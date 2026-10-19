@@ -1223,6 +1223,7 @@ dependencies = [
 name = "loon-core"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "loon-config",
  "loon-events",
  "loon-providers",

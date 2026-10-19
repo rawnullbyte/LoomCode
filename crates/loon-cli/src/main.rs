@@ -129,7 +129,8 @@ async fn tui_main() -> i32 {
             return 64;
         }
     };
-    let agent_cfg = AgentConfig::from(&cfg.session);
+    let mut agent_cfg = AgentConfig::from(&cfg.session);
+    agent_cfg.permissions = cfg.permissions.clone();
     let transparent = cfg.appearance.mode == loon_config::AppearanceMode::Transparent;
     match loon_tui::run(&paths, agent_cfg, registry, transparent, cwd).await {
         Ok(()) => 0,
@@ -206,9 +207,11 @@ async fn run_headless(cli: Cli) -> i32 {
         return 64;
     }
 
+    let mut agent_cfg = AgentConfig::from(&cfg.session);
+    agent_cfg.permissions = cfg.permissions.clone();
     let mut agent = match Agent::new_session(
         &paths,
-        AgentConfig::from(&cfg.session),
+        agent_cfg,
         registry.clone(),
         ToolRegistry::standard(),
         workspace,
@@ -308,6 +311,7 @@ fn event_type(ev: &AgentEvent) -> &'static str {
         AgentEvent::ToolStarted { .. } => "tool_started",
         AgentEvent::ToolFinished { .. } => "tool_finished",
         AgentEvent::MemberNote(_) => "member_note",
+        AgentEvent::ApprovalRequested { .. } => "approval_requested",
         AgentEvent::Warning(_) => "warning",
         AgentEvent::TurnFinished { .. } => "turn_finished",
     }

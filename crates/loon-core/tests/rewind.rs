@@ -29,6 +29,7 @@ fn cfg() -> AgentConfig {
         tool_output_bytes: 4096,
         max_retries: 0,
         allow_retry_after_partial_stream: false,
+        permissions: loon_config::Permissions::default(),
     }
 }
 

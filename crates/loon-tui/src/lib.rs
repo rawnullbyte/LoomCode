@@ -319,6 +319,14 @@ async fn run_inner(
                     app.tool_finished(&name, ok, &excerpt)
                 }
                 AgentEvent::MemberNote(m) => app.push_block(Block::Member(m)),
+                AgentEvent::ApprovalRequested { tool, args_excerpt } => {
+                    // Ask mode without a hook (or before one is installed): surface the
+                    // pending request; the agent's hook (wired in interactive mode)
+                    // carries the actual y/n answer.
+                    app.push_block(Block::System(format!(
+                        "approval requested: {tool} {args_excerpt}"
+                    )));
+                }
                 AgentEvent::Warning(w) => app.push_block(Block::System(format!("warning: {w}"))),
                 AgentEvent::TurnFinished { status } => {
                     app.commit_stream();

@@ -18,6 +18,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+futures.workspace = true
 
 [features]
 rewind_debug = []

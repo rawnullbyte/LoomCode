@@ -11,7 +11,8 @@ pub mod validate;
 pub use paths::LoonPaths;
 pub use schema::{
     ApiFamily, Appearance, AppearanceMode, CapState, CapabilityOverrides, Combo, ComboMember,
-    ComboMode, ComboRequires, ModelDef, PermissionMode, Permissions, Provider, SessionCfg,
+    ComboMode, ComboRequires, ModelDef, PermissionMode, PermissionRule, Permissions, Provider,
+    SessionCfg,
 };
 pub use validate::{ConfigError, Finding, Validator};
 

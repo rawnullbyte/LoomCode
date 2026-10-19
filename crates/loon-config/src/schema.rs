@@ -156,6 +156,17 @@ pub enum PermissionMode {
     Bypass,
 }
 
+/// A structured permission rule: tool name plus optional path constraint.
+/// Path matching is prefix-based on the *resolved* path; substring tricks do not pass.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PermissionRule {
+    /// Exact tool name (e.g. "bash", "edit", "write").
+    pub tool: String,
+    /// When set, the rule only matches calls whose `path` argument resolves under it.
+    #[serde(default)]
+    pub path_prefix: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Permissions {
     #[serde(default)]
@@ -166,6 +177,12 @@ pub struct Permissions {
     /// Hosts the agent may fetch. Empty list ⇒ unrestricted (subject to other policy).
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+    /// Allowlist-mode rules (mode = "allowlist").
+    #[serde(default)]
+    pub allow_rules: Vec<PermissionRule>,
+    /// Explicit denies: enforced in EVERY mode, including bypass.
+    #[serde(default)]
+    pub deny_rules: Vec<PermissionRule>,
 }
 
 impl Default for Permissions {
@@ -174,6 +191,8 @@ impl Default for Permissions {
             mode: PermissionMode::Bypass,
             extra_write_roots: vec![],
             allowed_hosts: vec![],
+            allow_rules: vec![],
+            deny_rules: vec![],
         }
     }
 }
