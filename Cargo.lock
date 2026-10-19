@@ -1278,6 +1278,7 @@ dependencies = [
  "async-trait",
  "glob",
  "ignore",
+ "loon-events",
  "loon-workspace",
  "regex",
  "serde",

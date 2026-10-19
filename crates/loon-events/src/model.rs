@@ -107,6 +107,9 @@ pub enum EventKind {
     ToolCallObserved {
         request: EvId,
         call: EvId,
+        /// The protocol-level call id (needed to rebuild valid wire conversations).
+        #[serde(default)]
+        wire_id: String,
         name: String,
         arguments_json: String,
     },
@@ -142,6 +145,47 @@ pub enum EventKind {
         from: MemberAttempt,
         to: MemberAttempt,
         reason: String,
+    },
+    /// One workspace file changed by a tool transaction, with content-addressed
+    /// before/after snapshots — the substrate for undo/redo/rewind.
+    FileMutated {
+        tx: EvId,
+        call: EvId,
+        path: String,
+        tool: String,
+        before_sha256: String,
+        after_sha256: String,
+        before_blob: Option<BlobRef>,
+        after_blob: Option<BlobRef>,
+    },
+    MutationUndone {
+        tx: EvId,
+        files: usize,
+        /// Files left untouched because the current content did not match the
+        /// expected hash — user work is never silently overwritten.
+        conflicts: Vec<String>,
+    },
+    MutationRedone {
+        tx: EvId,
+        files: usize,
+        conflicts: Vec<String>,
+    },
+    /// Conversation/workspace rewound to before `target_request`. `truncate_to_seq`
+    /// lets a resume replay drop everything after the mark deterministically.
+    Rewound {
+        target_request: EvId,
+        mode: String,
+        truncate_to_seq: u64,
+        files_restored: usize,
+        files_conflicted: usize,
+    },
+    ForkCreated {
+        name: String,
+        at_seq: u64,
+    },
+    CheckpointCreated {
+        name: String,
+        at_seq: u64,
     },
     Warning {
         message: String,
@@ -219,6 +263,28 @@ impl Event {
                     from.model_id, to.model_id, reason
                 )
             }
+            FileMutated { path, tool, .. } => format!("file mutated by {tool}: {path}"),
+            MutationUndone {
+                tx,
+                files,
+                conflicts,
+            } => {
+                format!(
+                    "undid tx {} ({files} files, {} conflicts)",
+                    tx.as_simple(),
+                    conflicts.len()
+                )
+            }
+            MutationRedone { tx, files, .. } => {
+                format!("redone tx {} ({files} files)", tx.as_simple())
+            }
+            Rewound {
+                target_request,
+                mode,
+                ..
+            } => format!("rewound to before request {target_request} ({mode})"),
+            ForkCreated { name, .. } => format!("fork created: {name}"),
+            CheckpointCreated { name, .. } => format!("checkpoint: {name}"),
             Warning { message } => format!("warning: {message}"),
             Error { message } => format!("error: {message}"),
         }

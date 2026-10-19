@@ -132,10 +132,13 @@ impl Tool for WriteTool {
             .and_then(Value::as_str)
             .map(str::to_string);
         let p = ctx.ws.resolve(path)?;
+        let prior = std::fs::read(&p).ok();
+        let before_blob = prior.as_deref().and_then(|b| snap(ctx, b));
         let g = ctx.ws.write_lock();
         let rec = ctx
             .ws
             .cas_write(&p, content.as_bytes(), expect.as_deref(), "write", &g)?;
+        let after_blob = snap(ctx, content.as_bytes());
         Ok(ToolOutput {
             ok: true,
             text: format!(
@@ -146,7 +149,11 @@ impl Tool for WriteTool {
             ),
             full: None,
             truncated: false,
-            structured: serde_json::to_value(&rec).unwrap_or(Value::Null),
+            structured: attach_mutation_fields(
+                serde_json::to_value(&rec).unwrap_or(Value::Null),
+                before_blob,
+                after_blob,
+            ),
         })
     }
 }
@@ -332,9 +339,11 @@ async fn run_edit(args: Value, ctx: &ToolCtx, multi: bool) -> Result<ToolOutput,
     let (next, _matched) = apply_one(&text, old, new, replace_all)?;
     let g = ctx.ws.write_lock();
     let cas = expect.unwrap_or_else(|| bytes_hash(&bytes));
+    let before_blob = snap(ctx, &bytes);
     let rec = ctx
         .ws
         .cas_write(&p, next.as_bytes(), Some(cas.as_str()), "edit", &g)?;
+    let after_blob = snap(ctx, next.as_bytes());
     Ok(ToolOutput {
         ok: true,
         text: format!(
@@ -351,7 +360,11 @@ async fn run_edit(args: Value, ctx: &ToolCtx, multi: bool) -> Result<ToolOutput,
         ),
         full: None,
         truncated: false,
-        structured: serde_json::to_value(&rec).unwrap_or(Value::Null),
+        structured: attach_mutation_fields(
+            serde_json::to_value(&rec).unwrap_or(Value::Null),
+            before_blob,
+            after_blob,
+        ),
     })
 }
 
@@ -362,6 +375,25 @@ fn matched_exact_span(text: &str, old: &str) -> bool {
 
 fn bytes_hash(b: &[u8]) -> String {
     loon_workspace::sha256_hex(b)
+}
+
+/// Snapshot `bytes` through the ctx sink (if any) for undo/redo; returns the blob sha.
+fn snap(ctx: &ToolCtx, bytes: &[u8]) -> Option<String> {
+    ctx.snapshot(bytes).map(|b| b.sha256)
+}
+
+fn attach_mutation_fields(
+    mut structured: serde_json::Value,
+    before_blob: Option<String>,
+    after_blob: Option<String>,
+) -> serde_json::Value {
+    if let Some(b) = before_blob {
+        structured["before_blob_sha256"] = serde_json::json!(b);
+    }
+    if let Some(a) = after_blob {
+        structured["after_blob_sha256"] = serde_json::json!(a);
+    }
+    structured
 }
 
 // ─── fuzzy_edit ──────────────────────────────────────────────────────────────────
@@ -454,9 +486,11 @@ impl Tool for MultiEditTool {
         }
         let g = ctx.ws.write_lock();
         let cas = expect.unwrap_or_else(|| bytes_hash(&bytes));
+        let before_blob = snap(ctx, &bytes);
         let rec = ctx
             .ws
             .cas_write(&p, text.as_bytes(), Some(cas.as_str()), "multi_edit", &g)?;
+        let after_blob = snap(ctx, text.as_bytes());
         Ok(ToolOutput {
             ok: true,
             text: format!(
@@ -466,7 +500,11 @@ impl Tool for MultiEditTool {
             ),
             full: None,
             truncated: false,
-            structured: serde_json::to_value(&rec).unwrap_or(Value::Null),
+            structured: attach_mutation_fields(
+                serde_json::to_value(&rec).unwrap_or(Value::Null),
+                before_blob,
+                after_blob,
+            ),
         })
     }
 }

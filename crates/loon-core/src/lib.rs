@@ -6,6 +6,8 @@
 
 pub mod est;
 pub mod prompt;
+pub mod replay;
+pub mod rewind;
 
 use loon_config::LoonPaths;
 use loon_events::model::{EventKind, MemberAttempt, RequestOutcome, Usage};
@@ -140,6 +142,7 @@ impl Agent {
         };
         let store = open_store(paths)?;
         let journal = Arc::new(Journal::create_default(&store, &meta)?);
+        // (blob_sink attached below, after ctx is built)
         let system = prompt::system_prompt(&cwd);
         journal.append(
             None,
@@ -162,7 +165,13 @@ impl Agent {
             default_timeout: std::time::Duration::from_secs(120),
             child_env: Default::default(),
             cancel: cancel_rx.clone(),
+            blob_sink: None,
         };
+        let mut ctx = ctx;
+        {
+            let j = journal.clone();
+            ctx.blob_sink = Some(Arc::new(move |data: &[u8]| j.put_blob(data).ok()));
+        }
         Ok(Agent {
             journal,
             registry,
@@ -207,44 +216,19 @@ impl Agent {
     ) -> loon_events::Result<Agent> {
         let store = open_store(paths)?;
         let (journal, events) = Journal::open_default(&store, &paths.sessions_dir(), session_id)?;
-        let mut history = Vec::new();
         let mut cwd = String::new();
+        // The newest Rewound mark truncates the replay (see rewind.rs).
+        let mut truncate_at: Option<u64> = None;
         for ev in &events {
             match &ev.kind {
                 EventKind::SessionStarted { cwd: c, .. } => cwd = c.clone(),
-                EventKind::UserMessage { text } => {
-                    history.push(loon_providers::ChatMessage::user(text.clone()))
-                }
-                EventKind::TextDelta { .. } => {} // assembled below from request records
-                EventKind::ToolExecutionFinished {
-                    call,
-                    ok: _,
-                    excerpt,
-                    blob,
-                    ..
-                } => {
-                    history.push(loon_providers::ChatMessage::tool_result(
-                        call.to_string(),
-                        blob_note(excerpt, blob.as_ref()),
-                    ));
-                }
+                EventKind::Rewound {
+                    truncate_to_seq, ..
+                } => truncate_at = Some(*truncate_to_seq),
                 _ => {}
             }
         }
-        // Assistant turns: reconstruct contiguous text deltas per request into messages.
-        let mut assistant = String::new();
-        for ev in &events {
-            if let EventKind::TextDelta { text, .. } = &ev.kind {
-                assistant.push_str(text);
-            } else if !assistant.is_empty() {
-                history.insert_tool_aware(loon_providers::ChatMessage::assistant(std::mem::take(
-                    &mut assistant,
-                )));
-            }
-        }
-        if !assistant.is_empty() {
-            history.insert_tool_aware(loon_providers::ChatMessage::assistant(assistant));
-        }
+        let history = replay::replay_history(&events, truncate_at);
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (steering_tx, steering_rx) = mpsc::channel(64);
         let ctx = ToolCtx {
@@ -260,9 +244,16 @@ impl Agent {
             default_timeout: std::time::Duration::from_secs(120),
             child_env: Default::default(),
             cancel: cancel_rx.clone(),
+            blob_sink: None,
         };
+        let journal = Arc::new(journal);
+        let mut ctx = ctx;
+        {
+            let j = journal.clone();
+            ctx.blob_sink = Some(Arc::new(move |data: &[u8]| j.put_blob(data).ok()));
+        }
         Ok(Agent {
-            journal: Arc::new(journal),
+            journal,
             registry,
             tools,
             ctx,
@@ -396,6 +387,7 @@ impl Agent {
                                     EventKind::ToolCallObserved {
                                         request: request_id,
                                         call: loon_events::EvId::now_v7(),
+                                        wire_id: call.id.clone(),
                                         name: call.name.clone(),
                                         arguments_json: call.arguments_json.clone(),
                                     },
@@ -679,6 +671,38 @@ impl Agent {
                         duration_ms,
                     },
                 );
+                // Journal a FileMutated record when a mutating tool reported a content
+                // change (structured carries before/after hashes and snapshot blobs).
+                if out.ok {
+                    if let Some(obj) = out.structured.as_object() {
+                        let has_change = obj.contains_key("before_sha256");
+                        if has_change {
+                            let get =
+                                |k: &str| obj.get(k).and_then(|v| v.as_str()).map(str::to_string);
+                            let blob_sha = |k: &str| {
+                                obj.get(k).and_then(|v| v.as_str()).map(|sha| {
+                                    loon_events::BlobRef {
+                                        sha256: sha.to_string(),
+                                        bytes: 0, // size resolved from the store on read
+                                    }
+                                })
+                            };
+                            let _ = self.journal.append(
+                                Some(*call_event_id),
+                                EventKind::FileMutated {
+                                    tx: *call_event_id,
+                                    call: *call_event_id,
+                                    path: get("path").unwrap_or_default(),
+                                    tool: get("tool").unwrap_or_else(|| call.name.clone()),
+                                    before_sha256: get("before_sha256").unwrap_or_default(),
+                                    after_sha256: get("after_sha256").unwrap_or_default(),
+                                    before_blob: blob_sha("before_blob_sha256"),
+                                    after_blob: blob_sha("after_blob_sha256"),
+                                },
+                            );
+                        }
+                    }
+                }
                 ToolRunOutcome {
                     model_text: out.text,
                     ok: out.ok,
@@ -753,16 +777,6 @@ impl InsertToolAware for Vec<loon_providers::ChatMessage> {
             }
         }
         self.push(msg);
-    }
-}
-
-fn blob_note(excerpt: &str, blob: Option<&loon_events::BlobRef>) -> String {
-    match blob {
-        Some(b) => {
-            let short = &b.sha256[..12.min(b.sha256.len())];
-            format!("{excerpt}\n[full output: blob {short} ({} bytes)]", b.bytes)
-        }
-        None => excerpt.to_string(),
     }
 }
 

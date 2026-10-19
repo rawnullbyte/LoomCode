@@ -82,6 +82,19 @@ pub struct ToolCtx {
     pub child_env: BTreeMap<String, String>,
     /// Cooperative cancellation: long-running tools (shell) watch this.
     pub cancel: tokio::sync::watch::Receiver<bool>,
+    /// Optional sink for content-addressed snapshots. Mutating file tools capture
+    /// before/after bytes through it so undo/redo can restore exact content.
+    pub blob_sink: Option<BlobSink>,
+}
+
+/// Content-addressed snapshot sink: bytes in, blob reference out (None when no store).
+pub type BlobSink =
+    std::sync::Arc<dyn Fn(&[u8]) -> Option<loon_events_type_alias::BlobRef> + Send + Sync>;
+
+/// Alias indirection so loon-tools does not need a direct dependency bump; resolved by
+/// the loon-events re-export below.
+pub mod loon_events_type_alias {
+    pub use loon_events::BlobRef;
 }
 
 impl Default for ToolCtx {
@@ -93,7 +106,15 @@ impl Default for ToolCtx {
             default_timeout: Duration::from_secs(120),
             child_env: Default::default(),
             cancel: rx,
+            blob_sink: None,
         }
+    }
+}
+
+impl ToolCtx {
+    /// Capture bytes through the blob sink, if one is attached.
+    pub fn snapshot(&self, data: &[u8]) -> Option<loon_events_type_alias::BlobRef> {
+        self.blob_sink.as_ref().and_then(|f| f(data))
     }
 }
 
