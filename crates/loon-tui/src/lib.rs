@@ -11,7 +11,6 @@ pub mod ui;
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
 use loon_core::{Agent, AgentConfig, AgentEvent, TurnResult, TurnStatus};
-use loon_tools::ToolRegistry;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 use std::path::PathBuf;
@@ -244,7 +243,7 @@ async fn run_inner(
             paths,
             cfg.clone(),
             registry,
-            ToolRegistry::standard(),
+            loon_core::standard_tools(paths, &cwd),
             cwd.clone(),
             false,
         )

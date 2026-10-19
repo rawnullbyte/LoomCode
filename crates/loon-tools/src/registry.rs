@@ -5,10 +5,17 @@ use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct ToolRegistry {
-    tools: Vec<Arc<dyn Tool>>,
+    pub(crate) tools: Vec<Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
+    /// Extend with additional tools (used by hosts adding e.g. the memory tool).
+    pub fn with_extra(self, extra: Vec<Arc<dyn Tool>>) -> ToolRegistry {
+        let mut tools = self.tools;
+        tools.extend(extra);
+        ToolRegistry { tools }
+    }
+
     pub fn new(tools: Vec<Arc<dyn Tool>>) -> ToolRegistry {
         ToolRegistry { tools }
     }

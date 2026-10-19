@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand};
 use loon_config::{Config, LoonPaths};
 use loon_core::{Agent, AgentConfig, AgentEvent, TurnStatus};
 use loon_providers::ProviderRegistry;
-use loon_tools::ToolRegistry;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -215,7 +214,7 @@ async fn run_headless(cli: Cli) -> i32 {
         &paths,
         agent_cfg,
         registry.clone(),
-        ToolRegistry::standard(),
+        loon_core::standard_tools(&paths, &workspace),
         workspace,
         true,
     ) {

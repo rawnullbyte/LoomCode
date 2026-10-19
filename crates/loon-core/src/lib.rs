@@ -6,6 +6,7 @@
 
 pub mod compaction;
 pub mod est;
+pub mod memory;
 pub mod permissions;
 pub mod prompt;
 pub mod replay;
@@ -138,6 +139,13 @@ impl Agent {
 pub fn open_store(paths: &LoonPaths) -> loon_events::Result<Arc<Store>> {
     let path = paths.data_dir.join("loon.db");
     Ok(Arc::new(Store::open(&path)?))
+}
+
+/// The default toolset plus the memory tool (scoped to this Loon home + workspace).
+pub fn standard_tools(paths: &LoonPaths, cwd: &Path) -> ToolRegistry {
+    ToolRegistry::standard().with_extra(vec![Arc::new(memory::MemoryTool {
+        paths: Arc::new(memory::MemoryPaths::resolve(&paths.data_dir, cwd)),
+    })])
 }
 
 impl Agent {
