@@ -100,6 +100,36 @@ pub fn replay_history(events: &[Event], upto_seq: Option<u64>) -> Vec<ChatMessag
             EventKind::RequestFinished { .. } | EventKind::TurnFinished { .. } => {
                 flush_text(&mut history, &mut assistant_text);
             }
+            // Compaction replaces everything the model saw before this point with the
+            // summary plus the verbatim kept tail — exactly what the live session held.
+            EventKind::ContextCompacted { summary, kept, .. } => {
+                flush_text(&mut history, &mut assistant_text);
+                history.clear();
+                pending_calls.clear();
+                history.push(ChatMessage::user(format!(
+                    "[Earlier conversation summary]\n{summary}"
+                )));
+                for m in kept {
+                    history.push(ChatMessage {
+                        role: match m.role.as_str() {
+                            "assistant" => Role::Assistant,
+                            "tool" => Role::Tool,
+                            _ => Role::User,
+                        },
+                        text: m.text.clone(),
+                        tool_calls: m
+                            .tool_calls
+                            .iter()
+                            .map(|c| ToolCallReq {
+                                id: c.id.clone(),
+                                name: c.name.clone(),
+                                arguments_json: c.arguments_json.clone(),
+                            })
+                            .collect(),
+                        tool_call_id: m.tool_call_id.clone(),
+                    });
+                }
+            }
             _ => {}
         }
     }

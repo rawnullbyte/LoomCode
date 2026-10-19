@@ -4,6 +4,7 @@
 //! journals every state change. The TUI and headless clients are consumers of
 //! [`AgentEvent`]s; they hold no business logic.
 
+pub mod compaction;
 pub mod est;
 pub mod permissions;
 pub mod prompt;
@@ -77,6 +78,9 @@ pub struct AgentConfig {
     pub allow_retry_after_partial_stream: bool,
     /// Permission policy (mode + allow/deny rules) resolved from config and CLI overrides.
     pub permissions: loon_config::Permissions,
+    /// Effective context window in tokens (from the model def / combo minimum). 0
+    /// disables compaction. Unknown windows fall back to a conservative 128k default.
+    pub context_window: u64,
 }
 
 impl From<&loon_config::SessionCfg> for AgentConfig {
@@ -88,6 +92,7 @@ impl From<&loon_config::SessionCfg> for AgentConfig {
             max_retries: s.max_retries,
             allow_retry_after_partial_stream: s.allow_retry_after_partial_stream,
             permissions: loon_config::Permissions::default(),
+            context_window: 128_000,
         }
     }
 }
@@ -110,6 +115,8 @@ pub struct Agent {
     pub permissions: Arc<permissions::PermissionEngine>,
     /// Interactive approval hook (ask mode): None ⇒ approval-required without prompting.
     pub approval_hook: Option<permissions::ApprovalHook>,
+    /// Context summarizer; defaults to a model-backed summarizer (compaction.rs).
+    pub summarizer: Option<compaction::Summarizer>,
     system_prompt: String,
     session_id: loon_events::EvId,
 }
@@ -210,6 +217,7 @@ impl Agent {
                 Some(audit_path),
             )),
             approval_hook: None,
+            summarizer: None,
             cfg,
             system_prompt: system,
             session_id,
@@ -302,6 +310,7 @@ impl Agent {
                 Some(audit_path),
             )),
             approval_hook: None,
+            summarizer: None,
             cfg,
             system_prompt: prompt::system_prompt(Path::new(&cwd)),
             session_id,
@@ -369,6 +378,9 @@ impl Agent {
             }
 
             // ── one provider request (combo-aware) ────────────────────────────────
+            // Context guard first: summarize older exchanges if the next request would
+            // cross the compaction threshold.
+            self.maybe_compact().await;
             let request_id = loon_events::EvId::now_v7();
             let req = loon_providers::ChatRequest {
                 model: self.cfg.model_ref.clone(),

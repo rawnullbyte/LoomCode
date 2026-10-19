@@ -131,6 +131,7 @@ async fn tui_main() -> i32 {
     };
     let mut agent_cfg = AgentConfig::from(&cfg.session);
     agent_cfg.permissions = cfg.permissions.clone();
+    agent_cfg.context_window = effective_context_window(&cfg, &cfg.session.model);
     let transparent = cfg.appearance.mode == loon_config::AppearanceMode::Transparent;
     match loon_tui::run(&paths, agent_cfg, registry, transparent, cwd).await {
         Ok(()) => 0,
@@ -209,6 +210,7 @@ async fn run_headless(cli: Cli) -> i32 {
 
     let mut agent_cfg = AgentConfig::from(&cfg.session);
     agent_cfg.permissions = cfg.permissions.clone();
+    agent_cfg.context_window = effective_context_window(&cfg, &cfg.session.model);
     let mut agent = match Agent::new_session(
         &paths,
         agent_cfg,
@@ -302,6 +304,33 @@ async fn run_headless(cli: Cli) -> i32 {
         TurnStatus::Cancelled => 2,
         TurnStatus::BudgetPaused { .. } => 3,
     }
+}
+
+/// Effective context window for a model reference: the model def's window, a combo's
+/// minimum across members, or a conservative 128k default when unknown.
+fn effective_context_window(cfg: &loon_config::Config, model_ref: &str) -> u64 {
+    if let Some(def) = cfg.models.get(model_ref) {
+        if let Some(w) = def.context_window {
+            return w;
+        }
+    }
+    if let Some(name) = model_ref.strip_prefix("combo:") {
+        if let Some(combo) = cfg.combos.get(name) {
+            if let Some(w) = combo.requires.min_context_window {
+                return w;
+            }
+            // Fall back to the smallest declared member window.
+            let windows: Vec<u64> = combo
+                .members
+                .iter()
+                .filter_map(|m| cfg.models.get(&m.model).and_then(|d| d.context_window))
+                .collect();
+            if let Some(min) = windows.iter().min() {
+                return *min;
+            }
+        }
+    }
+    128_000
 }
 
 fn event_type(ev: &AgentEvent) -> &'static str {

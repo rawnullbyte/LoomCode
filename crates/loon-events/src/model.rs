@@ -187,6 +187,17 @@ pub enum EventKind {
         name: String,
         at_seq: u64,
     },
+    /// Context compaction: everything the model saw before this point is replaced by
+    /// `summary` plus the verbatim `kept` tail. The event fully describes the
+    /// post-compaction context, so a resume replays byte-identical history with no
+    /// duplicated user/tool events in the journal.
+    ContextCompacted {
+        turn: EvId,
+        before_tokens: u64,
+        after_tokens: u64,
+        summary: String,
+        kept: Vec<JournalMessage>,
+    },
     Warning {
         message: String,
     },
@@ -200,6 +211,27 @@ pub enum EventKind {
 pub struct BlobRef {
     pub sha256: String,
     pub bytes: u64,
+}
+
+/// Wire-format conversation message as journaled inside [`EventKind::ContextCompacted`].
+/// Field-compatible with `loon_providers::ChatMessage` (which depends on this crate, so
+/// the neutral shape lives here).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalMessage {
+    /// "user" | "assistant" | "tool"
+    pub role: String,
+    pub text: String,
+    #[serde(default)]
+    pub tool_calls: Vec<JournalToolCall>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JournalToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments_json: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +317,11 @@ impl Event {
             } => format!("rewound to before request {target_request} ({mode})"),
             ForkCreated { name, .. } => format!("fork created: {name}"),
             CheckpointCreated { name, .. } => format!("checkpoint: {name}"),
+            ContextCompacted {
+                before_tokens,
+                after_tokens,
+                ..
+            } => format!("context compacted ({before_tokens} → {after_tokens} est. tokens)"),
             Warning { message } => format!("warning: {message}"),
             Error { message } => format!("error: {message}"),
         }

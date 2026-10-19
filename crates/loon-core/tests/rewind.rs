@@ -30,6 +30,7 @@ fn cfg() -> AgentConfig {
         max_retries: 0,
         allow_retry_after_partial_stream: false,
         permissions: loon_config::Permissions::default(),
+        context_window: 128_000,
     }
 }
 
