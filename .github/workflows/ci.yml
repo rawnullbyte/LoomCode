@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Format
+        run: cargo fmt --check
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Tests
+        run: cargo test --workspace
+      - name: Build release
+        run: cargo build --release
+      - name: Smoke test (offline, mock provider)
+        run: |
+          export LOON_HOME=$(mktemp -d)
+          ./target/release/loon doctor
+          ./target/release/loon run "smoke" --output jsonl | grep -q '"type":"turn"'
+          ./target/release/loon sessions list
+          ./target/release/loon config validate

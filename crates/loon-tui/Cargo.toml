@@ -1,0 +1,22 @@
+[package]
+name = "loon-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+loon-core.workspace = true
+loon-config.workspace = true
+loon-events.workspace = true
+loon-providers.workspace = true
+loon-tools.workspace = true
+ratatui.workspace = true
+crossterm = { workspace = true, features = ["event-stream"] }
+futures.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unicode-width = "0.2"
+
+[dev-dependencies]
+tempfile.workspace = true

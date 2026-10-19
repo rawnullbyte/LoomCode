@@ -1,0 +1,89 @@
+# Example Loon configuration: multiple providers, models, and both combo modes.
+# Copy to ~/.config/loon/config.toml (or run `loon config init` for a minimal one).
+# Comments and unknown fields are preserved when Loon rewrites the file.
+
+schema_version = 1
+
+[appearance]
+mode = "transparent"        # transparent (default) | opaque — opaque never activates silently
+color = "auto"              # auto | true | 256 | 16 | mono
+ascii_only = false
+
+[permissions]
+mode = "bypass"             # bypass | ask | allowlist
+extra_write_roots = []      # additional writable roots beyond the workspace
+allowed_hosts = []          # empty = unrestricted (future enforcement milestone)
+
+[session]
+model = "combo:daily-driver"   # a [models] alias or combo:NAME
+max_steps = 24
+tool_output_bytes = 65536
+max_retries = 2
+allow_retry_after_partial_stream = false   # opt-in: restart after a partially streamed answer
+
+# ── Providers: any number of OpenAI-compatible endpoints ─────────────────────────────
+
+[providers.ollama]
+base_url = "http://127.0.0.1:11434/v1"
+api = "chat"                # chat | responses
+models = ["llama3.1:8b", "qwen2.5-coder:14b"]
+timeout_secs = 300
+
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1"
+api = "chat"
+api_key_env = "OPENROUTER_API_KEY"
+models = ["anthropic/claude-sonnet-4.5", "openai/gpt-5-mini"]
+
+[providers.selfhosted]
+base_url = "https://llm.internal.corp/v1"
+api = "responses"           # an endpoint that speaks the Responses protocol
+api_key_env = "CORP_LLM_KEY"
+headers = { "X-Team" = "platform" }
+models = ["corp-coder-v3"]
+
+# ── Models: named references with capabilities and limits ────────────────────────────
+
+[models.local-fast]
+provider = "ollama"
+id = "llama3.1:8b"
+context_window = 131072
+
+[models.local-coder]
+provider = "ollama"
+id = "qwen2.5-coder:14b"
+context_window = 131072
+capabilities.tool_calling = "supported"    # supported | unsupported | unknown
+
+[models.cloud-strong]
+provider = "openrouter"
+id = "anthropic/claude-sonnet-4.5"
+context_window = 200000
+capabilities.tool_calling = "supported"
+capabilities.vision = "supported"
+
+[models.corp]
+provider = "selfhosted"
+id = "corp-coder-v3"
+context_window = 128000
+capabilities.tool_calling = "unknown"      # unknown ≠ supported: hard-requirement combos refuse it
+
+# ── Combos: ordered model sets across any providers ──────────────────────────────────
+
+[combos.daily-driver]
+mode = "fallback"           # highest priority first; switch on transport/rate/auth/5xx
+members = [
+    { provider = "ollama", model = "qwen2.5-coder:14b" },
+    { provider = "openrouter", model = "anthropic/claude-sonnet-4.5" },
+]
+requires = { tool_calling = true }
+cost_ceiling = 5.0          # combo-level pause threshold (future enforcement milestone)
+
+[combos.spread]
+mode = "round_robin"        # rotate new requests across members
+members = [
+    { provider = "ollama", model = "llama3.1:8b" },
+    { provider = "ollama", model = "qwen2.5-coder:14b" },
+    { provider = "selfhosted", model = "corp-coder-v3" },
+]
+persistent_rotation = false  # per-session cursor; true keeps one cursor across sessions

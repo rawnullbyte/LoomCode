@@ -1,0 +1,283 @@
+//! Milestone-1 vertical slice: one complete agent turn — read → edit (CAS-protected) →
+//! verify via shell → final answer — against the deterministic mock provider, with the
+//! journal asserted end to end. This is the "one verified coding task" of M1; it uses a
+//! scripted provider, which is stated as such (no live-model claim).
+
+use loon_config::LoonPaths;
+use loon_core::{Agent, AgentConfig};
+use loon_events::model::EventKind;
+use loon_events::Journal;
+use loon_providers::{MockScript, MockStep, ProviderRegistry};
+use loon_tools::ToolRegistry;
+use serde_json::json;
+use std::sync::Arc;
+
+fn test_paths(dir: &std::path::Path) -> LoonPaths {
+    LoonPaths {
+        config_dir: dir.join("config"),
+        data_dir: dir.join("data"),
+        state_dir: dir.join("state"),
+        cache_dir: dir.join("cache"),
+        runtime_dir: dir.join("runtime"),
+    }
+}
+
+fn agent_cfg(model: &str) -> AgentConfig {
+    AgentConfig {
+        model_ref: model.into(),
+        max_steps: 12,
+        tool_output_bytes: 4096,
+        max_retries: 0,
+        allow_retry_after_partial_stream: false,
+    }
+}
+
+#[tokio::test]
+async fn verified_coding_task_end_to_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let initial = "total = 1 + 1\nprint(total)\n";
+    std::fs::write(ws.join("calc.txt"), initial).unwrap();
+
+    // The model must pass the hash it read back for CAS protection.
+    let (_bytes, hash) = {
+        let data = std::fs::read(ws.join("calc.txt")).unwrap();
+        (data.clone(), loon_workspace::sha256_hex(&data))
+    };
+
+    let mock_scripts = vec![
+        // 1) read the file
+        MockScript::new(vec![MockStep::tool_call(
+            "call_1",
+            "read",
+            json!({"path": "calc.txt"}),
+        )]),
+        // 2) apply the fix with CAS hash from the read
+        MockScript::new(vec![MockStep::tool_call(
+            "call_2",
+            "edit",
+            json!({"path": "calc.txt", "old_string": "total = 1 + 1", "new_string": "total = 2 + 2", "expect_sha256": hash}),
+        )]),
+        // 3) verify by running it
+        MockScript::new(vec![MockStep::tool_call(
+            "call_3",
+            "bash",
+            json!({"command": "cat calc.txt", "timeout_secs": 15}),
+        )]),
+        // 4) report completion
+        MockScript::text(
+            "Fixed the total (1+1 → 2+2) and verified by cat: output shows total = 2 + 2.",
+        ),
+    ];
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(mock_scripts),
+    ));
+
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let mut agent = Agent::new_session(
+        &paths,
+        agent_cfg("mock"),
+        registry,
+        ToolRegistry::standard(),
+        ws.clone(),
+        true,
+    )
+    .unwrap();
+
+    let result = agent.run_turn("Fix the total in calc.txt").await;
+
+    // ── workspace effect ─────────────────────────────────────────────────────────
+    let after = std::fs::read_to_string(ws.join("calc.txt")).unwrap();
+    assert_eq!(after, "total = 2 + 2\nprint(total)\n", "edit applied");
+
+    // ── turn status ──────────────────────────────────────────────────────────────
+    assert!(
+        matches!(result.status, loon_core::TurnStatus::Completed),
+        "{:?}",
+        result.status
+    );
+    assert!(
+        result.assistant_text.contains("verified"),
+        "final report present"
+    );
+    assert_eq!(result.steps, 4, "read, edit, verify, answer");
+
+    // ── journal is complete and ordered ─────────────────────────────────────────
+    let (_, events) = Journal::open(&paths.sessions_dir(), agent.session_id()).unwrap();
+    let kinds: Vec<&EventKind> = events.iter().map(|e| &e.kind).collect();
+    assert!(kinds
+        .iter()
+        .any(|k| matches!(k, EventKind::UserMessage { text } if text.contains("Fix the total"))));
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| matches!(k, EventKind::ToolCallObserved { name, .. } if name == "read"))
+            .count(),
+        1
+    );
+    assert!(kinds.iter().any(
+        |k| matches!(k, EventKind::ToolExecutionFinished { name, ok: true, .. } if name == "edit")
+    ));
+    assert!(kinds.iter().any(
+        |k| matches!(k, EventKind::ToolExecutionFinished { name, ok: true, .. } if name == "bash")
+    ));
+    // every request got a start and a finish record
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|k| matches!(k, EventKind::RequestStarted { .. }))
+            .count(),
+        kinds
+            .iter()
+            .filter(|k| matches!(k, EventKind::RequestFinished { .. }))
+            .count()
+    );
+    assert!(kinds
+        .iter()
+        .any(|k| matches!(k, EventKind::TurnFinished { .. })));
+    // bash verification evidence contains the post-edit content
+    let bash_out = events.iter().find_map(|e| match &e.kind {
+        EventKind::ToolExecutionFinished {
+            name,
+            excerpt,
+            ok: true,
+            ..
+        } if name == "bash" => Some(excerpt.clone()),
+        _ => None,
+    });
+    assert!(
+        bash_out.unwrap().contains("total = 2 + 2"),
+        "verification evidence recorded"
+    );
+}
+
+#[tokio::test]
+async fn stale_cas_write_is_refused_and_reported_to_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(ws.join("f.txt"), "hello").unwrap();
+
+    // Hash the file, then a "user" edits it concurrently before the agent acts.
+    // The user's edit keeps the anchor text so the tool reaches the CAS check itself.
+    let data = std::fs::read(ws.join("f.txt")).unwrap();
+    let stale_hash = loon_workspace::sha256_hex(&data);
+    std::fs::write(ws.join("f.txt"), "user changed hello to something else").unwrap();
+
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![
+            MockScript::new(vec![MockStep::tool_call(
+                "call_1",
+                "edit",
+                json!({"path": "f.txt", "old_string": "hello", "new_string": "agent edit", "expect_sha256": stale_hash}),
+            )]),
+            MockScript::text("I stopped: the file changed under me; please re-check."),
+        ]),
+    ));
+
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let mut agent = Agent::new_session(
+        &paths,
+        agent_cfg("mock"),
+        registry,
+        ToolRegistry::standard(),
+        ws.clone(),
+        true,
+    )
+    .unwrap();
+    let result = agent.run_turn("edit f.txt").await;
+
+    // user work preserved
+    assert_eq!(
+        std::fs::read_to_string(ws.join("f.txt")).unwrap(),
+        "user changed hello to something else"
+    );
+    assert!(matches!(result.status, loon_core::TurnStatus::Completed));
+    let (_, events) = Journal::open(&paths.sessions_dir(), agent.session_id()).unwrap();
+    let refused = events.iter().any(|e| {
+        matches!(&e.kind,
+            EventKind::ToolExecutionFinished { name, ok: false, excerpt, .. }
+                if name == "edit" && excerpt.contains("changed since it was read"))
+    });
+    assert!(
+        refused,
+        "CAS refusal must be journaled as a failed tool run"
+    );
+}
+
+#[tokio::test]
+async fn cancellation_stops_between_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![MockScript::new(vec![
+            MockStep::tool_call("call_1", "bash", json!({"command": "sleep 0.05"})),
+            MockStep::tool_call("call_2", "bash", json!({"command": "echo should-not-run"})),
+            MockStep::Text("never".into()),
+        ])]),
+    ));
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let mut agent = Agent::new_session(
+        &paths,
+        agent_cfg("mock"),
+        registry,
+        ToolRegistry::standard(),
+        ws,
+        true,
+    )
+    .unwrap();
+    agent.cancel();
+    let result = agent.run_turn("go").await;
+    assert!(matches!(result.status, loon_core::TurnStatus::Cancelled));
+}
+
+#[tokio::test]
+async fn tool_argument_validation_rejects_bad_calls() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![
+            MockScript::new(vec![MockStep::tool_call(
+                "call_bad",
+                "read",
+                json!({"path": 42}), // wrong type
+            )]),
+            MockScript::new(vec![MockStep::tool_call(
+                "call_unknown",
+                "teleport",
+                json!({}),
+            )]),
+            MockScript::text("both calls were rejected; understood."),
+        ]),
+    ));
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let mut agent = Agent::new_session(
+        &paths,
+        agent_cfg("mock"),
+        registry,
+        ToolRegistry::standard(),
+        ws,
+        true,
+    )
+    .unwrap();
+    let result = agent.run_turn("try bad calls").await;
+    assert!(matches!(result.status, loon_core::TurnStatus::Completed));
+    let (_, events) = Journal::open(&paths.sessions_dir(), agent.session_id()).unwrap();
+    let rejected = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::ToolCallRejected { .. }))
+        .count();
+    assert_eq!(
+        rejected,
+        2,
+        "both invalid calls rejected: {:?}",
+        events.iter().map(|e| e.summary()).collect::<Vec<_>>()
+    );
+}

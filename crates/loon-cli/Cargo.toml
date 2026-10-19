@@ -1,0 +1,27 @@
+[package]
+name = "loon-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "loon"
+path = "src/main.rs"
+
+[dependencies]
+loon-core.workspace = true
+loon-config.workspace = true
+loon-events.workspace = true
+loon-providers.workspace = true
+loon-tools.workspace = true
+loon-tui.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_cmd = "2"
