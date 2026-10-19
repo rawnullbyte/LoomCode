@@ -11,6 +11,7 @@ pub mod permissions;
 pub mod prompt;
 pub mod replay;
 pub mod rewind;
+pub mod verify;
 
 use loon_config::LoonPaths;
 use loon_events::model::{EventKind, MemberAttempt, RequestOutcome, Usage};
