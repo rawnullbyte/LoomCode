@@ -7,9 +7,13 @@
 
 pub mod journal;
 pub mod model;
+pub mod session_journal;
+pub mod store;
 
-pub use journal::{list_sessions, Journal, SessionMeta, SCHEMA_VERSION};
+pub use journal::{list_legacy_sessions, list_sessions, FileJournal, SessionMeta, SCHEMA_VERSION};
 pub use model::*;
+pub use session_journal::{list_all_sessions, Journal};
+pub use store::Store;
 
 use thiserror::Error;
 
@@ -23,6 +27,8 @@ pub enum EventsError {
     SchemaTooNew { found: u32, supported: u32 },
     #[error("malformed journal line {line}: {reason}")]
     MalformedLine { line: usize, reason: String },
+    #[error("database error: {0}")]
+    Db(#[from] rusqlite::Error),
 }
 
 pub type Result<T> = std::result::Result<T, EventsError>;

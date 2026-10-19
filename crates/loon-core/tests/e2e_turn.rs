@@ -6,7 +6,6 @@
 use loon_config::LoonPaths;
 use loon_core::{Agent, AgentConfig};
 use loon_events::model::EventKind;
-use loon_events::Journal;
 use loon_providers::{MockScript, MockStep, ProviderRegistry};
 use loon_tools::ToolRegistry;
 use serde_json::json;
@@ -105,7 +104,10 @@ async fn verified_coding_task_end_to_end() {
     assert_eq!(result.steps, 4, "read, edit, verify, answer");
 
     // ── journal is complete and ordered ─────────────────────────────────────────
-    let (_, events) = Journal::open(&paths.sessions_dir(), agent.session_id()).unwrap();
+    let store = loon_core::open_store(&paths).unwrap();
+    let (_, events) =
+        loon_events::Journal::open_default(&store, &paths.sessions_dir(), agent.session_id())
+            .unwrap();
     let kinds: Vec<&EventKind> = events.iter().map(|e| &e.kind).collect();
     assert!(kinds
         .iter()
@@ -196,7 +198,10 @@ async fn stale_cas_write_is_refused_and_reported_to_model() {
         "user changed hello to something else"
     );
     assert!(matches!(result.status, loon_core::TurnStatus::Completed));
-    let (_, events) = Journal::open(&paths.sessions_dir(), agent.session_id()).unwrap();
+    let store = loon_core::open_store(&paths).unwrap();
+    let (_, events) =
+        loon_events::Journal::open_default(&store, &paths.sessions_dir(), agent.session_id())
+            .unwrap();
     let refused = events.iter().any(|e| {
         matches!(&e.kind,
             EventKind::ToolExecutionFinished { name, ok: false, excerpt, .. }
@@ -269,7 +274,10 @@ async fn tool_argument_validation_rejects_bad_calls() {
     .unwrap();
     let result = agent.run_turn("try bad calls").await;
     assert!(matches!(result.status, loon_core::TurnStatus::Completed));
-    let (_, events) = Journal::open(&paths.sessions_dir(), agent.session_id()).unwrap();
+    let store = loon_core::open_store(&paths).unwrap();
+    let (_, events) =
+        loon_events::Journal::open_default(&store, &paths.sessions_dir(), agent.session_id())
+            .unwrap();
     let rejected = events
         .iter()
         .filter(|e| matches!(e.kind, EventKind::ToolCallRejected { .. }))

@@ -25,7 +25,7 @@ fn meta(id: EvId) -> SessionMeta {
 fn append_replay_and_sequence() {
     let (_d, root) = tmp_root();
     let id = EvId::now_v7();
-    let j = loon_events::Journal::create(&root, &meta(id)).unwrap();
+    let j = loon_events::Journal::create_files(&root, &meta(id)).unwrap();
     let e1 = j
         .append(None, EventKind::UserMessage { text: "hi".into() })
         .unwrap();
@@ -40,7 +40,9 @@ fn append_replay_and_sequence() {
     assert_eq!(e1.seq, 1);
     assert_eq!(e2.seq, 2);
     assert_eq!(e2.parent, Some(e1.id));
-    let (j2, events) = loon_events::Journal::open(&root, id).unwrap();
+    let j2 = loon_events::FileJournal::open(&root, id).unwrap().0;
+    let events =
+        loon_events::journal::read_events(&root.join(id.to_string()).join("events.jsonl")).unwrap();
     assert_eq!(events.len(), 2);
     // continues sequence after reopen
     let e3 = j2
@@ -57,7 +59,7 @@ fn append_replay_and_sequence() {
 #[test]
 fn blob_roundtrip_is_content_addressed() {
     let (_d, root) = tmp_root();
-    let j = loon_events::Journal::create(&root, &meta(EvId::now_v7())).unwrap();
+    let j = loon_events::Journal::create_files(&root, &meta(EvId::now_v7())).unwrap();
     let data = b"large output".repeat(100);
     let r1 = j.put_blob(&data).unwrap();
     let r2 = j.put_blob(&data).unwrap();
@@ -71,7 +73,7 @@ fn torn_final_line_is_tolerated_and_reported() {
     let (_d, root) = tmp_root();
     let id = EvId::now_v7();
     {
-        let j = loon_events::Journal::create(&root, &meta(id)).unwrap();
+        let j = loon_events::Journal::create_files(&root, &meta(id)).unwrap();
         j.append(
             None,
             EventKind::UserMessage {
@@ -96,7 +98,7 @@ fn malformed_interior_line_is_an_error_not_silence() {
     let (_d, root) = tmp_root();
     let id = EvId::now_v7();
     {
-        let j = loon_events::Journal::create(&root, &meta(id)).unwrap();
+        let j = loon_events::Journal::create_files(&root, &meta(id)).unwrap();
         j.append(None, EventKind::UserMessage { text: "one".into() })
             .unwrap();
     }
@@ -120,8 +122,8 @@ fn session_listing_is_newest_first() {
     let a = EvId::now_v7();
     std::thread::sleep(std::time::Duration::from_millis(5));
     let b = EvId::now_v7();
-    loon_events::Journal::create(&root, &meta(a)).unwrap();
-    loon_events::Journal::create(&root, &meta(b)).unwrap();
+    loon_events::Journal::create_files(&root, &meta(a)).unwrap();
+    loon_events::Journal::create_files(&root, &meta(b)).unwrap();
     let listed = list_sessions(&root).unwrap();
     assert_eq!(listed.len(), 2);
     assert_eq!(listed[0].id, b, "newest first");

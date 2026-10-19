@@ -326,7 +326,15 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
     let paths = LoonPaths::resolve();
     match cmd {
         SessionsCmd::List => {
-            let list = loon_events::list_sessions(&paths.sessions_dir()).unwrap_or_default();
+            let store = match loon_core::open_store(&paths) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("loon: store: {e}");
+                    return 1;
+                }
+            };
+            let list =
+                loon_events::list_all_sessions(&store, &paths.sessions_dir()).unwrap_or_default();
             if list.is_empty() {
                 println!("no sessions yet");
                 return 0;
@@ -344,7 +352,14 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
                 eprintln!("loon: `{id}` is not a session id (uuid)");
                 return 64;
             };
-            match loon_events::Journal::open(&paths.sessions_dir(), sid) {
+            let store = match loon_core::open_store(&paths) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("loon: store: {e}");
+                    return 1;
+                }
+            };
+            match loon_events::Journal::open_default(&store, &paths.sessions_dir(), sid) {
                 Ok((_, events)) => {
                     println!("# Loon session {id}");
                     println!();

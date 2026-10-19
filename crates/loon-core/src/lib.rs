@@ -9,7 +9,7 @@ pub mod prompt;
 
 use loon_config::LoonPaths;
 use loon_events::model::{EventKind, MemberAttempt, RequestOutcome, Usage};
-use loon_events::{Journal, SessionMeta};
+use loon_events::{Journal, SessionMeta, Store};
 use loon_providers::{AttemptEvent, ComboOutcome, ComboRunner, ProviderEvent, ProviderRegistry};
 use loon_tools::{validate_args, ToolCtx, ToolRegistry};
 use std::path::{Path, PathBuf};
@@ -112,6 +112,12 @@ impl Agent {
     }
 }
 
+/// Open (or create) the shared SQLite event store under the Loon data dir.
+pub fn open_store(paths: &LoonPaths) -> loon_events::Result<Arc<Store>> {
+    let path = paths.data_dir.join("loon.db");
+    Ok(Arc::new(Store::open(&path)?))
+}
+
 impl Agent {
     /// Create a session agent. `cwd` is the workspace root; AGENTS.md there (if any) is
     /// included as task guidance.
@@ -132,7 +138,8 @@ impl Agent {
             schema_version: loon_events::SCHEMA_VERSION,
             headless,
         };
-        let journal = Arc::new(Journal::create(&paths.sessions_dir(), &meta)?);
+        let store = open_store(paths)?;
+        let journal = Arc::new(Journal::create_default(&store, &meta)?);
         let system = prompt::system_prompt(&cwd);
         journal.append(
             None,
@@ -198,7 +205,8 @@ impl Agent {
         registry: Arc<ProviderRegistry>,
         tools: ToolRegistry,
     ) -> loon_events::Result<Agent> {
-        let (journal, events) = Journal::open(&paths.sessions_dir(), session_id)?;
+        let store = open_store(paths)?;
+        let (journal, events) = Journal::open_default(&store, &paths.sessions_dir(), session_id)?;
         let mut history = Vec::new();
         let mut cwd = String::new();
         for ev in &events {

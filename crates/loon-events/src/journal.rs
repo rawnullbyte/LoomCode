@@ -27,7 +27,7 @@ use std::sync::Mutex;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
-pub struct Journal {
+pub struct FileJournal {
     dir: PathBuf,
     inner: Mutex<JournalInner>,
 }
@@ -37,9 +37,9 @@ struct JournalInner {
     seq: u64,
 }
 
-impl Journal {
+impl FileJournal {
     /// Create a brand-new session directory. Fails if it already exists.
-    pub fn create(sessions_root: &Path, meta: &SessionMeta) -> Result<Journal> {
+    pub fn create(sessions_root: &Path, meta: &SessionMeta) -> Result<FileJournal> {
         let dir = session_dir(sessions_root, meta.id);
         fs::create_dir_all(dir.join("blobs"))?;
         let meta_path = dir.join("session.json");
@@ -54,14 +54,14 @@ impl Journal {
             .create(true)
             .append(true)
             .open(dir.join("events.jsonl"))?;
-        Ok(Journal {
+        Ok(FileJournal {
             dir,
             inner: Mutex::new(JournalInner { file, seq: 0 }),
         })
     }
 
     /// Open an existing session for appending, replaying its events.
-    pub fn open(sessions_root: &Path, id: EvId) -> Result<(Journal, Vec<Event>)> {
+    pub fn open(sessions_root: &Path, id: EvId) -> Result<(FileJournal, Vec<Event>)> {
         let dir = session_dir(sessions_root, id);
         let events = read_events(&dir.join("events.jsonl"))?;
         let seq = events.last().map(|e| e.seq).unwrap_or(0);
@@ -70,7 +70,7 @@ impl Journal {
             .append(true)
             .open(dir.join("events.jsonl"))?;
         Ok((
-            Journal {
+            FileJournal {
                 dir,
                 inner: Mutex::new(JournalInner { file, seq }),
             },
@@ -126,6 +126,16 @@ impl Journal {
 
 pub fn session_dir(sessions_root: &Path, id: EvId) -> PathBuf {
     sessions_root.join(id.to_string())
+}
+
+pub fn sha256_hex(data: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(data))
+}
+
+/// Alias kept explicit at call sites that specifically want the pre-SQLite layout.
+pub fn list_legacy_sessions(sessions_root: &Path) -> Result<Vec<SessionMeta>> {
+    list_sessions(sessions_root)
 }
 
 /// Read and validate a journal file. Malformed lines are reported with line numbers —
