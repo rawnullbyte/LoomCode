@@ -40,6 +40,9 @@ pub enum Block {
     },
     System(String),
     Member(String),
+    /// Pre-styled lines (the welcome banner); rendered verbatim, scrolls away with
+    /// the transcript like any other block.
+    Rich(Vec<ratatui::text::Line<'static>>),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -70,6 +73,13 @@ pub struct App {
     pub completion_selected: usize,
     /// Set by Esc: hide the popup until the input changes again.
     pub popup_dismissed: bool,
+    /// Text cursor position in the input line, as a char offset (0..=len).
+    pub cursor: usize,
+    /// Popup/input geometry recorded by the last draw, for mouse hit-testing.
+    pub popup_rect: Option<(u16, u16, u16)>, // (x, y, height) incl. border row
+    pub input_rect: Option<(u16, u16)>, // (x, y) of the input text row
+    /// First completion row rendered in the popup window (for click mapping).
+    pub popup_window_start: usize,
 }
 
 impl App {
@@ -87,6 +97,49 @@ impl App {
             turn_started: None,
             completion_selected: 0,
             popup_dismissed: false,
+            cursor: 0,
+            popup_rect: None,
+            input_rect: None,
+            popup_window_start: 0,
+        }
+    }
+
+    /// The welcome banner: logo spark, version, model · mode, workspace — pushed as
+    /// the first transcript block so chat messages scroll it away naturally.
+    pub fn push_welcome_banner(&mut self) {
+        let spark = self.spinner_glyph();
+        self.blocks.insert(
+            0,
+            Block::Rich(vec![
+                ratatui::text::Line::from(vec![
+                    ratatui::text::Span::styled(format!(" {spark} "), theme::accent_fg()),
+                    ratatui::text::Span::styled(
+                        format!("Loon v{}", env!("CARGO_PKG_VERSION")),
+                        theme::user_fg(),
+                    ),
+                ]),
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    format!("   {} · {}", self.status.model, self.status.mode),
+                    theme::system_fg(),
+                )),
+                ratatui::text::Line::from(ratatui::text::Span::styled(
+                    format!("   {}", self.status.cwd),
+                    theme::system_fg(),
+                )),
+                ratatui::text::Line::default(),
+            ]),
+        );
+    }
+
+    /// While the intro plays, keep animating the banner spark glyph (blocks[0]).
+    pub fn update_intro(&mut self) {
+        if self.tick <= 20 {
+            let glyph = self.spinner_glyph();
+            if let Some(Block::Rich(lines)) = self.blocks.first_mut() {
+                if let Some(span) = lines.first_mut().and_then(|l| l.spans.first_mut()) {
+                    span.content = std::borrow::Cow::Owned(format!(" {glyph} "));
+                }
+            }
         }
     }
 
@@ -122,8 +175,18 @@ impl App {
         let idx = self.completion_selected.min(completions.len() - 1);
         let cmd = completions[idx].insert.clone();
         self.input = format!("/{cmd} ");
+        self.cursor = self.input.chars().count();
         self.input_changed();
         true
+    }
+
+    /// Byte offset of the given char index in the input (panics-free on clamps).
+    pub fn cursor_byte_offset(&self, char_idx: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_idx)
+            .map(|(b, _)| b)
+            .unwrap_or(self.input.len())
     }
 
     /// The busy-spinner glyph: six glyphs cycled forward then backward (palindrome),
@@ -203,9 +266,16 @@ impl App {
 
     /// Rendered transcript lines, wrapped to `width`.
     pub fn transcript_lines(&self, width: u16) -> Vec<ratatui::text::Line<'static>> {
-        let mut lines = Vec::new();
+        let mut lines: Vec<ratatui::text::Line<'static>> = Vec::new();
         let w = width.max(8) as usize;
-        let mut push = |prefix: &str, text: &str, style: ratatui::style::Style| {
+        // plain fn (not a closure) so the Rich arm can also borrow `lines`
+        fn push(
+            lines: &mut Vec<ratatui::text::Line<'static>>,
+            prefix: &str,
+            text: &str,
+            style: ratatui::style::Style,
+            w: usize,
+        ) {
             let indent = prefix.chars().count();
             let wrapped = wrap_text(text, w.saturating_sub(indent).max(4));
             for (i, seg) in wrapped.into_iter().enumerate() {
@@ -216,11 +286,11 @@ impl App {
                 };
                 lines.push(ratatui::text::Line::styled(format!("{lead}{seg}"), style));
             }
-        };
+        }
         for b in &self.blocks {
             match b {
-                Block::User(t) => push("you › ", t, theme::user_fg()),
-                Block::Assistant(t) => push("loon › ", t, theme::assistant_fg()),
+                Block::User(t) => push(&mut lines, "you › ", t, theme::user_fg(), w),
+                Block::Assistant(t) => push(&mut lines, "loon › ", t, theme::assistant_fg(), w),
                 Block::Tool {
                     name,
                     ok,
@@ -236,10 +306,13 @@ impl App {
                     } else {
                         ('✗', theme::tool_err_fg())
                     };
-                    push(&format!("  {mark} {name}: "), excerpt, style);
+                    push(&mut lines, &format!("  {mark} {name}: "), excerpt, style, w);
                 }
-                Block::System(t) => push("· ", t, theme::system_fg()),
-                Block::Member(t) => push("↻ ", t, theme::member_fg()),
+                Block::System(t) => push(&mut lines, "· ", t, theme::system_fg(), w),
+                Block::Member(t) => push(&mut lines, "↻ ", t, theme::member_fg(), w),
+                // Pre-styled lines (welcome banner) render verbatim and scroll away
+                // with the rest of the transcript.
+                Block::Rich(rich) => lines.extend(rich.iter().cloned()),
             }
         }
         if let Some(s) = &self.streaming {
@@ -297,7 +370,8 @@ pub async fn run(
         crossterm::execute!(
             stdout,
             crossterm::terminal::EnterAlternateScreen,
-            crossterm::cursor::Hide
+            crossterm::cursor::Hide,
+            crossterm::event::EnableMouseCapture
         )?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend)?;
@@ -305,6 +379,7 @@ pub async fn run(
         // restore before propagating the result
         let _ = crossterm::execute!(
             terminal.backend_mut(),
+            crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen,
             crossterm::cursor::Show
         );
@@ -346,10 +421,9 @@ async fn run_inner(
         cwd: cwd.display().to_string(),
     };
     let mut app = App::new(transparent, status);
+    app.push_welcome_banner();
     app.push_block(Block::System(format!(
-        "Loon ready — model {} · transparent mode {} · Enter sends · Ctrl+C cancels (twice quits) · /quit exits",
-        cfg.model_ref,
-        if transparent { "on" } else { "OFF (opaque)" }
+        "Enter sends · Esc stops (skips to queued) · Ctrl+C cancels (twice quits) · / for commands · /quit exits"
     )));
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(32);
@@ -486,6 +560,7 @@ async fn run_inner(
         }
 
         app.tick();
+        app.update_intro();
         terminal.draw(|f| ui::draw(f, &mut app))?;
         if app.quit {
             break;
@@ -495,6 +570,7 @@ async fn run_inner(
             maybe_ev = events.next() => {
                 match maybe_ev {
                     Some(Ok(CtEvent::Key(key))) => handle_key(&mut app, key, &cmd_tx).await,
+                    Some(Ok(CtEvent::Mouse(m))) => handle_mouse(&mut app, m),
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
                     None => break, // terminal disconnected
@@ -532,6 +608,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         {
             let text = app.input.trim().to_string();
             app.input.clear();
+            app.cursor = 0;
             if text.is_empty() {
                 return;
             }
@@ -555,9 +632,27 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             let _ = cmd_tx.send(UiCommand::Submit(text)).await;
         }
         KeyCode::Backspace => {
-            app.input.pop();
+            if app.cursor > 0 {
+                let char_idx = app.cursor - 1;
+                let byte = app.cursor_byte_offset(char_idx);
+                let byte_end = app.cursor_byte_offset(char_idx + 1);
+                app.input.replace_range(byte..byte_end, "");
+                app.cursor -= 1;
+            }
             app.input_changed();
         }
+        KeyCode::Left => {
+            app.cursor = app.cursor.saturating_sub(1);
+        }
+        KeyCode::Right => {
+            app.cursor = (app.cursor + 1).min(app.input.chars().count());
+        }
+        KeyCode::Home => app.cursor = 0,
+        KeyCode::End => app.cursor = app.input.chars().count(),
+        // single-line input: Up/Down jump to the ends (popup navigation keeps
+        // priority when the popup is visible)
+        KeyCode::Up if app.completion_count() == 0 => app.cursor = 0,
+        KeyCode::Down if app.completion_count() == 0 => app.cursor = app.input.chars().count(),
         KeyCode::PageUp => {
             app.scroll_from_bottom = Some(app.scroll_from_bottom.unwrap_or(0).saturating_add(10));
         }
@@ -581,12 +676,73 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         KeyCode::Esc if app.completion_count() > 0 => {
             app.popup_dismissed = true;
         }
+        // Esc advances: with a turn running, stop it — the driver automatically starts
+        // the next queued prompt, so with a queue Esc means "skip to the next one",
+        // and a second Esc stops that. Idle, it does nothing.
+        KeyCode::Esc if app.status.busy => {
+            let _ = cmd_tx.send(UiCommand::Cancel).await;
+            if !app.cancel_hint_shown {
+                app.push_block(Block::System(
+                    "stopping… queued prompts will run next".into(),
+                ));
+                app.cancel_hint_shown = true;
+            }
+        }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.input.push(c);
+            let byte = app.cursor_byte_offset(app.cursor);
+            app.input.insert(byte, c);
+            app.cursor += 1;
             app.input_changed();
         }
         _ => {}
     }
+}
+
+/// Mouse: wheel scrolls the transcript; click positions the input cursor; click on a
+/// popup row selects that completion.
+fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    match m.kind {
+        MouseEventKind::ScrollUp => {
+            let next = app.scroll_from_bottom.unwrap_or(0).saturating_add(3);
+            app.scroll_from_bottom = Some(next);
+        }
+        MouseEventKind::ScrollDown => match app.scroll_from_bottom {
+            Some(0) | None => app.scroll_from_bottom = None,
+            Some(n) => app.scroll_from_bottom = Some(n.saturating_sub(3)),
+        },
+        MouseEventKind::Down(MouseButton::Left) => {
+            // popup rows select+accept
+            if let Some((px, py, ph)) = app.popup_rect {
+                if m.row > py && m.row < py + ph {
+                    let row = (m.row - py - 1) as usize; // skip border row
+                    let completions = app.visible_completions();
+                    let idx = app.popup_window_start + row;
+                    if idx < completions.len() {
+                        app.completion_selected = idx;
+                        app.accept_completion();
+                    }
+                    return;
+                }
+            }
+            // input row positions the text cursor
+            if let Some((ix, iy)) = app.input_rect {
+                if m.row == iy && m.column > ix {
+                    let col = (m.column - ix - 1) as usize; // -1: prompt glyph
+                    app.cursor = click_col_to_cursor(m.column, ix, app.input.chars().count());
+                    let _ = col;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Map a clicked column to a char offset in the input line. The input row renders as
+/// `› {input}` starting at inner x; clicking anywhere past the end clamps to the end.
+fn click_col_to_cursor(column: u16, inner_x: u16, input_chars: usize) -> usize {
+    let offset = (column as usize).saturating_sub(inner_x as usize + 2); // prompt glyph + space
+    offset.min(input_chars)
 }
 
 #[cfg(test)]

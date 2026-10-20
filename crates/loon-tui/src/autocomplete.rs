@@ -43,7 +43,11 @@ mod tests {
     #[test]
     fn empty_slash_lists_everything_in_table_order() {
         let c = completions_for("/");
-        assert_eq!(c.len(), 12, "one entry per command_list row");
+        assert_eq!(
+            c.len(),
+            command_list().len(),
+            "one entry per command_list row"
+        );
         assert_eq!(c[0].insert, "help");
         assert_eq!(c[0].description, "this list");
         // order follows the table: help before undo before redo…

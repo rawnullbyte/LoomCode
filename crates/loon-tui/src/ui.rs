@@ -27,6 +27,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         Constraint::Length(3),
     ])
     .areas(area);
+    app.popup_rect = None;
+    app.input_rect = Some((input.x + 1, input.y + 1));
 
     let theme = theme::Theme::from_mode(if app.transparent {
         loon_config::AppearanceMode::Transparent

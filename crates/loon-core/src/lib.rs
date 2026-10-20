@@ -14,6 +14,7 @@ pub mod permissions;
 pub mod prompt;
 pub mod replay;
 pub mod rewind;
+pub mod skills;
 pub mod subagent;
 pub mod verify;
 
@@ -74,6 +75,18 @@ impl std::fmt::Debug for AgentConfig {
             .field("context_window", &self.context_window)
             .field("extra_tools", &self.extra_tools.len())
             .finish()
+    }
+}
+
+impl TurnStatus {
+    /// Short honest status word for embedders.
+    pub fn status_text(&self) -> &'static str {
+        match self {
+            TurnStatus::Completed => "completed",
+            TurnStatus::Cancelled => "cancelled",
+            TurnStatus::Failed(_) => "failed",
+            TurnStatus::BudgetPaused { .. } => "budget paused",
+        }
     }
 }
 
@@ -139,6 +152,10 @@ pub struct Agent {
     pub summarizer: Option<compaction::Summarizer>,
     /// Loon data dir (for memory and friends). Set at construction.
     pub data_dir: PathBuf,
+    /// Loon config dir (for /config persistence).
+    pub config_dir: PathBuf,
+    /// User-defined skills (custom slash commands), loaded at construction.
+    pub skills: Vec<skills::Skill>,
     system_prompt: String,
     session_id: loon_events::EvId,
 }
@@ -248,6 +265,8 @@ impl Agent {
             approval_hook: None,
             summarizer: None,
             data_dir: paths.data_dir.clone(),
+            config_dir: paths.config_dir.clone(),
+            skills: skills::load(&paths.data_dir, Path::new(&cwd)),
             cfg,
             system_prompt: system,
             session_id,
@@ -351,6 +370,8 @@ impl Agent {
             approval_hook: None,
             summarizer: None,
             data_dir: paths.data_dir.clone(),
+            config_dir: paths.config_dir.clone(),
+            skills: skills::load(&paths.data_dir, Path::new(&cwd)),
             cfg,
             system_prompt: prompt::system_prompt(Path::new(&cwd)),
             session_id,
@@ -374,6 +395,10 @@ impl Agent {
 
     /// Execute the agent loop for the current history state (used after resume too).
     pub async fn execute_turn(&mut self) -> TurnResult {
+        // A new turn starts fresh: a cancellation left over from a previous turn (or
+        // from an idle Esc/Ctrl+C) must not poison this one. Cancelling DURING the
+        // turn still works — the flag is re-set from the UI while this loop runs.
+        let _ = self.cancel_tx.send(false);
         let turn_id = loon_events::EvId::now_v7();
         let _ = self
             .journal

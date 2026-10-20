@@ -34,11 +34,22 @@ pub enum SlashCommand {
     Model {
         reference: Option<String>,
     },
+    /// /config — show; /config set <key> <value> — change and persist.
+    Config {
+        args: Vec<String>,
+    },
+    /// A user-defined skill (`/name args…`) from `skills/*.md`. Resolved against the
+    /// agent's loaded skills; a name with no skill behind it is an unknown command.
+    Skill {
+        name: String,
+        args: String,
+    },
     Quit,
 }
 
-/// Parse one input line starting with `/`. Returns None for non-commands and for
-/// unknown commands (the caller reports those as plain errors).
+/// Parse one input line starting with `/`. Returns None for non-commands. Unknown
+/// names come back as [`SlashCommand::Skill`] and are resolved (or refused) by the
+/// agent, which knows the loaded skill set.
 pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
     let line = input.trim();
     let rest = line.strip_prefix('/')?;
@@ -97,8 +108,17 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         "model" => SlashCommand::Model {
             reference: (!args.is_empty()).then(|| args.join(" ")),
         },
+        "config" => SlashCommand::Config {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
         "quit" | "exit" => SlashCommand::Quit,
-        other => return Some(Err(format!("unknown command `/{other}` — try /help"))),
+        // Anything else may be a user-defined skill: resolved against the agent's
+        // loaded skills; a miss is reported as an unknown command with the same wording
+        // as before.
+        other => SlashCommand::Skill {
+            name: other.to_string(),
+            args: args.join(" "),
+        },
     };
     Some(Ok(cmd))
 }
@@ -124,6 +144,7 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
             "show or save persistent memory",
         ),
         ("model [REF]", "show or switch model/combos:NAME"),
+        ("config [set K V]", "show or change + persist configuration"),
         ("quit", "exit"),
     ]
 }
@@ -255,8 +276,182 @@ impl Agent {
                     ))
                 }
             },
+            SlashCommand::Skill { name, args } => {
+                let Some(skill) = self.skills.iter().find(|s| s.name == name).cloned() else {
+                    return Err(format!("unknown command `/{name}` — try /help"));
+                };
+                let prompt = crate::skills::expand(&skill.body, &args);
+                self.emit(crate::AgentEvent::MemberNote(format!(
+                    "running skill /{} ({} scope)",
+                    skill.name, skill.scope
+                )));
+                let result = self.run_turn(&prompt).await;
+                Ok(format!(
+                    "[skill /{} {}] {}",
+                    skill.name,
+                    result.status.status_text(),
+                    result.assistant_text
+                ))
+            }
+            SlashCommand::Config { args } => Ok(self.run_config_command(args).await?),
             SlashCommand::Quit => unreachable!("quit handled by the caller"),
         }
+    }
+
+    /// /config — `show` (default) renders the effective configuration; `set <key>
+    /// <value>` changes the live session AND persists to the config file through the
+    /// comment-preserving save path, reported separately so the user knows what stuck.
+    async fn run_config_command(&mut self, args: Vec<String>) -> Result<String, String> {
+        match args.first().map(|s| s.as_str()) {
+            None | Some("show") => Ok(self.config_report()),
+            Some("set") => {
+                let key = args
+                    .get(1)
+                    .ok_or("usage: /config set <key> <value> — keys: model, max_steps, context_window, permission_mode, tool_output_bytes")?;
+                let value = args.get(2).ok_or("missing <value>")?;
+                self.config_set(key, value)
+            }
+            Some(other) => Err(format!(
+                "unknown /config subcommand `{other}` — use /config or /config set <key> <value>"
+            )),
+        }
+    }
+
+    fn config_report(&self) -> String {
+        let p = &self.cfg.permissions;
+        format!(
+            "effective configuration\n  model: {}\n  context window: {} tokens (compaction at {}%)\n  max steps: {}\n  permission mode: {} ({} allow / {} deny rules)\n  tool output cap: {} bytes\n  appearance dir: config at {}",
+            self.cfg.model_ref,
+            self.cfg.context_window,
+            (crate::compaction::COMPACT_THRESHOLD * 100.0) as u32,
+            self.cfg.max_steps,
+            match p.mode {
+                loon_config::PermissionMode::Bypass => "bypass",
+                loon_config::PermissionMode::Ask => "ask",
+                loon_config::PermissionMode::Allowlist => "allowlist",
+            },
+            p.allow_rules.len(),
+            p.deny_rules.len(),
+            self.cfg.tool_output_bytes,
+            self.config_dir.join("config.toml").display(),
+        )
+    }
+
+    fn config_set(&mut self, key: &str, value: &str) -> Result<String, String> {
+        let applied = match key {
+            "model" => {
+                self.registry.resolve(value)?;
+                self.cfg.model_ref = value.to_string();
+                "model switched (next request uses it)".to_string()
+            }
+            "max_steps" => {
+                let v: u32 = value
+                    .parse()
+                    .map_err(|_| "max_steps must be a positive integer")?;
+                self.cfg.max_steps = v;
+                format!("max steps set to {v}")
+            }
+            "context_window" => {
+                let v: u64 = value
+                    .parse()
+                    .map_err(|_| "context_window must be an integer (0 disables compaction)")?;
+                self.cfg.context_window = v;
+                format!("context window set to {v}")
+            }
+            "permission_mode" => {
+                let mode = match value {
+                    "bypass" => loon_config::PermissionMode::Bypass,
+                    "ask" => loon_config::PermissionMode::Ask,
+                    "allowlist" => loon_config::PermissionMode::Allowlist,
+                    other => return Err(format!("unknown permission mode `{other}` (bypass|ask|allowlist)")),
+                };
+                self.cfg.permissions.mode = mode;
+                format!("permission mode set to {value} (rules unchanged)")
+            }
+            "tool_output_bytes" => {
+                let v: usize = value
+                    .parse()
+                    .map_err(|_| "tool_output_bytes must be an integer")?;
+                self.cfg.tool_output_bytes = v;
+                self.ctx.output_limit = v;
+                format!("tool output cap set to {v} bytes")
+            }
+            other => {
+                return Err(format!(
+                    "unknown key `{other}` — keys: model, max_steps, context_window, permission_mode, tool_output_bytes"
+                ))
+            }
+        };
+        let persisted = self.persist_config_value(key, value);
+        match persisted {
+            Ok(()) => Ok(format!(
+                "{applied}; saved to {}",
+                self.config_dir.join("config.toml").display()
+            )),
+            Err(e) => Ok(format!("{applied}; NOT persisted: {e}")),
+        }
+    }
+
+    /// Persist one scalar to the user's config.toml, preserving comments and unknown
+    /// tables (save goes through toml_edit overlay). Session-effective even if this
+    /// fails, and the result says which happened.
+    fn persist_config_value(&self, key: &str, value: &str) -> Result<(), String> {
+        let paths = loon_config::LoonPaths {
+            config_dir: self.config_dir.clone(),
+            data_dir: self.data_dir.clone(),
+            state_dir: self
+                .data_dir
+                .parent()
+                .map(|p| p.join("state"))
+                .unwrap_or_default(),
+            cache_dir: self
+                .data_dir
+                .parent()
+                .map(|p| p.join("cache"))
+                .unwrap_or_default(),
+            runtime_dir: self
+                .data_dir
+                .parent()
+                .map(|p| p.join("runtime"))
+                .unwrap_or_default(),
+        };
+        let (mut cfg, findings) =
+            loon_config::Config::load_or_builtin(&paths).map_err(|e| e.to_string())?;
+        if !findings.is_empty() {
+            // do not overwrite a config the validator flags; report instead
+            let msgs: Vec<String> = findings.iter().map(|f| format!("{f:?}")).collect();
+            return Err(format!(
+                "existing config has validation findings; fix them before persisting: {}",
+                msgs.join("; ")
+            ));
+        }
+        match key {
+            "model" => cfg.session.model = value.to_string(),
+            "max_steps" => cfg.session.max_steps = value.parse().map_err(|_| "bad integer")?,
+            "context_window" => {
+                if let Some(def) = cfg.models.get_mut(&self.cfg.model_ref) {
+                    def.context_window = Some(value.parse().map_err(|_| "bad integer")?);
+                } else {
+                    return Err(format!(
+                        "model `{}` is not in [models]; nothing to persist it to",
+                        self.cfg.model_ref
+                    ));
+                }
+            }
+            "permission_mode" => {
+                cfg.permissions.mode = match value {
+                    "bypass" => loon_config::PermissionMode::Bypass,
+                    "ask" => loon_config::PermissionMode::Ask,
+                    "allowlist" => loon_config::PermissionMode::Allowlist,
+                    _ => return Err("bad mode".into()),
+                };
+            }
+            "tool_output_bytes" => {
+                cfg.session.tool_output_bytes = value.parse().map_err(|_| "bad integer")?
+            }
+            other => return Err(format!("unknown key {other}")),
+        }
+        cfg.save(&paths).map_err(|e| e.to_string())
     }
 
     fn events(&self) -> Result<Vec<loon_events::model::Event>, String> {
@@ -376,7 +571,21 @@ mod tests {
             parse("/model"),
             Some(Ok(SlashCommand::Model { reference: None }))
         );
-        assert!(matches!(parse("/nope"), Some(Err(_))));
+        // unknown names parse as Skill and are refused at execution time
+        assert_eq!(
+            parse("/nope"),
+            Some(Ok(SlashCommand::Skill {
+                name: "nope".into(),
+                args: String::new()
+            }))
+        );
+        assert_eq!(
+            parse("/ship now please"),
+            Some(Ok(SlashCommand::Skill {
+                name: "ship".into(),
+                args: "now please".into()
+            }))
+        );
         assert_eq!(parse("plain text"), None);
     }
 
