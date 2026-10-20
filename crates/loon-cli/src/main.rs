@@ -228,12 +228,21 @@ async fn run_headless(cli: Cli) -> i32 {
             cfg.mcp.servers.len()
         );
     }
-    let tools =
-        loon_core::subagent::default_tools(&paths, &workspace, &agent_cfg, registry.clone())
-            .with_extra(mcp_tools);
+    let loop_registry = std::sync::Arc::new(loon_core::loops::LoopRegistry::new());
+    let tools = loon_core::subagent::default_tools(
+        &paths,
+        &workspace,
+        &agent_cfg,
+        registry.clone(),
+        Some(loop_registry.clone()),
+    )
+    .with_extra(mcp_tools);
     let mut agent =
         match Agent::new_session(&paths, agent_cfg, registry.clone(), tools, workspace, true) {
-            Ok(a) => a,
+            Ok(mut a) => {
+                a.loops = loop_registry.clone();
+                a
+            }
             Err(e) => {
                 eprintln!("loon: session: {e}");
                 return 1;

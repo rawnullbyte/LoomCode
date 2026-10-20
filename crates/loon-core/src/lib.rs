@@ -8,6 +8,7 @@ pub mod commands;
 pub mod compaction;
 pub mod est;
 pub mod index;
+pub mod loops;
 pub mod mcp;
 pub mod memory;
 pub mod permissions;
@@ -160,6 +161,9 @@ pub struct Agent {
     pub config_dir: PathBuf,
     /// User-defined skills (custom slash commands), loaded at construction.
     pub skills: Vec<skills::Skill>,
+    /// Loop tasks (recurring prompts). The host scheduler polls `take_due`; the agent
+    /// cancels through the same registry via the loop_cancel tool.
+    pub loops: Arc<loops::LoopRegistry>,
     system_prompt: String,
     session_id: loon_events::EvId,
 }
@@ -271,6 +275,7 @@ impl Agent {
             data_dir: paths.data_dir.clone(),
             config_dir: paths.config_dir.clone(),
             skills: skills::load(&paths.data_dir, Path::new(&cwd)),
+            loops: Arc::new(loops::LoopRegistry::new()),
             cfg,
             system_prompt: system,
             session_id,
@@ -384,6 +389,7 @@ impl Agent {
             data_dir: paths.data_dir.clone(),
             config_dir: paths.config_dir.clone(),
             skills: skills::load(&paths.data_dir, Path::new(&cwd)),
+            loops: Arc::new(loops::LoopRegistry::new()),
             cfg,
             system_prompt: prompt::system_prompt(Path::new(&cwd)),
             session_id,

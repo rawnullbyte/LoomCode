@@ -94,6 +94,9 @@ pub struct App {
     pub transcript_rect: Option<(u16, u16, u16, u16)>,
     /// Active text selection (drag); Some while selecting, copied on release.
     pub selection: Option<SelRange>,
+    /// Pending ask-mode approval: tool, args excerpt, and the answer channel. Modal —
+    /// keys other than y/n/Esc are ignored while set.
+    pub pending_approval: Option<(String, String, tokio::sync::oneshot::Sender<bool>)>,
 }
 
 impl App {
@@ -117,6 +120,7 @@ impl App {
             popup_window_start: 0,
             transcript_rect: None,
             selection: None,
+            pending_approval: None,
         }
     }
 
@@ -429,20 +433,51 @@ async fn run_inner(
     transparent: bool,
     cwd: PathBuf,
 ) -> anyhow::Result<()> {
-    let agent = Arc::new(Mutex::new(
-        Agent::new_session(
+    let loop_registry = std::sync::Arc::new(loon_core::loops::LoopRegistry::new());
+    let agent = Arc::new(Mutex::new({
+        let mut a = Agent::new_session(
             paths,
             cfg.clone(),
             registry.clone(),
-            loon_core::subagent::default_tools(paths, &cwd, &cfg, registry),
+            loon_core::subagent::default_tools(
+                paths,
+                &cwd,
+                &cfg,
+                registry.clone(),
+                Some(loop_registry.clone()),
+            ),
             cwd.clone(),
             false,
         )
-        .map_err(|e| anyhow::anyhow!("session init: {e}"))?,
-    ));
+        .map_err(|e| anyhow::anyhow!("session init: {e}"))?;
+        a.loops = loop_registry.clone();
+        a
+    }));
     let (ev_tx, mut ev_rx) = mpsc::channel::<AgentEvent>(1024);
     let (slash_tx, mut slash_rx) = mpsc::channel::<String>(64);
     agent.lock().await.set_event_sink(ev_tx.clone());
+    // Ask-mode approvals: the agent (holding its own lock inside the turn) asks
+    // through this lock-free channel; the UI answers via a oneshot. y approves, n or
+    // Esc refuses.
+    let (approval_tx, mut approval_rx) = mpsc::channel::<(
+        loon_core::permissions::ApprovalRequest,
+        tokio::sync::oneshot::Sender<bool>,
+    )>(8);
+    {
+        let approval_tx = approval_tx.clone();
+        let hook: loon_core::permissions::ApprovalHook =
+            Arc::new(move |req: loon_core::permissions::ApprovalRequest| {
+                let tx = approval_tx.clone();
+                Box::pin(async move {
+                    let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+                    if tx.send((req, answer_tx)).await.is_err() {
+                        return false;
+                    }
+                    answer_rx.await.unwrap_or(false)
+                })
+            });
+        agent.lock().await.approval_hook = Some(hook);
+    }
 
     let status = StatusLine {
         model: cfg.model_ref.clone(),
@@ -468,7 +503,33 @@ async fn run_inner(
             tokio::task::JoinHandle<TurnResult>,
             mpsc::Sender<AgentEvent>,
         )> = None;
-        while let Some(cmd) = cmd_rx.recv().await {
+        loop {
+            let cmd = tokio::select! {
+                cmd = cmd_rx.recv() => match cmd {
+                    Some(c) => c,
+                    None => break,
+                },
+                _ = tokio::time::sleep(Duration::from_millis(250)) => {
+                    // Loop-task scheduler: due prompts enter the normal queue (or start
+                    // immediately when idle) — the same path as a typed submission.
+                    for (_id, prompt) in loop_registry.take_due() {
+                        if running.is_some() {
+                            let _ = prompt_queue.push(prompt);
+                        } else {
+                            let a = agent.clone();
+                            let tx = ev_tx.clone();
+                            running = Some((
+                                tokio::spawn(async move {
+                                    let mut guard = a.lock().await;
+                                    guard.run_turn(&prompt).await
+                                }),
+                                tx,
+                            ));
+                        }
+                    }
+                    continue;
+                }
+            };
             match cmd {
                 UiCommand::Submit(text) => {
                     if running.is_some() {
@@ -571,6 +632,13 @@ async fn run_inner(
     loop {
         while let Ok(out) = slash_rx.try_recv() {
             app.push_block(Block::System(out));
+        }
+        while let Ok((req, answer_tx)) = approval_rx.try_recv() {
+            app.push_block(Block::System(format!(
+                "approve? (y/n) {} {}",
+                req.tool, req.args_excerpt
+            )));
+            app.pending_approval = Some((req.tool, req.args_excerpt, answer_tx));
         }
         while let Ok(ev) = ev_rx.try_recv() {
             match ev {
@@ -685,6 +753,26 @@ async fn run_inner(
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiCommand>) {
+    // A pending approval is modal: y approves, n or Esc refuses, everything else is
+    // swallowed so the turn cannot be poked while it waits.
+    if let Some((tool, _excerpt, answer_tx)) = app.pending_approval.take() {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let _ = answer_tx.send(true);
+                app.push_block(Block::System(format!("approved: {tool}")));
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                let _ = answer_tx.send(false);
+                app.push_block(Block::System(format!("refused: {tool}")));
+            }
+            other => {
+                // not an answer: keep waiting
+                app.pending_approval = Some((tool, _excerpt, answer_tx));
+                let _ = other;
+            }
+        }
+        return;
+    }
     match key.code {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             if app.status.busy {

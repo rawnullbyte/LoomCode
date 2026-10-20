@@ -51,7 +51,7 @@ async fn delegate_runs_a_child_session_and_returns_its_report() {
         context_window: 128_000,
         extra_tools: Vec::new(),
     };
-    let tools = loon_core::subagent::default_tools(&paths, &ws, &cfg, registry.clone());
+    let tools = loon_core::subagent::default_tools(&paths, &ws, &cfg, registry.clone(), None);
     let mut agent = Agent::new_session(&paths, cfg, registry, tools, ws.clone(), true).unwrap();
     let r = agent.run_turn("find out what answer() returns").await;
     assert!(matches!(r.status, loon_core::TurnStatus::Completed));
@@ -82,7 +82,7 @@ async fn child_session_has_no_delegate_tool() {
     let paths = test_paths(tmp.path());
     paths.ensure().unwrap();
     let cfg = AgentConfig::from(&loon_config::SessionCfg::default());
-    let tools = loon_core::subagent::default_tools(&paths, &ws, &cfg, registry.clone());
+    let tools = loon_core::subagent::default_tools(&paths, &ws, &cfg, registry.clone(), None);
     let agent = Agent::new_session(&paths, cfg, registry, tools, ws.clone(), true).unwrap();
     let names: Vec<String> = agent.tools.specs().iter().map(|s| s.name.clone()).collect();
     assert!(names.contains(&"delegate".to_string()));

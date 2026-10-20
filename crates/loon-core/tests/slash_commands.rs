@@ -6,6 +6,7 @@ use loon_config::LoonPaths;
 use loon_core::commands::SlashCommand;
 use loon_core::Agent;
 use loon_providers::{MockScript, ProviderRegistry};
+use serde_json::json;
 use std::sync::Arc;
 
 fn test_paths(dir: &std::path::Path) -> LoonPaths {
@@ -117,6 +118,80 @@ async fn slash_commands_execute_honestly() {
     // compact with only recent exchanges: honest no-op
     let out = a.run_slash(SlashCommand::Compact).await.unwrap();
     assert!(out.contains("nothing to compact"));
+
+    // loop tasks: create, list, cancel, cancel-again-refuses
+    let out = a
+        .run_slash(SlashCommand::Loop {
+            interval: "1m".into(),
+            prompt: "check CI".into(),
+        })
+        .await
+        .unwrap();
+    assert!(out.contains("loop #1"), "{out}");
+    let out = a.run_slash(SlashCommand::Loops).await.unwrap();
+    assert!(out.contains("#1"), "{out}");
+    assert!(out.contains("check CI"));
+    let out = a
+        .run_slash(SlashCommand::LoopCancel { id: 1 })
+        .await
+        .unwrap();
+    assert!(out.contains("cancelled"));
+    assert!(a
+        .run_slash(SlashCommand::LoopCancel { id: 1 })
+        .await
+        .is_err());
+    // bad interval refused
+    assert!(a
+        .run_slash(SlashCommand::Loop {
+            interval: "xm".into(),
+            prompt: "nope".into(),
+        })
+        .await
+        .is_err());
+    // the agent-side tool cancels through the same registry
+    a.run_slash(SlashCommand::Loop {
+        interval: "5m".into(),
+        prompt: "watch the deploy".into(),
+    })
+    .await
+    .unwrap();
+    let tool = loon_core::subagent::default_tools(
+        &paths_tmp(tmp.path()),
+        &ws,
+        &loon_core::AgentConfig::from(&loon_config::SessionCfg::default()),
+        Arc::new(loon_providers::ProviderRegistry::with_mock(Arc::new(
+            loon_providers::MockProvider::new(),
+        ))),
+        Some(a.loops.clone()),
+    )
+    .get("loop_cancel")
+    .expect("loop_cancel registered");
+    let ctx = tool_ctx(&ws);
+    let out = tool
+        .run(json!({"id": 2}), &ctx)
+        .await
+        .expect("cancel live loop");
+    assert!(out.text.contains("cancelled"));
+    assert!(a
+        .run_slash(SlashCommand::LoopCancel { id: 2 })
+        .await
+        .is_err());
+}
+
+fn paths_tmp(dir: &std::path::Path) -> LoonPaths {
+    test_paths(dir)
+}
+
+fn tool_ctx(ws: &std::path::Path) -> loon_tools::ToolCtx {
+    let (_tx, rx) = tokio::sync::watch::channel(false);
+    loon_tools::ToolCtx {
+        ws: Arc::new(loon_workspace::Workspace::new(ws, vec![]).unwrap()),
+        output_limit: 4096,
+        default_timeout: std::time::Duration::from_secs(10),
+        child_env: Default::default(),
+        cancel: rx,
+        blob_sink: None,
+    }
 }
 
 #[tokio::test]

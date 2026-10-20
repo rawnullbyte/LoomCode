@@ -38,6 +38,17 @@ pub enum SlashCommand {
     Config {
         args: Vec<String>,
     },
+    /// /loop <interval> <prompt> — recurring prompt task.
+    Loop {
+        interval: String,
+        prompt: String,
+    },
+    /// /loops — list loop tasks.
+    Loops,
+    /// /loopcancel <id> — cancel one loop task.
+    LoopCancel {
+        id: u64,
+    },
     /// A user-defined skill (`/name args…`) from `skills/*.md`. Resolved against the
     /// agent's loaded skills; a name with no skill behind it is an unknown command.
     Skill {
@@ -111,6 +122,14 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         "config" => SlashCommand::Config {
             args: args.iter().map(|s| s.to_string()).collect(),
         },
+        "loop" => SlashCommand::Loop {
+            interval: args.first().copied().unwrap_or_default().to_string(),
+            prompt: args.get(1..).map(|a| a.join(" ")).unwrap_or_default(),
+        },
+        "loops" => SlashCommand::Loops,
+        "loopcancel" => SlashCommand::LoopCancel {
+            id: args.first().and_then(|a| a.parse().ok()).unwrap_or(0),
+        },
         "quit" | "exit" => SlashCommand::Quit,
         // Anything else may be a user-defined skill: resolved against the agent's
         // loaded skills; a miss is reported as an unknown command with the same wording
@@ -145,8 +164,22 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
         ),
         ("model [REF]", "show or switch model/combos:NAME"),
         ("config [set K V]", "show or change + persist configuration"),
+        (
+            "loop <interval> <prompt>",
+            "run a prompt on an interval, e.g. /loop 1m check CI",
+        ),
+        ("loops", "list loop tasks"),
+        ("loopcancel <id>", "cancel a loop task"),
         ("quit", "exit"),
     ]
+}
+
+fn truncate_prompt(p: &str, max: usize) -> String {
+    if p.chars().count() <= max {
+        p.to_string()
+    } else {
+        p.chars().take(max).collect::<String>() + "…"
+    }
 }
 
 pub fn help_text() -> String {
@@ -294,6 +327,38 @@ impl Agent {
                 ))
             }
             SlashCommand::Config { args } => Ok(self.run_config_command(args).await?),
+            SlashCommand::Loop { interval, prompt } => {
+                if prompt.trim().is_empty() {
+                    return Err("usage: /loop <interval> <prompt> — e.g. /loop 1m check CI".into());
+                }
+                let dur = crate::loops::parse_interval(&interval)
+                    .map_err(|e| format!("bad interval `{interval}`: {e}"))?;
+                let id = self.loops.create(dur, prompt);
+                Ok(format!(
+                    "loop #{id} scheduled every {interval} — /loops lists, /loopcancel {id} stops it"
+                ))
+            }
+            SlashCommand::Loops => {
+                if self.loops.is_empty() {
+                    return Ok("no loop tasks (create with /loop <interval> <prompt>)".into());
+                }
+                let mut out = String::from("loop tasks:\n");
+                for (id, interval, remaining, prompt) in self.loops.list() {
+                    out.push_str(&format!(
+                        "  #{id}: every {}s (next in {remaining}s) — {}\n",
+                        interval.as_secs(),
+                        truncate_prompt(&prompt, 60)
+                    ));
+                }
+                Ok(out)
+            }
+            SlashCommand::LoopCancel { id } => {
+                if self.loops.cancel(id) {
+                    Ok(format!("loop #{id} cancelled"))
+                } else {
+                    Err(format!("no loop task #{id} — /loops lists live ones"))
+                }
+            }
             SlashCommand::Quit => unreachable!("quit handled by the caller"),
         }
     }

@@ -114,19 +114,70 @@ impl loon_tools::Tool for DelegateTool {
     }
 }
 
+/// `loop_cancel`: lets the AGENT cancel loop tasks the user created.
+pub struct LoopCancelTool {
+    pub registry: Arc<crate::loops::LoopRegistry>,
+}
+
+#[async_trait::async_trait]
+impl loon_tools::Tool for LoopCancelTool {
+    fn spec(&self) -> loon_tools::ToolSpec {
+        loon_tools::ToolSpec {
+            name: "loop_cancel".into(),
+            description: "Cancel one recurring loop task (created by /loop). Pass the numeric task id; /loops in the session lists live ids. The user sees the cancellation.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "integer", "description": "Loop task id to cancel."}
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            effects: loon_tools::Effects::Mutating,
+        }
+    }
+
+    async fn run(
+        &self,
+        args: serde_json::Value,
+        _ctx: &loon_tools::ToolCtx,
+    ) -> Result<loon_tools::ToolOutput, loon_tools::ToolError> {
+        let id = args["id"]
+            .as_u64()
+            .ok_or_else(|| loon_tools::ToolError::InvalidArgs("id required".into()))?;
+        if self.registry.cancel(id) {
+            Ok(loon_tools::ToolOutput::ok(format!(
+                "loop #{id} cancelled (the user has been notified through the session)"
+            )))
+        } else {
+            Err(loon_tools::ToolError::Other(format!("no loop task #{id}")))
+        }
+    }
+}
+
 /// The host-level default toolset: workspace tools + memory + delegate.
 pub fn default_tools(
     paths: &LoonPaths,
     cwd: &std::path::Path,
     cfg: &AgentConfig,
     registry: Arc<ProviderRegistry>,
+    loops: Option<Arc<crate::loops::LoopRegistry>>,
 ) -> loon_tools::ToolRegistry {
-    loon_tools::ToolRegistry::standard().with_extra(vec![
-        Arc::new(MemoryTool {
-            paths: Arc::new(memory::MemoryPaths::resolve(&paths.data_dir, cwd)),
-        }),
-        delegate_tool(paths.clone(), cfg.clone(), registry, cwd.to_path_buf(), 24),
-    ])
+    let mut extra: Vec<Arc<dyn loon_tools::Tool>> = vec![Arc::new(MemoryTool {
+        paths: Arc::new(memory::MemoryPaths::resolve(&paths.data_dir, cwd)),
+    })];
+    if let Some(loops) = loops {
+        extra.push(Arc::new(LoopCancelTool { registry: loops }));
+    }
+    loon_tools::ToolRegistry::standard()
+        .with_extra(extra)
+        .with_extra(vec![delegate_tool(
+            paths.clone(),
+            cfg.clone(),
+            registry,
+            cwd.to_path_buf(),
+            24,
+        )])
 }
 
 #[cfg(test)]
