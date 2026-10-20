@@ -75,7 +75,9 @@ tests; also handy for trying Loon without touching your real config).
   no recursion, cancellation propagation (`tests/subagent.rs`); interactive y/n
   approvals in ask mode; loop tasks the agent can cancel via `loop_cancel`. Interactive /config
   opens a modal settings menu (arrows/enter/esc toggling permission mode,
-  autocompact, effort, theme). Not done: reviewer-based auto-approval mode.
+  autocompact, effort, theme). Permission modes: bypass,
+  auto (reviewer agent checks calls, doubtful ones ask you), manual (ask), allowlist —
+  Shift+Tab cycles, config selects the default.
 - **M5 integrations — MCP implemented, rest not.** MCP stdio client ships
   (`crates/loon-core/src/mcp.rs`): initialize handshake, tools/list, tools/call over
   newline-delimited JSON-RPC against real spawned servers
@@ -140,7 +142,7 @@ crates/
 
 ```sh
 cargo build                 # zero warnings
-cargo test                  # 138 tests, all suites green
+cargo test                  # 141 tests, all suites green
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 LOON_HOME=$(mktemp -d) target/debug/loon run "smoke" --output jsonl
