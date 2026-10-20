@@ -10,6 +10,8 @@ pub mod ui;
 
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
+pub mod queue;
+
 use loon_core::{Agent, AgentConfig, AgentEvent, TurnResult, TurnStatus};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -272,6 +274,7 @@ async fn run_inner(
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(32);
 
     // Driver: one turn at a time; cancellation stays responsive while a turn runs.
+    let mut prompt_queue = queue::PromptQueue::new(16);
     let driver_slash_tx = slash_tx.clone();
     let driver = tokio::spawn(async move {
         let mut running: Option<(
@@ -282,7 +285,21 @@ async fn run_inner(
             match cmd {
                 UiCommand::Submit(text) => {
                     if running.is_some() {
-                        continue; // one turn at a time in M1
+                        // Queue instead of dropping; position is visible via the
+                        // queued event the UI prints.
+                        match prompt_queue.push(text.clone()) {
+                            Ok(n) => {
+                                let _ = ev_tx
+                                    .send(AgentEvent::Warning(format!(
+                                        "queued ({n} pending) — runs after the current turn"
+                                    )))
+                                    .await;
+                            }
+                            Err(reason) => {
+                                let _ = ev_tx.send(AgentEvent::Warning(reason)).await;
+                            }
+                        }
+                        continue;
                     }
                     let a = agent.clone();
                     let tx = ev_tx.clone();
@@ -321,10 +338,22 @@ async fn run_inner(
                     }
                 }
             }
-            // Reap finished turns without blocking command handling.
+            // Reap finished turns without blocking command handling; a finished turn
+            // releases the queued prompt, if any.
             if let Some((h, _)) = &running {
                 if h.is_finished() {
                     running = None;
+                    if let Some(next) = prompt_queue.pop() {
+                        let a = agent.clone();
+                        let tx = ev_tx.clone();
+                        running = Some((
+                            tokio::spawn(async move {
+                                let mut guard = a.lock().await;
+                                guard.run_turn(&next).await
+                            }),
+                            tx,
+                        ));
+                    }
                 }
             }
         }
