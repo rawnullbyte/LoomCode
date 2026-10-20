@@ -48,9 +48,10 @@ fn typing_slash_opens_popup_showing_all_commands() {
     a.input = "/".into();
     let t = draw(&mut a);
     // popup sits just above the input; with 12 commands it is capped at 6 rows
-    // layout: 6 content rows + 1 border row above the 3-row input → content at 15..21
+    // layout: 6 content rows + 1 border row above the 3-row input + 1 footer row
+    // → content at 14..20
     let rows: Vec<String> = (0..6)
-        .map(|i| row_text(&t, 24 - 3 - 7 + 1 + i, 80))
+        .map(|i| row_text(&t, 24 - 3 - 1 - 7 + 1 + i, 80))
         .collect();
     let joined = rows.join("\n");
     assert!(joined.contains("/help"), "{joined}");
@@ -77,7 +78,7 @@ fn prefix_narrows_and_selection_renders_highlighted() {
     a.input = "/re".into();
     let t = draw(&mut a);
     let rows: Vec<String> = (0..2)
-        .map(|i| row_text(&t, 24 - 3 - 3 + 1 + i, 80))
+        .map(|i| row_text(&t, 24 - 3 - 1 - 3 + 1 + i, 80))
         .collect();
     let joined = rows.join("\n");
     assert!(joined.contains("/redo"), "{joined}");

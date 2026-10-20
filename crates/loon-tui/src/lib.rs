@@ -26,6 +26,7 @@ pub enum UiCommand {
     Submit(String),
     Cancel,
     Slash(loon_core::commands::SlashCommand),
+    CycleMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -43,6 +44,15 @@ pub enum Block {
     /// Pre-styled lines (the welcome banner); rendered verbatim, scrolls away with
     /// the transcript like any other block.
     Rich(Vec<ratatui::text::Line<'static>>),
+}
+
+/// A text selection across the transcript, in absolute (line, char-col) coordinates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelRange {
+    pub start_line: usize,
+    pub start_col: usize,
+    pub end_line: usize,
+    pub end_col: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -80,6 +90,10 @@ pub struct App {
     pub input_rect: Option<(u16, u16)>, // (x, y) of the input text row
     /// First completion row rendered in the popup window (for click mapping).
     pub popup_window_start: usize,
+    /// Transcript geometry for selection hit-testing: (x, y, width, height).
+    pub transcript_rect: Option<(u16, u16, u16, u16)>,
+    /// Active text selection (drag); Some while selecting, copied on release.
+    pub selection: Option<SelRange>,
 }
 
 impl App {
@@ -101,44 +115,62 @@ impl App {
             popup_rect: None,
             input_rect: None,
             popup_window_start: 0,
+            transcript_rect: None,
+            selection: None,
         }
     }
 
     /// The welcome banner: logo spark, version, model · mode, workspace — pushed as
     /// the first transcript block so chat messages scroll it away naturally.
     pub fn push_welcome_banner(&mut self) {
-        let spark = self.spinner_glyph();
-        self.blocks.insert(
-            0,
-            Block::Rich(vec![
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::styled(format!(" {spark} "), theme::accent_fg()),
-                    ratatui::text::Span::styled(
-                        format!("Loon v{}", env!("CARGO_PKG_VERSION")),
-                        theme::user_fg(),
-                    ),
-                ]),
-                ratatui::text::Line::from(ratatui::text::Span::styled(
-                    format!("   {} · {}", self.status.model, self.status.mode),
-                    theme::system_fg(),
-                )),
-                ratatui::text::Line::from(ratatui::text::Span::styled(
-                    format!("   {}", self.status.cwd),
-                    theme::system_fg(),
-                )),
-                ratatui::text::Line::default(),
-            ]),
-        );
+        self.blocks.insert(0, Block::Rich(self.banner_lines()));
     }
 
-    /// While the intro plays, keep animating the banner spark glyph (blocks[0]).
+    /// Banner content: animated spark + version, model, workspace — nothing else.
+    fn banner_lines(&self) -> Vec<ratatui::text::Line<'static>> {
+        vec![
+            ratatui::text::Line::from(vec![
+                ratatui::text::Span::styled(
+                    format!(" {} ", self.intro_frame()),
+                    theme::accent_fg(),
+                ),
+                ratatui::text::Span::styled(
+                    format!("Loon v{}", env!("CARGO_PKG_VERSION")),
+                    theme::user_fg(),
+                ),
+            ]),
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!("   {}", self.status.model),
+                theme::system_fg(),
+            )),
+            ratatui::text::Line::from(ratatui::text::Span::styled(
+                format!("   {}", self.status.cwd),
+                theme::system_fg(),
+            )),
+            ratatui::text::Line::default(),
+        ]
+    }
+
+    /// Intro burst animation: grows, shimmers, settles on the logo glyph (forward,
+    /// reverse, hold).
+    fn intro_frame(&self) -> &'static str {
+        const FRAMES: [&str; 7] = ["·", "✦", "✦˖", "✧˖·", "✻ ✧", "✶ ✦˖", "✦"];
+        let n = FRAMES.len() as u64;
+        if self.tick < n {
+            FRAMES[self.tick as usize]
+        } else if self.tick < 2 * n {
+            FRAMES[((2 * n - 1 - self.tick) as usize).min(n as usize - 1)]
+        } else {
+            FRAMES[n as usize - 1]
+        }
+    }
+
+    /// While the intro plays, rebuild the banner from the current animation frame.
     pub fn update_intro(&mut self) {
-        if self.tick <= 20 {
-            let glyph = self.spinner_glyph();
-            if let Some(Block::Rich(lines)) = self.blocks.first_mut() {
-                if let Some(span) = lines.first_mut().and_then(|l| l.spans.first_mut()) {
-                    span.content = std::borrow::Cow::Owned(format!(" {glyph} "));
-                }
+        if self.tick < 2 * 7 {
+            let lines = self.banner_lines();
+            if let Some(Block::Rich(existing)) = self.blocks.first_mut() {
+                *existing = lines;
             }
         }
     }
@@ -422,13 +454,13 @@ async fn run_inner(
     };
     let mut app = App::new(transparent, status);
     app.push_welcome_banner();
-    app.push_block(Block::System(format!(
-        "Enter sends · Esc stops (skips to queued) · Ctrl+C cancels (twice quits) · / for commands · /quit exits"
-    )));
 
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(32);
 
     // Driver: one turn at a time; cancellation stays responsive while a turn runs.
+    // The cancel handle is lock-free on purpose: the turn task holds the agent mutex,
+    // so cancel must never queue behind it.
+    let cancel_handle = agent.lock().await.cancel_handle();
     let mut prompt_queue = queue::PromptQueue::new(16);
     let driver_slash_tx = slash_tx.clone();
     let driver = tokio::spawn(async move {
@@ -467,8 +499,29 @@ async fn run_inner(
                     ));
                 }
                 UiCommand::Cancel => {
+                    let _ = cancel_handle.send(true);
+                }
+                UiCommand::CycleMode => {
                     let a = agent.clone();
-                    tokio::spawn(async move { a.lock().await.cancel() });
+                    let tx = ev_tx.clone();
+                    tokio::spawn(async move {
+                        let mut guard = a.lock().await;
+                        let next = match guard.cfg.permissions.mode {
+                            loon_config::PermissionMode::Bypass => {
+                                guard.cfg.permissions.mode = loon_config::PermissionMode::Ask;
+                                "ask"
+                            }
+                            loon_config::PermissionMode::Ask => {
+                                guard.cfg.permissions.mode = loon_config::PermissionMode::Allowlist;
+                                "allowlist"
+                            }
+                            loon_config::PermissionMode::Allowlist => {
+                                guard.cfg.permissions.mode = loon_config::PermissionMode::Bypass;
+                                "bypass"
+                            }
+                        };
+                        let _ = tx.send(AgentEvent::ModeChanged { mode: next.into() }).await;
+                    });
                 }
                 UiCommand::Slash(cmd) => {
                     if running.is_some() {
@@ -529,6 +582,7 @@ async fn run_inner(
                 AgentEvent::ToolFinished { name, ok, excerpt } => {
                     app.tool_finished(&name, ok, &excerpt)
                 }
+                AgentEvent::ModeChanged { mode } => app.status.mode = mode,
                 AgentEvent::MemberNote(m) => app.push_block(Block::Member(m)),
                 AgentEvent::ApprovalRequested { tool, args_excerpt } => {
                     // Ask mode without a hook (or before one is installed): surface the
@@ -570,7 +624,54 @@ async fn run_inner(
             maybe_ev = events.next() => {
                 match maybe_ev {
                     Some(Ok(CtEvent::Key(key))) => handle_key(&mut app, key, &cmd_tx).await,
-                    Some(Ok(CtEvent::Mouse(m))) => handle_mouse(&mut app, m),
+                    Some(Ok(CtEvent::Mouse(m))) => {
+                        if let Some(text) = handle_mouse(&mut app, m) {
+                            // OSC 52: hand the selection to the terminal clipboard
+                            use std::io::Write;
+                            let b64 = {
+                                use std::fmt::Write as _;
+                                let mut out = String::new();
+                                const T: &[u8; 64] =
+                                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                                let bytes = text.as_bytes();
+                                for chunk in bytes.chunks(3) {
+                                    let b = [
+                                        chunk[0],
+                                        chunk.get(1).copied().unwrap_or(0),
+                                        chunk.get(2).copied().unwrap_or(0),
+                                    ];
+                                    let n = ((b[0] as u32) << 16)
+                                        | ((b[1] as u32) << 8)
+                                        | b[2] as u32;
+                                    let _ = write!(
+                                        out,
+                                        "{}{}{}{}",
+                                        T[(n >> 18) as usize & 63],
+                                        T[(n >> 12) as usize & 63],
+                                        if chunk.len() > 1 {
+                                            T[(n >> 6) as usize & 63]
+                                        } else {
+                                            b'='
+                                        },
+                                        if chunk.len() > 2 {
+                                            T[n as usize & 63]
+                                        } else {
+                                            b'='
+                                        },
+                                    );
+                                }
+                                out
+                            };
+                            let _ = write!(
+                                std::io::stdout(),
+                                "\x1b]52;c;{b64}\x07"
+                            );
+                            let _ = std::io::stdout().flush();
+                            app.push_block(Block::System(
+                                "copied selection to clipboard".into(),
+                            ));
+                        }
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(e)) => return Err(e.into()),
                     None => break, // terminal disconnected
@@ -673,6 +774,9 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         KeyCode::Tab if app.completion_count() > 0 => {
             app.accept_completion();
         }
+        KeyCode::BackTab => {
+            let _ = cmd_tx.send(UiCommand::CycleMode).await;
+        }
         KeyCode::Esc if app.completion_count() > 0 => {
             app.popup_dismissed = true;
         }
@@ -699,21 +803,28 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
 }
 
 /// Mouse: wheel scrolls the transcript; click positions the input cursor; click on a
-/// popup row selects that completion.
-fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) {
+/// popup row selects that completion; drag across the transcript selects text, and
+/// releasing copies it — returns the selected text for the caller to put on the
+/// clipboard (OSC 52).
+fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) -> Option<String> {
     use crossterm::event::{MouseButton, MouseEventKind};
     match m.kind {
         MouseEventKind::ScrollUp => {
             let next = app.scroll_from_bottom.unwrap_or(0).saturating_add(3);
             app.scroll_from_bottom = Some(next);
+            None
         }
-        MouseEventKind::ScrollDown => match app.scroll_from_bottom {
-            Some(0) | None => app.scroll_from_bottom = None,
-            Some(n) => app.scroll_from_bottom = Some(n.saturating_sub(3)),
-        },
+        MouseEventKind::ScrollDown => {
+            match app.scroll_from_bottom {
+                Some(0) | None => app.scroll_from_bottom = None,
+                Some(n) => app.scroll_from_bottom = Some(n.saturating_sub(3)),
+            }
+            None
+        }
         MouseEventKind::Down(MouseButton::Left) => {
-            // popup rows select+accept
-            if let Some((px, py, ph)) = app.popup_rect {
+            app.selection = None; // a fresh click clears any highlight
+                                  // popup rows select+accept
+            if let Some((_px, py, ph)) = app.popup_rect {
                 if m.row > py && m.row < py + ph {
                     let row = (m.row - py - 1) as usize; // skip border row
                     let completions = app.visible_completions();
@@ -722,20 +833,101 @@ fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) {
                         app.completion_selected = idx;
                         app.accept_completion();
                     }
-                    return;
+                    return None;
                 }
+            }
+            // transcript rows begin a selection
+            if let Some(point) = transcript_point(app, m.column, m.row) {
+                app.selection = Some(SelRange {
+                    start_line: point.0,
+                    start_col: point.1,
+                    end_line: point.0,
+                    end_col: point.1,
+                });
+                return None;
             }
             // input row positions the text cursor
             if let Some((ix, iy)) = app.input_rect {
                 if m.row == iy && m.column > ix {
-                    let col = (m.column - ix - 1) as usize; // -1: prompt glyph
                     app.cursor = click_col_to_cursor(m.column, ix, app.input.chars().count());
-                    let _ = col;
                 }
             }
+            None
         }
-        _ => {}
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let (Some(point), Some(_)) = (transcript_point(app, m.column, m.row), app.selection)
+            {
+                if let Some(sel) = app.selection.as_mut() {
+                    sel.end_line = point.0;
+                    sel.end_col = point.1;
+                }
+            }
+            None
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let sel = app.selection?;
+            let text = selected_text(app, sel);
+            if text.trim().is_empty() {
+                app.selection = None;
+                return None;
+            }
+            app.selection = None; // copied: highlight served its purpose
+            Some(text)
+        }
+        _ => None,
     }
+}
+
+/// Absolute (transcript-line, char-col) under the cursor, or None outside the
+/// transcript area.
+fn transcript_point(app: &App, column: u16, row: u16) -> Option<(usize, usize)> {
+    let (tx, ty, tw, th) = app.transcript_rect?;
+    if row < ty || row >= ty + th || column < tx || column >= tx + tw {
+        return None;
+    }
+    let lines = app.transcript_lines(tw);
+    let total = lines.len() as u16;
+    let visible = th;
+    let start = match app.scroll_from_bottom {
+        None => total.saturating_sub(visible),
+        Some(off) => total.saturating_sub(off).saturating_sub(visible),
+    };
+    let line = start as usize + (row - ty) as usize;
+    if line >= lines.len() {
+        return None;
+    }
+    let col = (column - tx) as usize;
+    Some((line, col))
+}
+
+/// The selected substrings joined with newlines.
+fn selected_text(app: &App, sel: SelRange) -> String {
+    let lines = app.transcript_lines(200); // width only affects wrapping; spans are what we copy
+    let (first_l, first_c, last_l, last_c) = if sel.start_line <= sel.end_line {
+        (sel.start_line, sel.start_col, sel.end_line, sel.end_col)
+    } else {
+        (sel.end_line, sel.end_col, sel.start_line, sel.start_col)
+    };
+    let mut out = Vec::new();
+    let last = last_l.min(lines.len().saturating_sub(1));
+    for (idx, line) in lines.iter().enumerate().take(last + 1).skip(first_l) {
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        let chars: Vec<char> = text.chars().collect();
+        let begin = if idx == first_l {
+            first_c.min(chars.len())
+        } else {
+            0
+        };
+        let stop = if idx == last {
+            last_c.min(chars.len())
+        } else {
+            chars.len()
+        };
+        if stop > begin {
+            out.push(chars[begin..stop].iter().collect::<String>());
+        }
+    }
+    out.join("\n")
 }
 
 /// Map a clicked column to a char offset in the input line. The input row renders as

@@ -1,9 +1,11 @@
 //! Layout and drawing.
 //!
-//! Four zones: animated status line, transcript, (optional) slash-command popup above
-//! the input, input line. The transparent invariant holds everywhere: every style comes
-//! from the theme, so every background is `Color::Reset` and reverse video is never
-//! used; all animation is foreground glyph cycling driven by `App::tick`.
+//! Zones: animated status line, transcript (with text-selection highlighting),
+//! (optional) slash-command popup above the input, input line, permission-mode footer.
+//! The transparent invariant holds everywhere: every style comes from the theme, so
+//! every background is `Color::Reset` and reverse video is never used; all animation is
+//! foreground glyph cycling driven by `App::tick`, and selection highlight is
+//! underline — never reverse video.
 
 use crate::{theme, App};
 use ratatui::layout::{Constraint, Layout};
@@ -20,15 +22,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     let completions = app.visible_completions();
     let popup_rows = completions.len().min(POPUP_MAX_ROWS) as u16;
-    let [status, transcript, popup, input] = Layout::vertical([
+    let [status, transcript, popup, input, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
         Constraint::Length(if popup_rows > 0 { popup_rows + 1 } else { 0 }), // +1 border row
         Constraint::Length(3),
+        Constraint::Length(1),
     ])
     .areas(area);
     app.popup_rect = None;
     app.input_rect = Some((input.x + 1, input.y + 1));
+    app.transcript_rect = Some((
+        transcript.x,
+        transcript.y,
+        transcript.width,
+        transcript.height,
+    ));
 
     let theme = theme::Theme::from_mode(if app.transparent {
         loon_config::AppearanceMode::Transparent
@@ -72,7 +81,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         status,
     );
 
-    // ── transcript ──────────────────────────────────────────────────────────────
+    // ── transcript, with selection highlight ────────────────────────────────────
     let lines = app.transcript_lines(transcript.width);
     let total = lines.len() as u16;
     let visible = transcript.height;
@@ -83,17 +92,30 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             (end.saturating_sub(visible), end)
         }
     };
-    let shown = &lines[start as usize..end as usize];
-    f.render_widget(Paragraph::new(shown.to_vec()), transcript);
+    let sel = app.selection;
+    let shown: Vec<Line> = lines[start as usize..end as usize]
+        .iter()
+        .enumerate()
+        .map(|(i, line)| match sel {
+            Some(sel) => {
+                let abs = (start as usize + i) as u64;
+                apply_selection(line, abs, &sel)
+            }
+            None => line.clone(),
+        })
+        .collect();
+    f.render_widget(Paragraph::new(shown), transcript);
 
     // ── slash-command popup, directly above the input ───────────────────────────
     if popup_rows > 0 {
+        app.popup_rect = Some((popup.x, popup.y, popup.height));
         let selected = app.completion_selected.min(completions.len() - 1);
         // window the list so the selection stays visible when there are more rows
         // than fit
         let start = selected
             .saturating_sub(POPUP_MAX_ROWS - 1)
             .min(completions.len().saturating_sub(popup_rows as usize));
+        app.popup_window_start = start;
         let mut rows: Vec<Line> = Vec::new();
         for (i, c) in completions
             .iter()
@@ -131,28 +153,117 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     } else {
         "›".to_string()
     };
-    let input_text = format!("{prompt} {}", app.input);
     let block = RtBlock::default()
         .borders(Borders::TOP)
         .border_style(theme.border());
-    let mut input_line = Line::from(vec![
+    let input_line = Line::from(vec![
         Span::styled(prompt.clone(), theme.accent_bold()),
         Span::styled(format!(" {}", app.input), theme.base()),
     ]);
-    input_line.style = theme.base();
     let para = Paragraph::new(input_line).block(block).style(theme.base());
-    let _ = &input_text; // kept for cursor math documentation
     f.render_widget(para, input);
 
-    // cursor position (hide while busy streaming to avoid flicker)
+    // ── permission-mode footer ──────────────────────────────────────────────────
+    let footer_text = permission_footer(&app.status.mode);
+    let footer_style = if app.status.mode == "bypass" {
+        theme.dim()
+    } else {
+        theme.ok()
+    };
+    f.render_widget(
+        Paragraph::new(Line::styled(
+            truncate_str(&footer_text, footer.width as usize),
+            footer_style,
+        )),
+        footer,
+    );
+
+    // text cursor at the recorded cursor position (hidden while busy streaming to
+    // avoid flicker)
     if !app.status.busy {
-        let x = (prompt.chars().count() + 1 + app.input.chars().count())
+        let x = (prompt.chars().count() + 1 + app.cursor)
             .min(input.width.saturating_sub(2) as usize) as u16;
         f.set_cursor_position((
             input.x + 1 + x.min(input.width.saturating_sub(2)),
             input.y + 1,
         ));
     }
+}
+
+/// Overlay the selection for one transcript line: the selected character range is
+/// re-rendered underlined (fg-only; reverse video stays banned).
+fn apply_selection(line: &Line<'static>, abs_line: u64, sel: &crate::SelRange) -> Line<'static> {
+    let (sel_first_line, sel_first_col, sel_last_line, sel_last_col) =
+        if sel.start_line <= sel.end_line {
+            (
+                sel.start_line as u64,
+                sel.start_col,
+                sel.end_line as u64,
+                sel.end_col,
+            )
+        } else {
+            (
+                sel.end_line as u64,
+                sel.end_col,
+                sel.start_line as u64,
+                sel.start_col,
+            )
+        };
+    if abs_line < sel_first_line || abs_line > sel_last_line {
+        return line.clone();
+    }
+    let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    let begin = if abs_line == sel_first_line {
+        sel_first_col
+    } else {
+        0
+    };
+    let stop = if abs_line == sel_last_line {
+        sel_last_col
+    } else {
+        text.chars().count()
+    };
+    if stop <= begin {
+        return line.clone();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let byte = |i: usize| -> usize {
+        chars[..i.min(chars.len())]
+            .iter()
+            .map(|c| c.len_utf8())
+            .sum()
+    };
+    let (b0, b1, b2) = (byte(begin), byte(stop), byte(chars.len()));
+    let mut out = Line::default();
+    if b0 > 0 {
+        out.spans
+            .push(Span::styled(text[..b0].to_string(), line.style));
+    }
+    out.spans.push(Span::styled(
+        text[b0..b1].to_string(),
+        theme::selection_fg(),
+    ));
+    if b2 > b1 {
+        out.spans
+            .push(Span::styled(text[b1..b2].to_string(), line.style));
+    }
+    out.style = line.style;
+    out
+}
+
+/// The footer glyph and hint live here once; labels are plain data per mode. Change
+/// the symbol or the key hint by editing exactly one constant.
+const MODE_GLYPH: &str = "⏵⏵";
+const MODE_HINT: &str = "(shift+tab to cycle)";
+
+fn permission_footer(mode: &str) -> String {
+    let label = match mode {
+        "bypass" => "bypass permissions on",
+        "ask" => "manual mode on — mutating calls ask first",
+        "allowlist" => "allowlist mode on — only allowlisted tools run",
+        other => return format!("{MODE_GLYPH} {other} {MODE_HINT}"),
+    };
+    format!("{MODE_GLYPH} {label} {MODE_HINT}")
 }
 
 fn truncate_str(s: &str, w: usize) -> String {

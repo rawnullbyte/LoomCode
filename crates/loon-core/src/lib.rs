@@ -49,6 +49,10 @@ pub enum AgentEvent {
         tool: String,
         args_excerpt: String,
     },
+    /// Permission mode changed (shift+tab in the TUI, /config set).
+    ModeChanged {
+        mode: String,
+    },
     Warning(String),
     TurnFinished {
         status: TurnStatus,
@@ -279,6 +283,14 @@ impl Agent {
 
     pub fn cancel(&self) {
         let _ = self.cancel_tx.send(true);
+    }
+
+    /// A lock-free cancellation handle. A running turn holds the agent mutex for its
+    /// whole duration, so cancellers (TUI, tests) must signal through this clone
+    /// instead of taking the lock — otherwise cancel queues behind the turn it is
+    /// meant to stop.
+    pub fn cancel_handle(&self) -> tokio::sync::watch::Sender<bool> {
+        self.cancel_tx.clone()
     }
 
     /// Replace this agent's cancellation signal with an external one (subagents stop

@@ -223,25 +223,57 @@ async fn cancellation_stops_between_steps() {
     std::fs::create_dir_all(&ws).unwrap();
     let registry = Arc::new(ProviderRegistry::with_mock(
         loon_providers::MockProvider::with_scripts(vec![MockScript::new(vec![
-            MockStep::tool_call("call_1", "bash", json!({"command": "sleep 0.05"})),
+            MockStep::tool_call("call_1", "bash", json!({"command": "sleep 0.5"})),
             MockStep::tool_call("call_2", "bash", json!({"command": "echo should-not-run"})),
             MockStep::Text("never".into()),
         ])]),
     ));
     let paths = test_paths(tmp.path());
     paths.ensure().unwrap();
-    let mut agent = Agent::new_session(
+    let agent = Arc::new(tokio::sync::Mutex::new(
+        Agent::new_session(
+            &paths,
+            agent_cfg("mock"),
+            registry,
+            ToolRegistry::standard(),
+            ws.clone(),
+            true,
+        )
+        .unwrap(),
+    ));
+
+    // Cancel while the turn is running (Esc mid-turn): through the lock-free handle,
+    // exactly like the UI does — the lock itself is held by the running turn.
+    let cancel_handle = agent.lock().await.cancel_handle();
+    let runner = {
+        let agent = agent.clone();
+        tokio::spawn(async move { agent.lock().await.run_turn("go").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let _ = cancel_handle.send(true);
+    let result = runner.await.unwrap();
+    assert!(matches!(result.status, loon_core::TurnStatus::Cancelled));
+
+    // The leftover flag must not poison the NEXT session's turn (queue-then-cancel
+    // flows rely on this).
+    let registry2 = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![MockScript::text("fresh turn runs")]),
+    ));
+    let mut agent2 = Agent::new_session(
         &paths,
         agent_cfg("mock"),
-        registry,
+        registry2,
         ToolRegistry::standard(),
         ws,
         true,
     )
     .unwrap();
-    agent.cancel();
-    let result = agent.run_turn("go").await;
-    assert!(matches!(result.status, loon_core::TurnStatus::Cancelled));
+    let r2 = agent2.run_turn("next").await;
+    assert!(
+        matches!(r2.status, loon_core::TurnStatus::Completed),
+        "a stale cancel flag must not poison the next turn, got {:?}",
+        r2.status
+    );
 }
 
 #[tokio::test]

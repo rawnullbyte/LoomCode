@@ -108,6 +108,15 @@ pub fn member_fg() -> Style {
 pub fn accent_fg() -> Style {
     Style::default().fg(Color::Cyan).bg(Color::Reset)
 }
+/// Selection highlight: underline + brightened fg — never reverse video, bg stays
+/// Reset so the transparency invariant holds under selected text.
+pub fn selection_fg() -> Style {
+    Style::default()
+        .fg(Color::Reset)
+        .add_modifier(ratatui::style::Modifier::UNDERLINED)
+        .add_modifier(ratatui::style::Modifier::BOLD)
+        .bg(Color::Reset)
+}
 pub fn pending_fg() -> Style {
     Style::default().fg(Color::Cyan).bg(Color::Reset)
 }
