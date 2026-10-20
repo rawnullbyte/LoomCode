@@ -49,22 +49,38 @@ tests; also handy for trying Loon without touching your real config).
 | Arbitrary OpenAI-compatible base URLs as first-class providers; endpoint without `/models` works with manual models (Loon never requires `/models`) | **implemented** | config schema + registry tests |
 | Token counting | **partial** — heuristic (chars/4) only, labeled as estimate; provider-reported usage replaces it on request records | `crates/loon-core/src/est.rs` |
 
-## Not yet implemented (tracked, not silently deferred)
+## Milestone status (evidence-backed, no silent deferral)
 
-These are the spec's later milestones (§20 order). Present state, no excuses:
-
-- **M2 reliability**: SQLite/WAL event store (JSONL today), rewind timeline, `/undo`/`/redo`,
-  fork/roll-forward, named checkpoints, git2 shadow repository, permissions engine
-  (ask/allowlist today: config parses modes but enforcement is bypass-shaped), redaction
-  of captured payloads.
-- **M3 context**: incremental repo index (grep is walk-based today), LSP, context inspector,
-  hierarchical compaction, memory, verification loop with baseline/flaky classification.
-- **M4 UX surface**: full slash-command set, `/config` TUI, prompt queue UI, skills,
-  workflows, isolated subagents, model routing rules.
-- **M5 integrations**: MCP client, plugin protocol, files/batch/embeddings APIs, monitors,
-  SSH/container workspaces, supervisor/attach, browser/DB/binary/RE tools.
-- **M6 hardening**: adversarial fixture expansion, measured benchmarks (targets unmeasured —
-  no numbers are claimed), packaging, portability matrix.
+- **M1 foundation — implemented.** 8-crate workspace, agent loop, toolset, provider
+  adapters (Chat + Responses over a proptest-fuzzed SSE parser), combos, mock provider,
+  headless CLI with documented exit codes, transparent TUI verified on `TestBackend`.
+- **M2 reliability — implemented.** SQLite/WAL store with migrations + legacy JSONL
+  fallback (`loon-events`); CAS rewind/undo/redo/fork/checkpoints with conflict
+  preservation (`loon-core/tests/rewind.rs`, 6 tests); permission engine wired into the
+  tool loop — deny rules bind every mode, allowlist is exact + component-prefix, ask
+  gates via an approval hook and refuses headless, redacted audit JSONL
+  (`crates/loon-core/tests/permissions.rs`, 5 tests); real `kill -9` crash-recovery test
+  (`crates/loon-cli/tests/crash_recovery.rs`). Not done: git2 shadow repository.
+- **M3 context — core implemented.** Hierarchical compaction with replay-identical
+  summaries (`tests/compaction.rs` — replay reproduces live history exactly); persistent
+  memory (global + workspace scopes, `memory` tool, prompt loading, `tests/memory.rs`);
+  verification loop with baseline/Introduced/PreExisting/FlakySuspected classification
+  (`tests/verify_shell.rs`); incremental repo index with persisted mtime cache
+  (`--lib index`). Not done: LSP integration.
+- **M4 UX — core implemented.** Slash commands `/help /undo /redo /rewind /checkpoint
+  /fork /compact /context /diff /memory /model /quit` execute real machinery and are
+  tested through the agent (`tests/slash_commands.rs`); subagent `delegate` tool with
+  journaled child sessions, no recursion, cancellation propagation
+  (`tests/subagent.rs`); mid-session model switching. Not done: `/config` TUI, prompt
+  queue UI, skills/workflows, model routing rules.
+- **M5 integrations — not implemented.** MCP client, plugin protocol,
+  files/batch/embeddings APIs, monitors, SSH/container workspaces, supervisor/attach,
+  browser/DB/binary/RE tools. The adapter seams exist (registry, tool registry) but no
+  MCP code is written and none is claimed.
+- **M6 hardening — partially done.** Crash/kill coverage and adversarial provider cases
+  (partial streams, drops, malformed frames) are tested; measured benchmarks against the
+  spec targets have **not been run** and no numbers are claimed; packaging and the
+  portability matrix are not done.
 
 Interactive TUI note: rendering, layout, and state transitions are verified on
 `TestBackend`; key-handling paths are unit-tested where practical, but a full interactive
@@ -78,7 +94,7 @@ keymap session was **not** exercised in this environment and is not claimed.
 | OpenAI Responses streaming | — | ✔ | live |
 | Arbitrary OpenAI-compatible endpoints | — | ✔ (non-SSE fallback, error statuses) | live |
 | Anthropic Messages / Gemini | — | — | ✔ (adapter interface reserved, no implementation) |
-| MCP | — | — | ✔ |
+| MCP | — | — | ✔ (not started) |
 
 ## Layout
 
@@ -101,7 +117,7 @@ crates/
 
 ```sh
 cargo build                 # zero warnings
-cargo test                  # 64 passed, 0 failed
+cargo test                  # 118 tests, all suites green
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 LOON_HOME=$(mktemp -d) target/debug/loon run "smoke" --output jsonl
