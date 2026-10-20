@@ -186,6 +186,8 @@ pub struct Agent {
     pub session_goal: Option<String>,
     /// Ultra Loop baseline check result (established on the first verify).
     baseline: Option<crate::verify::CheckResult>,
+    /// Whether the session has been auto-titled from its first prompt.
+    titled: std::sync::atomic::AtomicBool,
     system_prompt: String,
     session_id: loon_events::EvId,
 }
@@ -301,6 +303,7 @@ impl Agent {
             effort: None,
             session_goal: None,
             baseline: None,
+            titled: std::sync::atomic::AtomicBool::new(false),
             cfg,
             system_prompt: system,
             session_id,
@@ -516,6 +519,7 @@ impl Agent {
             effort: None,
             session_goal: None,
             baseline: None,
+            titled: std::sync::atomic::AtomicBool::new(false),
             cfg,
             system_prompt: prompt::system_prompt(Path::new(&cwd)),
             session_id,
@@ -524,6 +528,18 @@ impl Agent {
 
     /// Run one user turn to completion, journaling everything.
     pub async fn run_turn(&mut self, user_text: &str) -> TurnResult {
+        // Auto-title: the first real prompt names the session (shows in /resume).
+        if !self.titled.load(std::sync::atomic::Ordering::Relaxed) && !user_text.trim().is_empty() {
+            let title: String = user_text.trim().chars().take(60).collect();
+            let title = if user_text.trim().chars().count() > 60 {
+                format!("{title}…")
+            } else {
+                title
+            };
+            let _ = self.journal.rename_session(&title);
+            self.titled
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.journal
             .append(
                 None,

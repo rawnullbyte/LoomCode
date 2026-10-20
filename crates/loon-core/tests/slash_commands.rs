@@ -170,6 +170,18 @@ async fn slash_commands_execute_honestly() {
         .unwrap();
     assert!(out.contains("loop testing session"), "{out}");
     assert!(out.contains("/resume <n>"), "{out}");
+    // auto-title: /new starts untitled; the next prompt names the session
+    let _ = a.run_slash(SlashCommand::New).await;
+    let r = a.run_turn("help me refactor the parser module").await;
+    assert!(matches!(r.status, loon_core::TurnStatus::Completed));
+    let out = a
+        .run_slash(SlashCommand::Resume { target: None })
+        .await
+        .unwrap();
+    assert!(
+        out.contains("help me refactor the parser module"),
+        "auto-titled from first prompt: {out}"
+    );
     // resume by index swaps the agent in place (session id changes)
     let before = a.session_id();
     let out = a
