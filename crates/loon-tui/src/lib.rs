@@ -10,6 +10,7 @@ pub mod ui;
 
 use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use futures::StreamExt;
+pub mod autocomplete;
 pub mod queue;
 
 use loon_core::{Agent, AgentConfig, AgentEvent, TurnResult, TurnStatus};
@@ -61,6 +62,14 @@ pub struct App {
     streaming: Option<String>,
     pub quit: bool,
     pub cancel_hint_shown: bool,
+    /// Animation clock, advanced by the render loop (~20 fps).
+    pub tick: u64,
+    /// When the current turn started, for the elapsed-time readout.
+    pub turn_started: Option<std::time::Instant>,
+    /// Selected row in the slash-command popup; reset on input change.
+    pub completion_selected: usize,
+    /// Set by Esc: hide the popup until the input changes again.
+    pub popup_dismissed: bool,
 }
 
 impl App {
@@ -74,7 +83,64 @@ impl App {
             streaming: None,
             quit: false,
             cancel_hint_shown: false,
+            tick: 0,
+            turn_started: None,
+            completion_selected: 0,
+            popup_dismissed: false,
         }
+    }
+
+    /// Advance the animation clock (called once per render loop pass).
+    pub fn tick(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
+    }
+
+    /// Input changed: popup returns, selection resets.
+    pub fn input_changed(&mut self) {
+        self.completion_selected = 0;
+        self.popup_dismissed = false;
+    }
+
+    /// Commands matching the current input (popup contents), or empty when hidden.
+    pub fn visible_completions(&self) -> Vec<autocomplete::Completion> {
+        if self.popup_dismissed {
+            return Vec::new();
+        }
+        autocomplete::completions_for(&self.input)
+    }
+
+    pub fn completion_count(&self) -> usize {
+        self.visible_completions().len()
+    }
+
+    /// Replace the input with the selected completion's command word.
+    pub fn accept_completion(&mut self) -> bool {
+        let completions = self.visible_completions();
+        if completions.is_empty() {
+            return false;
+        }
+        let idx = self.completion_selected.min(completions.len() - 1);
+        let cmd = completions[idx].insert.clone();
+        self.input = format!("/{cmd} ");
+        self.input_changed();
+        true
+    }
+
+    /// The busy-spinner glyph: six glyphs cycled forward then backward (palindrome),
+    /// so the motion eases rather than snaps at the loop point.
+    pub fn spinner_glyph(&self) -> char {
+        const FRAMES: [char; 6] = ['·', '✢', '✳', '✶', '✻', '✽'];
+        let n = FRAMES.len();
+        let period = 2 * n - 2;
+        let i = (self.tick as usize) % period;
+        FRAMES[if i < n { i } else { period - i }]
+    }
+
+    /// Seconds since the current turn started (0 when idle).
+    pub fn elapsed_secs(&self) -> u64 {
+        self.turn_started
+            .map(|t| t.elapsed().as_secs())
+            .unwrap_or(0)
     }
 
     pub fn push_block(&mut self, b: Block) {
@@ -399,10 +465,12 @@ async fn run_inner(
                         }
                     }
                     app.status.busy = false;
+                    app.turn_started = None;
                 }
             }
         }
 
+        app.tick();
         terminal.draw(|f| ui::draw(f, &mut app))?;
         if app.quit {
             break;
@@ -466,12 +534,14 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
                 return;
             }
             app.cancel_hint_shown = false;
+            app.turn_started = Some(std::time::Instant::now());
             app.push_block(Block::User(text.clone()));
             app.status.busy = true;
             let _ = cmd_tx.send(UiCommand::Submit(text)).await;
         }
         KeyCode::Backspace => {
             app.input.pop();
+            app.input_changed();
         }
         KeyCode::PageUp => {
             app.scroll_from_bottom = Some(app.scroll_from_bottom.unwrap_or(0).saturating_add(10));
@@ -480,8 +550,25 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             Some(0) | None => app.scroll_from_bottom = None,
             Some(n) => app.scroll_from_bottom = Some(n.saturating_sub(10)),
         },
+        KeyCode::Up if app.completion_count() > 0 => {
+            if app.completion_selected == 0 {
+                app.completion_selected = app.completion_count() - 1; // wrap
+            } else {
+                app.completion_selected -= 1;
+            }
+        }
+        KeyCode::Down if app.completion_count() > 0 => {
+            app.completion_selected = (app.completion_selected + 1) % app.completion_count();
+        }
+        KeyCode::Tab if app.completion_count() > 0 => {
+            app.accept_completion();
+        }
+        KeyCode::Esc if app.completion_count() > 0 => {
+            app.popup_dismissed = true;
+        }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.input.push(c);
+            app.input_changed();
         }
         _ => {}
     }

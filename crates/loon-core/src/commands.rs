@@ -103,22 +103,43 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
     Some(Ok(cmd))
 }
 
+/// The canonical command table: (name, one-line description). Single source of truth
+/// for `/help` and the TUI autocomplete — a command listed here must parse.
+pub fn command_list() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("help", "this list"),
+        ("undo", "undo the newest file mutation"),
+        ("redo", "redo the newest undone mutation"),
+        (
+            "rewind [n] [mode]",
+            "rewind to n-th previous request boundary",
+        ),
+        ("checkpoint NAME", "mark a restore point in the journal"),
+        ("fork NAME", "fork the current session"),
+        ("compact", "summarize older context now"),
+        ("context", "context window usage report"),
+        ("diff", "files this session changed (from the journal)"),
+        (
+            "memory [global|workspace] [text]",
+            "show or save persistent memory",
+        ),
+        ("model [REF]", "show or switch model/combos:NAME"),
+        ("quit", "exit"),
+    ]
+}
+
 pub fn help_text() -> String {
-    String::from(
-        "/help                     this list\n\
-     /undo                     undo the newest file mutation\n\
-     /redo                     redo the newest undone mutation\n\
-     /rewind [n] [mode]        rewind to n-th previous request boundary\n\
-     /checkpoint NAME          mark a restore point in the journal\n\
-     /fork NAME                fork the current session\n\
-     /compact                  summarize older context now\n\
-     /context                  context window usage report\n\
-     /diff                     files this session changed (from the journal)\n\
-     /memory [global|workspace] [text]\n\
-                               show or save persistent memory\n\
-     /model [REF]              show or switch model/combos:NAME\n\
-     /quit                     exit",
-    )
+    let mut out = String::new();
+    for (name, desc) in command_list() {
+        out.push('/');
+        out.push_str(name);
+        let pad = 38usize.saturating_sub(name.len() + 1);
+        out.push_str(&" ".repeat(pad));
+        out.push_str(desc);
+        out.push('\n');
+    }
+    out.pop();
+    out
 }
 
 impl Agent {
