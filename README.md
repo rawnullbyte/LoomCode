@@ -157,7 +157,7 @@ crates/
 
 ```sh
 cargo build                 # zero warnings
-cargo test                  # 141 tests, all suites green
+cargo test                  # 142 tests, all suites green
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 LOON_HOME=$(mktemp -d) target/debug/loon run "smoke" --output jsonl
