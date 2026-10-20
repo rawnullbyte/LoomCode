@@ -1225,6 +1225,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "futures",
+ "ignore",
  "loon-config",
  "loon-events",
  "loon-providers",

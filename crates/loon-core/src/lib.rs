@@ -6,6 +6,7 @@
 
 pub mod compaction;
 pub mod est;
+pub mod index;
 pub mod memory;
 pub mod permissions;
 pub mod prompt;
