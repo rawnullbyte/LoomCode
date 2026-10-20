@@ -313,6 +313,7 @@ const MODE_HINT: &str = "(shift+tab to cycle)";
 fn permission_footer(mode: &str) -> String {
     let label = match mode {
         "bypass" => "bypass permissions on",
+        "auto" => "auto review on — a reviewer agent checks calls, doubtful ones ask you",
         "ask" => "manual mode on — mutating calls ask first",
         "allowlist" => "allowlist mode on — only allowlisted tools run",
         other => return format!("{MODE_GLYPH} {other} {MODE_HINT}"),

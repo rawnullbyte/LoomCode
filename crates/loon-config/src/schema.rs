@@ -150,6 +150,9 @@ pub struct ComboRequires {
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     Ask,
+    /// A reviewer model checks each mutating call: clear-cut ones are allowed, the
+    /// rest are forwarded to the user (interactive) or refused (headless).
+    Auto,
     Allowlist,
     /// Default: no approval prompts. Explicitly denied operations still stay denied.
     #[default]

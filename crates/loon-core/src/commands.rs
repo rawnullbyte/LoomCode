@@ -654,6 +654,7 @@ impl Agent {
             match p.mode {
                 loon_config::PermissionMode::Bypass => "bypass",
                 loon_config::PermissionMode::Ask => "ask",
+                loon_config::PermissionMode::Auto => "auto (reviewer checks calls)",
                 loon_config::PermissionMode::Allowlist => "allowlist",
             },
             p.allow_rules.len(),
@@ -688,8 +689,9 @@ impl Agent {
                 let mode = match value {
                     "bypass" => loon_config::PermissionMode::Bypass,
                     "ask" => loon_config::PermissionMode::Ask,
+                    "auto" => loon_config::PermissionMode::Auto,
                     "allowlist" => loon_config::PermissionMode::Allowlist,
-                    other => return Err(format!("unknown permission mode `{other}` (bypass|ask|allowlist)")),
+                    other => return Err(format!("unknown permission mode `{other}` (bypass|auto|ask|allowlist)")),
                 };
                 self.cfg.permissions.mode = mode;
                 format!("permission mode set to {value} (rules unchanged)")
@@ -768,6 +770,7 @@ impl Agent {
                 cfg.permissions.mode = match value {
                     "bypass" => loon_config::PermissionMode::Bypass,
                     "ask" => loon_config::PermissionMode::Ask,
+                    "auto" => loon_config::PermissionMode::Auto,
                     "allowlist" => loon_config::PermissionMode::Allowlist,
                     _ => return Err("bad mode".into()),
                 };

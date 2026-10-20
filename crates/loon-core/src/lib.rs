@@ -334,6 +334,52 @@ impl Agent {
         self.cancel_tx.clone()
     }
 
+    /// Shift+Tab cycle order: bypass → auto → ask (manual) → allowlist → bypass.
+    pub fn next_permission_mode(mode: loon_config::PermissionMode) -> loon_config::PermissionMode {
+        use loon_config::PermissionMode::*;
+        match mode {
+            Bypass => Auto,
+            Auto => Ask,
+            Ask => Allowlist,
+            Allowlist => Bypass,
+        }
+    }
+
+    /// Auto mode's reviewer verdict: a no-tools model call judging one tool call.
+    /// Returns None when the reviewer said nothing usable (model down, unusable
+    /// answer) — the caller then forwards to the user like ask mode.
+    async fn reviewer_verdict(&self, tool: &str, args: &serde_json::Value) -> Option<bool> {
+        let transcript = format!(
+            "tool: {tool}\narguments: {args}\nworkspace: {}",
+            self.ctx.ws.root().display()
+        );
+        let summarizer = match &self.summarizer {
+            Some(s) => s.clone(),
+            None => compaction::model_summarizer(self.registry.clone(), self.cfg.model_ref.clone()),
+        };
+        let answer = summarizer(format!(
+            "You are a safety reviewer for a coding agent. Judge whether allowing this \
+             operation is low-risk for the user's machine and repository (writes inside \
+             the workspace, normal build/test commands: low risk; deleting outside the \
+             workspace, exfiltration, destructive shell, credential access: high risk). \
+             Answer with exactly one word: ALLOW or DENY.\n\n{transcript}"
+        ))
+        .await;
+        Self::parse_reviewer_verdict(&answer)
+    }
+
+    /// Parse ALLOW/DENY from a reviewer answer; anything else is None (no verdict).
+    pub fn parse_reviewer_verdict(answer: &str) -> Option<bool> {
+        let upper = answer.to_uppercase();
+        let allow = upper.matches("ALLOW").count();
+        let deny = upper.matches("DENY").count();
+        match (allow > 0, deny > 0) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
+    }
+
     /// Replace this agent's cancellation signal with an external one (subagents stop
     /// when their parent stops). Cancelling *this* agent afterwards only flips the
     /// external channel's local flag consumers already hold — the parent remains the
@@ -817,7 +863,12 @@ impl Agent {
         );
         if matches!(decision, permissions::Decision::ApprovalRequired) {
             // Interactive UIs answer through the hook; headless runs cannot approve.
-            let approved = self.request_approval(&call.name, &args).await;
+            // Auto mode consults the reviewer agent first.
+            let approved = if self.cfg.permissions.mode == loon_config::PermissionMode::Auto {
+                self.auto_review_then_ask(&call.name, &args).await
+            } else {
+                self.request_approval(&call.name, &args).await
+            };
             decision = if approved {
                 permissions::Decision::Allowed
             } else {
@@ -1011,6 +1062,30 @@ fn chrono_ms() -> i64 {
 impl Agent {
     /// Ask the attached UI (or headless caller) to approve one operation in ask mode.
     /// With no hook installed the answer is always no — approval is never implied.
+    /// Auto mode: the reviewer consults first; ALLOW passes, DENY/no-verdict forwards
+    /// to the user hook (which refuses in headless runs). Never bypasses deny rules —
+    /// those were enforced before this runs.
+    async fn auto_review_then_ask(&self, tool: &str, args: &serde_json::Value) -> bool {
+        match self.reviewer_verdict(tool, args).await {
+            Some(true) => {
+                self.emit(AgentEvent::MemberNote(format!(
+                    "auto review: {tool} allowed by reviewer"
+                )));
+                true
+            }
+            verdict => {
+                self.emit(AgentEvent::MemberNote(format!(
+                    "auto review: {tool} {}— asking you",
+                    match verdict {
+                        Some(false) => "DENIED ",
+                        _ => "unclear ",
+                    }
+                )));
+                self.request_approval(tool, args).await
+            }
+        }
+    }
+
     async fn request_approval(&self, tool: &str, args: &serde_json::Value) -> bool {
         let args_excerpt: String = serde_json::to_string(args)
             .unwrap_or_default()
@@ -1047,5 +1122,55 @@ fn decision_refusal_reason(d: &permissions::Decision) -> String {
             "permission mode is ask and the operation was not approved".into()
         }
         permissions::Decision::Allowed => "allowed".into(),
+    }
+}
+
+#[cfg(test)]
+mod auto_mode_tests {
+    use super::*;
+    use loon_config::PermissionMode;
+
+    #[test]
+    fn reviewer_verdict_parses_allow_deny_and_garbage() {
+        assert_eq!(Agent::parse_reviewer_verdict("ALLOW"), Some(true));
+        assert_eq!(Agent::parse_reviewer_verdict("deny"), Some(false));
+        assert_eq!(
+            Agent::parse_reviewer_verdict("The operation is low risk, ALLOW"),
+            Some(true)
+        );
+        assert_eq!(Agent::parse_reviewer_verdict("maybe"), None);
+        assert_eq!(Agent::parse_reviewer_verdict(""), None);
+        assert_eq!(
+            Agent::parse_reviewer_verdict("ALLOW DENY"),
+            None,
+            "contradictory"
+        );
+    }
+
+    #[test]
+    fn shift_tab_cycle_covers_all_four_modes() {
+        assert_eq!(
+            Agent::next_permission_mode(PermissionMode::Bypass),
+            PermissionMode::Auto
+        );
+        assert_eq!(
+            Agent::next_permission_mode(PermissionMode::Auto),
+            PermissionMode::Ask
+        );
+        assert_eq!(
+            Agent::next_permission_mode(PermissionMode::Ask),
+            PermissionMode::Allowlist
+        );
+        assert_eq!(
+            Agent::next_permission_mode(PermissionMode::Allowlist),
+            PermissionMode::Bypass
+        );
+    }
+
+    #[test]
+    fn config_parses_auto_mode() {
+        // serde round trip through the config enum (what config.toml parsing uses)
+        let cfg: loon_config::Permissions = serde_json::from_str(r#"{"mode": "auto"}"#).unwrap();
+        assert_eq!(cfg.mode, PermissionMode::Auto);
     }
 }

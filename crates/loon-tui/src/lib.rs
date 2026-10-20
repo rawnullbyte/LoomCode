@@ -575,19 +575,14 @@ async fn run_inner(
                     let tx = ev_tx.clone();
                     tokio::spawn(async move {
                         let mut guard = a.lock().await;
-                        let next = match guard.cfg.permissions.mode {
-                            loon_config::PermissionMode::Bypass => {
-                                guard.cfg.permissions.mode = loon_config::PermissionMode::Ask;
-                                "ask"
-                            }
-                            loon_config::PermissionMode::Ask => {
-                                guard.cfg.permissions.mode = loon_config::PermissionMode::Allowlist;
-                                "allowlist"
-                            }
-                            loon_config::PermissionMode::Allowlist => {
-                                guard.cfg.permissions.mode = loon_config::PermissionMode::Bypass;
-                                "bypass"
-                            }
+                        let next_mode =
+                            loon_core::Agent::next_permission_mode(guard.cfg.permissions.mode);
+                        guard.cfg.permissions.mode = next_mode;
+                        let next = match next_mode {
+                            loon_config::PermissionMode::Bypass => "bypass",
+                            loon_config::PermissionMode::Auto => "auto",
+                            loon_config::PermissionMode::Ask => "ask",
+                            loon_config::PermissionMode::Allowlist => "allowlist",
                         };
                         let _ = tx.send(AgentEvent::ModeChanged { mode: next.into() }).await;
                     });

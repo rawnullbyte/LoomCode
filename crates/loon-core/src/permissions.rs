@@ -111,9 +111,10 @@ impl PermissionEngine {
                     Decision::NotAllowlisted
                 }
             }
-            PermissionMode::Ask => {
-                // Reads do not need approval even in ask mode: asking would only slow
-                // down looking. Mutating operations do.
+            PermissionMode::Ask | PermissionMode::Auto => {
+                // Reads do not need approval: asking would only slow down looking.
+                // Mutating operations need a yes — from the reviewer (auto) or the
+                // user (ask).
                 if mutating {
                     Decision::ApprovalRequired
                 } else {
@@ -169,6 +170,7 @@ impl PermissionEngine {
                 PermissionMode::Bypass => "bypass",
                 PermissionMode::Allowlist => "allowlist",
                 PermissionMode::Ask => "ask",
+                PermissionMode::Auto => "auto",
             },
         });
         let _guard = self.audit_lock.lock().expect("audit lock");
