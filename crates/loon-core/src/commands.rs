@@ -38,6 +38,44 @@ pub enum SlashCommand {
     Config {
         args: Vec<String>,
     },
+    /// /new — abandon this session, start fresh (journal kept).
+    New,
+    /// /resume [n|id] — list sessions or switch to one.
+    Resume {
+        target: Option<String>,
+    },
+    /// /rename <title> — rename this session.
+    Rename {
+        title: String,
+    },
+    /// /theme — cycle transparent/opaque.
+    Theme,
+    /// /usage — per-day token/request totals from the journal.
+    Usage,
+    /// /init — generate AGENTS.md for this workspace.
+    Init,
+    /// /mcp — list connected MCP tools.
+    Mcp,
+    /// /workflows — list user-defined skills (workflows).
+    Workflows,
+    /// /autocompact on|off|toggle — enable/disable context compaction.
+    AutoCompact {
+        setting: String,
+    },
+    /// /effort low|medium|high — output budget per request.
+    Effort {
+        level: String,
+    },
+    /// /goal <text|clear> — session goal, injected into every request.
+    Goal {
+        text: String,
+    },
+    /// /btw <text> — record context without triggering a turn.
+    Btw {
+        text: String,
+    },
+    /// /recap — summarize the session so far without compacting.
+    Recap,
     /// /loop <interval> <prompt> — recurring prompt task.
     Loop {
         interval: String,
@@ -122,6 +160,31 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         "config" => SlashCommand::Config {
             args: args.iter().map(|s| s.to_string()).collect(),
         },
+        "new" => SlashCommand::New,
+        "resume" => SlashCommand::Resume {
+            target: (!args.is_empty()).then(|| args.join(" ")),
+        },
+        "rename" => SlashCommand::Rename {
+            title: args.join(" "),
+        },
+        "theme" => SlashCommand::Theme,
+        "usage" => SlashCommand::Usage,
+        "init" => SlashCommand::Init,
+        "mcp" => SlashCommand::Mcp,
+        "workflows" => SlashCommand::Workflows,
+        "autocompact" => SlashCommand::AutoCompact {
+            setting: args.first().copied().unwrap_or("toggle").to_string(),
+        },
+        "effort" => SlashCommand::Effort {
+            level: args.first().copied().unwrap_or_default().to_string(),
+        },
+        "goal" => SlashCommand::Goal {
+            text: args.join(" "),
+        },
+        "btw" => SlashCommand::Btw {
+            text: args.join(" "),
+        },
+        "recap" => SlashCommand::Recap,
         "loop" => SlashCommand::Loop {
             interval: args.first().copied().unwrap_or_default().to_string(),
             prompt: args.get(1..).map(|a| a.join(" ")).unwrap_or_default(),
@@ -337,6 +400,188 @@ impl Agent {
                 ))
             }
             SlashCommand::Config { args } => Ok(self.run_config_command(args).await?),
+            SlashCommand::New => {
+                let paths = self.loon_paths();
+                let mut fresh = Agent::new_session(
+                    &paths,
+                    self.cfg.clone(),
+                    self.registry.clone(),
+                    self.tools.clone(),
+                    self.ctx.ws.root().to_path_buf(),
+                    true,
+                )
+                .map_err(|e| format!("new session: {e}"))?;
+                fresh.approval_hook = self.approval_hook.clone();
+                fresh.summarizer = self.summarizer.clone();
+                fresh.events = self.events.take();
+                fresh.loops = self.loops.clone();
+                *self = fresh;
+                Ok(
+                    "new session started (the old one stays in the journal — /resume to return)"
+                        .into(),
+                )
+            }
+            SlashCommand::Resume { target } => {
+                let paths = self.loon_paths();
+                let store = crate::open_store(&paths).map_err(|e| e.to_string())?;
+                let sessions = store.list_sessions().map_err(|e| e.to_string())?;
+                if sessions.is_empty() {
+                    return Ok("no sessions yet".into());
+                }
+                let Some(target) = target else {
+                    let mut out =
+                        String::from("sessions (newest first — /resume <n> to switch):\n");
+                    for (i, meta) in sessions.iter().take(10).enumerate() {
+                        out.push_str(&format!(
+                            "  {}: {} · {} · {}\n",
+                            i + 1,
+                            &meta.id.to_string()[..8],
+                            meta.title,
+                            meta.cwd
+                        ));
+                    }
+                    return Ok(out);
+                };
+                let picked = match target.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= sessions.len() => sessions[n - 1].id,
+                    _ => target
+                        .parse()
+                        .map_err(|_| format!("no session matching `{target}` — /resume lists"))?,
+                };
+                let mut switched = Agent::resume(
+                    &paths,
+                    picked,
+                    self.cfg.clone(),
+                    self.registry.clone(),
+                    self.tools.clone(),
+                )
+                .map_err(|e| format!("resume: {e}"))?;
+                switched.approval_hook = self.approval_hook.clone();
+                switched.summarizer = self.summarizer.clone();
+                switched.events = self.events.take();
+                switched.loops = self.loops.clone();
+                *self = switched;
+                Ok(format!("resumed session {picked}"))
+            }
+            SlashCommand::Rename { title } => {
+                if title.trim().is_empty() {
+                    return Err("usage: /rename <title>".into());
+                }
+                self.journal
+                    .rename_session(title.trim())
+                    .map_err(|e| e.to_string())?;
+                Ok(format!("renamed to `{}`", title.trim()))
+            }
+            SlashCommand::Theme => {
+                self.emit(crate::AgentEvent::ToggleTheme);
+                Ok("theme cycled".into())
+            }
+            SlashCommand::Usage => Ok(self.usage_report()),
+            SlashCommand::Init => {
+                let prompt = "Survey this workspace (structure, language, build/test commands, conventions) and write an AGENTS.md at the repository root covering: project overview, build/test/lint commands, code style conventions, and gotchas. Read before you write; keep it under 60 lines.";
+                let result = self.run_turn(prompt).await;
+                Ok(format!(
+                    "[init {}] {}",
+                    result.status.status_text(),
+                    result.assistant_text
+                ))
+            }
+            SlashCommand::Mcp => {
+                let mut out = String::new();
+                for spec in self.tools.specs() {
+                    if spec.name.starts_with("mcp_") {
+                        out.push_str(&format!("  {} — {}\n", spec.name, spec.description));
+                    }
+                }
+                if out.is_empty() {
+                    Ok("no MCP tools connected (configure [mcp.servers] and restart)".into())
+                } else {
+                    Ok(format!("connected MCP tools:\n{out}"))
+                }
+            }
+            SlashCommand::Workflows => {
+                if self.skills.is_empty() {
+                    return Ok(
+                        "no workflows yet — drop a <name>.md into .loon/skills/ or the global skills dir"
+                            .into(),
+                    );
+                }
+                let mut out = String::from("workflows (skills):\n");
+                for skill in &self.skills {
+                    out.push_str(&format!(
+                        "  /{} ({}) — {}\n",
+                        skill.name,
+                        skill.scope,
+                        skill.path.display()
+                    ));
+                }
+                Ok(out)
+            }
+            SlashCommand::AutoCompact { setting } => {
+                let enable = match setting.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    "toggle" => self.cfg.context_window == 0,
+                    other => return Err(format!("unknown setting `{other}` — on|off|toggle")),
+                };
+                self.cfg.context_window = if enable { 128_000 } else { 0 };
+                Ok(format!(
+                    "autocompact {} (session only — /config set context_window N to persist)",
+                    if enable { "on" } else { "off" }
+                ))
+            }
+            SlashCommand::Effort { level } => {
+                let tokens = match level.as_str() {
+                    "low" => 2_048,
+                    "medium" => 8_192,
+                    "high" => 32_768,
+                    other => return Err(format!("unknown effort `{other}` — low|medium|high")),
+                };
+                self.effort = Some(level);
+                Ok(format!(
+                    "effort set — max output {tokens} tokens per request"
+                ))
+            }
+            SlashCommand::Goal { text } => {
+                if text.trim().is_empty() || text.trim() == "clear" {
+                    let had = self.session_goal.take();
+                    return Ok(match had {
+                        Some(g) => format!("goal cleared (was: {g})"),
+                        None => "no goal set".into(),
+                    });
+                }
+                self.session_goal = Some(text.clone());
+                Ok(format!("goal set: {text}"))
+            }
+            SlashCommand::Btw { text } => {
+                if text.trim().is_empty() {
+                    return Err("usage: /btw <context the model should know>".into());
+                }
+                let _ = self.journal.append(
+                    None,
+                    loon_events::model::EventKind::UserMessage {
+                        text: format!("[btw] {text}"),
+                    },
+                );
+                self.history
+                    .push(loon_providers::ChatMessage::user(format!("[btw] {text}")));
+                Ok(format!("noted (will be part of context): {text}"))
+            }
+            SlashCommand::Recap => {
+                if self.history.is_empty() {
+                    return Ok("nothing to recap yet".into());
+                }
+                let transcript = crate::compaction::render_transcript(&self.history);
+                let summarizer = match &self.summarizer {
+                    Some(s) => s.clone(),
+                    None => crate::compaction::model_summarizer(
+                        self.registry.clone(),
+                        self.cfg.model_ref.clone(),
+                    ),
+                };
+                let summary = summarizer(transcript).await;
+                Ok(format!("session recap (nothing compacted):\n{summary}"))
+            }
             SlashCommand::Loop { interval, prompt } => {
                 if prompt.trim().is_empty() {
                     return Err("usage: /loop <interval> <prompt> — e.g. /loop 1m check CI".into());
@@ -542,6 +787,73 @@ impl Agent {
 
     fn paths_data_dir(&self) -> Result<std::path::PathBuf, String> {
         Ok(self.data_dir.clone())
+    }
+
+    /// /usage: per-day request and token totals from RequestFinished events, rendered
+    /// GitHub-activity-style (last 8 weeks; intensity by quartile). Empty days are
+    /// ░ — shown as-is, not hidden.
+    pub fn usage_report(&self) -> String {
+        let Ok(events) = self.journal.events() else {
+            return "journal unreadable".into();
+        };
+        let mut per_day: std::collections::BTreeMap<String, (u64, u64)> =
+            std::collections::BTreeMap::new(); // date → (requests, tokens)
+        for e in &events {
+            if let loon_events::model::EventKind::RequestFinished {
+                usage,
+                usage_reported,
+                ..
+            } = &e.kind
+            {
+                let date = chrono::DateTime::from_timestamp_millis(e.ts_ms)
+                    .map(|d| d.format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                let tokens = if *usage_reported {
+                    usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0)
+                } else {
+                    0
+                };
+                per_day
+                    .entry(date)
+                    .and_modify(|r| {
+                        r.0 += 1;
+                        r.1 += tokens;
+                    })
+                    .or_insert((1, tokens));
+            }
+        }
+        if per_day.is_empty() {
+            return "no usage recorded yet (usage appears after provider requests)".into();
+        }
+        let max: u64 = per_day.values().map(|(_, t)| *t).max().unwrap_or(1);
+        let shades = ['░', '▒', '▓', '█'];
+        let tile = |tokens: u64| -> char {
+            if tokens == 0 {
+                shades[0]
+            } else {
+                let q = ((tokens as f64 / max as f64) * 3.0).ceil() as usize;
+                shades[q.clamp(1, 3)]
+            }
+        };
+        // last 8 weeks as columns of 7 days (weeks end today)
+        let today = chrono::Utc::now().date_naive();
+        let mut out = String::from("usage by day (░▒▓█ by quartile of the busiest day):\n\n");
+        for week in (0..8).rev() {
+            let mut row = String::new();
+            for day in (0..7).rev() {
+                let date = today - chrono::Duration::weeks(week) - chrono::Duration::days(day);
+                let key = date.format("%Y-%m-%d").to_string();
+                let (requests, tokens) = per_day.get(&key).copied().unwrap_or((0, 0));
+                row.push(if requests > 0 { tile(tokens) } else { '·' });
+            }
+            let week_start = today - chrono::Duration::weeks(week) - chrono::Duration::days(6);
+            out.push_str(&format!("  {} {}\n", week_start.format("%m-%d"), row));
+        }
+        out.push_str("\nday totals (requests · est./reported tokens):\n");
+        for (date, (requests, tokens)) in per_day.iter().rev().take(7) {
+            out.push_str(&format!("  {date}: {requests} · {tokens}\n"));
+        }
+        out
     }
 
     /// /context: where the window stands, with a usage bar. Estimates are labeled as

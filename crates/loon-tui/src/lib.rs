@@ -651,6 +651,7 @@ async fn run_inner(
                     app.tool_finished(&name, ok, &excerpt)
                 }
                 AgentEvent::ModeChanged { mode } => app.status.mode = mode,
+                AgentEvent::ToggleTheme => app.transparent = !app.transparent,
                 AgentEvent::MemberNote(m) => app.push_block(Block::Member(m)),
                 AgentEvent::ApprovalRequested { tool, args_excerpt } => {
                     // Ask mode without a hook (or before one is installed): surface the

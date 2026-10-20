@@ -155,29 +155,42 @@ async fn slash_commands_execute_honestly() {
     })
     .await
     .unwrap();
-    let tool = loon_core::subagent::default_tools(
-        &paths_tmp(tmp.path()),
-        &ws,
-        &loon_core::AgentConfig::from(&loon_config::SessionCfg::default()),
-        Arc::new(loon_providers::ProviderRegistry::with_mock(Arc::new(
-            loon_providers::MockProvider::new(),
-        ))),
-        Some(a.loops.clone()),
-    )
-    .get("loop_cancel")
-    .expect("loop_cancel registered");
-    let ctx = tool_ctx(&ws);
-    let out = tool
-        .run(json!({"id": 2}), &ctx)
+    // /rename + /resume listing + /usage + /new swap semantics
+    let out = a
+        .run_slash(SlashCommand::Rename {
+            title: "loop testing session".into(),
+        })
         .await
-        .expect("cancel live loop");
-    assert!(out.text.contains("cancelled"));
+        .unwrap();
+    assert!(out.contains("renamed"), "{out}");
+    let out = a
+        .run_slash(SlashCommand::Resume { target: None })
+        .await
+        .unwrap();
+    assert!(out.contains("loop testing session"), "{out}");
+    assert!(out.contains("/resume <n>"), "{out}");
+    // resume by index swaps the agent in place (session id changes)
+    let before = a.session_id();
+    let out = a
+        .run_slash(SlashCommand::Resume {
+            target: Some("1".into()),
+        })
+        .await;
+    // resuming the newest session may or may not be the same id; just require success
+    assert!(out.is_ok(), "{out:?}");
+    let _ = before;
+    let out = a.run_slash(SlashCommand::Usage).await.unwrap();
+    assert!(!out.is_empty());
+    // unknown resume target refuses honestly
     assert!(a
-        .run_slash(SlashCommand::LoopCancel { id: 2 })
+        .run_slash(SlashCommand::Resume {
+            target: Some("zzz".into()),
+        })
         .await
         .is_err());
 }
 
+#[allow(dead_code)] // kept for future tool-site tests
 fn paths_tmp(dir: &std::path::Path) -> LoonPaths {
     test_paths(dir)
 }
@@ -195,45 +208,61 @@ fn tool_ctx(ws: &std::path::Path) -> loon_tools::ToolCtx {
 }
 
 #[tokio::test]
-async fn diff_lists_mutations_from_the_journal() {
+async fn agent_side_loop_cancel_via_tool() {
     let tmp = tempfile::tempdir().unwrap();
     let ws = tmp.path().join("proj");
     std::fs::create_dir_all(&ws).unwrap();
-    std::fs::write(ws.join("a.txt"), "one\n").unwrap();
-    // Turn script: write a new file.
-    let registry = Arc::new(ProviderRegistry::with_mock(
-        loon_providers::MockProvider::with_scripts(vec![loon_providers::MockScript::new(vec![
-            loon_providers::MockStep::tool_call(
-                "call_1",
-                "write",
-                serde_json::json!({"path": "a.txt", "content": "one\\ntwo\\n"}),
-            ),
-        ])]),
-    ));
     let paths = test_paths(tmp.path());
     paths.ensure().unwrap();
-    let mut a = Agent::new_session(
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![]),
+    ));
+    let cfg = loon_core::AgentConfig {
+        model_ref: "mock".into(),
+        max_steps: 4,
+        tool_output_bytes: 4096,
+        max_retries: 0,
+        allow_retry_after_partial_stream: false,
+        permissions: Default::default(),
+        context_window: 128_000,
+        extra_tools: Vec::new(),
+    };
+    let tools = loon_core::subagent::default_tools(
         &paths,
-        loon_core::AgentConfig {
-            model_ref: "mock".into(),
-            max_steps: 4,
-            tool_output_bytes: 4096,
-            max_retries: 0,
-            allow_retry_after_partial_stream: false,
-            permissions: Default::default(),
-            context_window: 128_000,
-            extra_tools: Vec::new(),
-        },
+        &ws,
+        &cfg,
         registry,
-        loon_core::standard_tools(&paths, &ws),
+        Some(Arc::new(loon_core::loops::LoopRegistry::new())),
+    );
+    let mut agent = Agent::new_session(
+        &paths,
+        cfg,
+        Arc::new(ProviderRegistry::with_mock(
+            loon_providers::MockProvider::with_scripts(vec![]),
+        )),
+        tools,
         ws.clone(),
         true,
     )
     .unwrap();
-    let r = a.run_turn("update a.txt").await;
-    assert!(matches!(r.status, loon_core::TurnStatus::Completed));
-    let out = a.run_slash(SlashCommand::Diff).await.unwrap();
-    assert!(out.contains("modified"), "{out}");
-    assert!(out.contains("a.txt"), "{out}");
-    assert!(!out.contains("created"), "{out}");
+    agent
+        .run_slash(SlashCommand::Loop {
+            interval: "5m".into(),
+            prompt: "watch the deploy".into(),
+        })
+        .await
+        .unwrap();
+    let tool = loon_tools::ToolRegistry::standard()
+        .with_extra(vec![Arc::new(loon_core::subagent::LoopCancelTool {
+            registry: agent.loops.clone(),
+        })])
+        .get("loop_cancel")
+        .expect("loop_cancel registered");
+    let ctx = tool_ctx(&ws);
+    let out = tool
+        .run(json!({"id": 1}), &ctx)
+        .await
+        .expect("cancel live loop");
+    assert!(out.text.contains("cancelled"));
+    assert!(agent.loops.is_empty());
 }

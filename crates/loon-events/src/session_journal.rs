@@ -53,6 +53,18 @@ impl Journal {
         Ok((Journal::Files(Arc::new(fj)), events))
     }
 
+    /// Rename this session (SQLite-backed journals only; legacy files report
+    /// unsupported honestly).
+    pub fn rename_session(&self, title: &str) -> Result<()> {
+        match self {
+            Journal::Db { store, session } => store.rename_session(*session, title),
+            Journal::Files(_) => Err(crate::EventsError::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "legacy file journals do not support renaming",
+            ))),
+        }
+    }
+
     pub fn session_id(&self) -> EvId {
         match self {
             Journal::Files(f) => {

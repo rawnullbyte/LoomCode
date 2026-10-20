@@ -54,6 +54,8 @@ pub enum AgentEvent {
     ModeChanged {
         mode: String,
     },
+    /// /theme cycled — the UI flips its own transparent flag.
+    ToggleTheme,
     Warning(String),
     TurnFinished {
         status: TurnStatus,
@@ -296,10 +298,36 @@ impl Agent {
         let _ = self.cancel_tx.send(true);
     }
 
+    /// Replace this agent wholesale (/new, /resume): the replacement keeps THIS
+    /// agent's event sink, approval hook and summarizer so the UI keeps streaming.
+    pub fn replace_with(&mut self, mut other: Agent) {
+        other.events = self.events.take();
+        other.approval_hook = self.approval_hook.take();
+        other.summarizer = self.summarizer.take();
+        *self = other;
+    }
+
     /// A lock-free cancellation handle. A running turn holds the agent mutex for its
     /// whole duration, so cancellers (TUI, tests) must signal through this clone
     /// instead of taking the lock — otherwise cancel queues behind the turn it is
     /// meant to stop.
+    /// Reconstructed LoonPaths for slash commands that need the store (/new,
+    /// /resume): derived from the dirs captured at construction.
+    pub fn loon_paths(&self) -> loon_config::LoonPaths {
+        let base = self
+            .data_dir
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| self.data_dir.clone());
+        loon_config::LoonPaths {
+            config_dir: self.config_dir.clone(),
+            data_dir: self.data_dir.clone(),
+            state_dir: base.join("state"),
+            cache_dir: base.join("cache"),
+            runtime_dir: base.join("runtime"),
+        }
+    }
+
     pub fn cancel_handle(&self) -> tokio::sync::watch::Sender<bool> {
         self.cancel_tx.clone()
     }

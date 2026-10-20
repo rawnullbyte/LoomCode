@@ -365,6 +365,7 @@ fn event_type(ev: &AgentEvent) -> &'static str {
         AgentEvent::MemberNote(_) => "member_note",
         AgentEvent::ApprovalRequested { .. } => "approval_requested",
         AgentEvent::ModeChanged { .. } => "mode_changed",
+        AgentEvent::ToggleTheme => "toggle_theme",
         AgentEvent::Warning(_) => "warning",
         AgentEvent::TurnFinished { .. } => "turn_finished",
     }

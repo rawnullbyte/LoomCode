@@ -303,6 +303,17 @@ impl Store {
         Ok(out)
     }
 
+    /// Rename a session (shows up in listings / /resume).
+    pub fn rename_session(&self, id: EvId, title: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("store lock");
+        conn.execute(
+            "UPDATE sessions SET title = ?2 WHERE id = ?1",
+            params![id.to_string(), title],
+        )
+        .map_err(EventsError::Db)?;
+        Ok(())
+    }
+
     pub fn session_meta(&self, id: EvId) -> Result<Option<SessionMeta>> {
         let conn = self.conn.lock().expect("store lock");
         let row = conn
