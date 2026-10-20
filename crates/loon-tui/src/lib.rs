@@ -101,6 +101,8 @@ pub struct App {
     pub settings: Option<usize>,
     /// Model picker (bare /model): Some((refs, selected)). Modal overlay.
     pub model_picker: Option<(Vec<String>, usize)>,
+    /// Effort picker (bare /effort): Some(selected). Modal overlay.
+    pub effort_picker: Option<usize>,
     /// Menu-local mirrors (optimistically updated on toggle; commands re-apply).
     pub settings_autocompact: bool,
     pub settings_effort: String,
@@ -130,6 +132,7 @@ impl App {
             pending_approval: None,
             settings: None,
             model_picker: None,
+            effort_picker: None,
             settings_autocompact: true,
             settings_effort: "medium".into(),
         }
@@ -660,6 +663,7 @@ async fn run_inner(
                 AgentEvent::ToggleTheme => app.transparent = !app.transparent,
                 AgentEvent::OpenConfigMenu => app.settings = Some(0),
                 AgentEvent::OpenModelPicker { refs } => app.model_picker = Some((refs, 0)),
+                AgentEvent::OpenEffortPicker => app.effort_picker = Some(1),
                 AgentEvent::MemberNote(m) => app.push_block(Block::Member(m)),
                 AgentEvent::ApprovalRequested { tool, args_excerpt } => {
                     // Ask mode without a hook (or before one is installed): surface the
@@ -762,6 +766,26 @@ async fn run_inner(
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiCommand>) {
+    // The effort picker is modal: arrows move, Enter sets, Esc closes.
+    if let Some(selected) = app.effort_picker {
+        const LEVELS: [&str; 3] = ["low", "medium", "high"];
+        match key.code {
+            KeyCode::Up => app.effort_picker = Some(if selected == 0 { 2 } else { selected - 1 }),
+            KeyCode::Down => app.effort_picker = Some((selected + 1) % 3),
+            KeyCode::Esc | KeyCode::Char('q') => app.effort_picker = None,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                let level = LEVELS[selected].to_string();
+                let _ = cmd_tx
+                    .send(UiCommand::Slash(
+                        loon_core::commands::SlashCommand::Effort { level },
+                    ))
+                    .await;
+                app.effort_picker = None;
+            }
+            _ => {}
+        }
+        return;
+    }
     // The model picker is modal: arrows move, Enter switches, Esc closes.
     if let Some((refs, selected)) = app.model_picker.clone() {
         match key.code {

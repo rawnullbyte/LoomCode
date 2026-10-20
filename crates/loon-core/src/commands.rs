@@ -610,6 +610,14 @@ impl Agent {
                 ))
             }
             SlashCommand::Effort { level } => {
+                if level.is_empty() {
+                    // bare /effort: interactive hosts open the picker; headless lists
+                    if self.events.is_some() {
+                        self.emit(crate::AgentEvent::OpenEffortPicker);
+                        return Ok(String::new());
+                    }
+                    return Ok("usage: /effort low|medium|high (2k/8k/32k output tokens)".into());
+                }
                 let tokens = match level.as_str() {
                     "low" => 2_048,
                     "medium" => 8_192,

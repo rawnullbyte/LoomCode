@@ -198,6 +198,43 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(rows).block(block).style(theme.base()), rect);
     }
 
+    // ── effort picker overlay (bare /effort) ────────────────────────────────────
+    if let Some(selected) = app.effort_picker {
+        let w = 36u16.min(area.width.saturating_sub(4));
+        let h = 6u16.min(area.height.saturating_sub(4));
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let rect = ratatui::layout::Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        f.render_widget(ratatui::widgets::Clear, rect);
+        let mut rows: Vec<Line> = vec![Line::styled(
+            " effort — arrows · enter · esc ".to_string(),
+            theme.accent_bold(),
+        )];
+        for (i, level) in ["low — 2k output tokens", "medium — 8k", "high — 32k"]
+            .iter()
+            .enumerate()
+        {
+            if i == selected {
+                rows.push(Line::from(Span::styled(
+                    format!("› {level}"),
+                    theme.menu_selected(),
+                )));
+            } else {
+                rows.push(Line::from(Span::styled(format!("  {level}"), theme.base())));
+            }
+        }
+        let block = RtBlock::default()
+            .borders(Borders::ALL)
+            .border_style(theme.border())
+            .style(theme.base());
+        f.render_widget(Paragraph::new(rows).block(block).style(theme.base()), rect);
+    }
+
     // ── settings menu overlay (bare /config) ────────────────────────────────────
     if let Some(selected) = app.settings {
         let w = 56u16.min(area.width.saturating_sub(4));

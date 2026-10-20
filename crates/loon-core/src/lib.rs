@@ -62,6 +62,8 @@ pub enum AgentEvent {
     OpenModelPicker {
         refs: Vec<String>,
     },
+    /// bare /effort — the UI opens the effort picker.
+    OpenEffortPicker,
     Warning(String),
     TurnFinished {
         status: TurnStatus,
