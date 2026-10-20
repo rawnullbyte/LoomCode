@@ -58,6 +58,7 @@ proptest = "1"
 [profile.release]
 lto = "thin"
 strip = true
+codegen-units = 1
 
 [profile.dev]
 opt-level = 0

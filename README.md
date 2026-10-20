@@ -111,6 +111,21 @@ terminal background, no reverse video) is verified by buffer-walk tests on `Test
 (`crates/loon-tui/tests/transparency.rs`, `tests/ui_popup.rs`). A full interactive
 keymap session was **not** exercised in this environment and is not claimed.
 
+## Packaging and portability
+
+- `cargo install --path crates/loon-cli` builds the optimized `loon` binary (release
+  profile: thin LTO, stripped, single codegen unit).
+- Dependencies are chosen for portability: `reqwest` with rustls (no OpenSSL linkage),
+  `rusqlite` bundled (no system SQLite required), `ratatui`/`crossterm` for the TUI.
+
+| Platform | Status | Notes |
+| --- | --- | --- |
+| Linux x86-64 (glibc) | tested | all 142 tests + benchmarks run here |
+| macOS aarch64/x86-64 | untested | no platform-specific code is intentional; report issues |
+| Windows | untested | crossterm/ratatui support it; bash tool assumes a POSIX shell |
+| musl static | untested | `--target x86_64-unknown-linux-musl` expected to work via rustls + bundled sqlite |
+| NixOS | untested | LOON_HOME/XDG paths are honored; no hardcoded /usr paths |
+
 ## Compatibility matrix
 
 | Capability | Live-tested | Fixture-tested | Not yet |
