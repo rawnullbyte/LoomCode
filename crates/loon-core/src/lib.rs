@@ -164,6 +164,10 @@ pub struct Agent {
     /// Loop tasks (recurring prompts). The host scheduler polls `take_due`; the agent
     /// cancels through the same registry via the loop_cancel tool.
     pub loops: Arc<loops::LoopRegistry>,
+    /// /effort: requested output budget per request (max_output_tokens).
+    pub effort: Option<String>,
+    /// /goal: session goal, injected into every request as a leading system message.
+    pub session_goal: Option<String>,
     system_prompt: String,
     session_id: loon_events::EvId,
 }
@@ -276,6 +280,8 @@ impl Agent {
             config_dir: paths.config_dir.clone(),
             skills: skills::load(&paths.data_dir, Path::new(&cwd)),
             loops: Arc::new(loops::LoopRegistry::new()),
+            effort: None,
+            session_goal: None,
             cfg,
             system_prompt: system,
             session_id,
@@ -390,6 +396,8 @@ impl Agent {
             config_dir: paths.config_dir.clone(),
             skills: skills::load(&paths.data_dir, Path::new(&cwd)),
             loops: Arc::new(loops::LoopRegistry::new()),
+            effort: None,
+            session_goal: None,
             cfg,
             system_prompt: prompt::system_prompt(Path::new(&cwd)),
             session_id,
@@ -465,11 +473,16 @@ impl Agent {
             // cross the compaction threshold.
             self.maybe_compact().await;
             let request_id = loon_events::EvId::now_v7();
+            let max_output_tokens = match self.effort.as_deref() {
+                Some("low") => Some(2_048),
+                Some("high") => Some(32_768),
+                _ => None,
+            };
             let req = loon_providers::ChatRequest {
                 model: self.cfg.model_ref.clone(),
                 messages: self.assemble_messages(),
                 tools: self.tools.provider_definitions(),
-                max_output_tokens: None,
+                max_output_tokens,
                 temperature: None,
             };
             let est_tokens = est::estimate_messages(&req.messages);
@@ -910,6 +923,11 @@ impl Agent {
         let mut v = vec![loon_providers::ChatMessage::system(
             self.system_prompt.clone(),
         )];
+        if let Some(goal) = &self.session_goal {
+            v.push(loon_providers::ChatMessage::system(format!(
+                "Current session goal (the user set this with /goal): {goal}"
+            )));
+        }
         v.extend(self.history.iter().cloned());
         v
     }

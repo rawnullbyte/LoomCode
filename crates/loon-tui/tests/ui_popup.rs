@@ -77,12 +77,13 @@ fn prefix_narrows_and_selection_renders_highlighted() {
     let mut a = app();
     a.input = "/re".into();
     let t = draw(&mut a);
-    let rows: Vec<String> = (0..2)
-        .map(|i| row_text(&t, 24 - 3 - 1 - 3 + 1 + i, 80))
+    let rows: Vec<String> = (0..3)
+        .map(|i| row_text(&t, 24 - 3 - 1 - 4 + 1 + i, 80))
         .collect();
     let joined = rows.join("\n");
     assert!(joined.contains("/redo"), "{joined}");
     assert!(joined.contains("/rewind"), "{joined}");
+    assert!(joined.contains("/recap"), "{joined}");
     assert!(
         !joined.contains("/help"),
         "filtered list must drop non-matches"

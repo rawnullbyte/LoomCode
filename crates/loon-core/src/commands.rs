@@ -164,6 +164,16 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
         ),
         ("model [REF]", "show or switch model/combos:NAME"),
         ("config [set K V]", "show or change + persist configuration"),
+        ("mcp", "list connected MCP tools"),
+        ("workflows", "list user-defined skills (workflows)"),
+        (
+            "autocompact on|off|toggle",
+            "enable/disable context compaction",
+        ),
+        ("effort low|medium|high", "output budget per request"),
+        ("goal <text|clear>", "session goal, kept in context"),
+        ("btw <text>", "record context without triggering a turn"),
+        ("recap", "summarize the session so far"),
         (
             "loop <interval> <prompt>",
             "run a prompt on an interval, e.g. /loop 1m check CI",
@@ -534,10 +544,24 @@ impl Agent {
         Ok(self.data_dir.clone())
     }
 
-    /// /context: where the window stands. Estimates are labeled as estimates.
+    /// /context: where the window stands, with a usage bar. Estimates are labeled as
+    /// estimates everywhere they appear.
     pub fn context_report(&self) -> String {
         let est = self.estimated_context_tokens();
         let window = self.cfg.context_window;
+        let bar = if window > 0 {
+            let width = 24usize;
+            let frac = (est as f64 / window as f64).clamp(0.0, 1.0);
+            let filled = (frac * width as f64).round() as usize;
+            format!(
+                "[{}{}] {:.0}%",
+                "█".repeat(filled),
+                "░".repeat(width - filled),
+                frac * 100.0
+            )
+        } else {
+            String::new()
+        };
         let pct = if window > 0 {
             format!(" ({:.*}% of window)", 1, 100.0 * est as f64 / window as f64)
         } else {
@@ -549,7 +573,7 @@ impl Agent {
         }
         let roles: Vec<String> = roles.into_iter().map(|(k, v)| format!("{k}×{v}")).collect();
         format!(
-            "context: ~{est} est. tokens{pct}, {} message(s) [{}]\ncompaction at {}% of window ({} tokens); {}",
+            "context: ~{est} est. tokens {bar}{pct}\n{} message(s) [{}]\ncompaction at {}% of window ({} tokens); {}",
             self.history.len(),
             roles.join(" "),
             (crate::compaction::COMPACT_THRESHOLD * 100.0) as u32,

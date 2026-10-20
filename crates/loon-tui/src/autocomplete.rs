@@ -60,7 +60,7 @@ mod tests {
         let names: Vec<&str> = c.iter().map(|x| x.insert.as_str()).collect();
         assert_eq!(
             names,
-            vec!["redo", "rewind"],
+            vec!["redo", "rewind", "recap"],
             "prefix on the word, args ignored"
         );
         // argument hints still shown
