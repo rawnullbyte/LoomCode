@@ -68,11 +68,13 @@ tests; also handy for trying Loon without touching your real config).
   (`tests/verify_shell.rs`); incremental repo index with persisted mtime cache
   (`--lib index`). Not done: LSP integration.
 - **M4 UX — core implemented.** Slash commands `/help /undo /redo /rewind /checkpoint
-  /fork /compact /context /diff /memory /model /quit` execute real machinery and are
-  tested through the agent (`tests/slash_commands.rs`); subagent `delegate` tool with
-  journaled child sessions, no recursion, cancellation propagation
-  (`tests/subagent.rs`); mid-session model switching. Not done: `/config` TUI, prompt
-  queue UI, skills/workflows, model routing rules.
+  /fork /compact /context /diff /memory /model /config /new /resume /rename /theme
+  /usage /init /mcp /workflows /autocompact /effort /goal /btw /recap /loop /loops
+  /loopcancel /quit` execute real machinery and are tested through the agent
+  (`tests/slash_commands.rs`); subagent `delegate` tool with journaled child sessions,
+  no recursion, cancellation propagation (`tests/subagent.rs`); interactive y/n
+  approvals in ask mode; loop tasks the agent can cancel via `loop_cancel`. Not done:
+  `/config` TUI menu (currently show/set), reviewer-based auto-approval mode.
 - **M5 integrations — MCP implemented, rest not.** MCP stdio client ships
   (`crates/loon-core/src/mcp.rs`): initialize handshake, tools/list, tools/call over
   newline-delimited JSON-RPC against real spawned servers
@@ -137,7 +139,7 @@ crates/
 
 ```sh
 cargo build                 # zero warnings
-cargo test                  # 132 tests, all suites green
+cargo test                  # 137 tests, all suites green
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 LOON_HOME=$(mktemp -d) target/debug/loon run "smoke" --output jsonl
