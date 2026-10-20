@@ -73,10 +73,14 @@ tests; also handy for trying Loon without touching your real config).
   journaled child sessions, no recursion, cancellation propagation
   (`tests/subagent.rs`); mid-session model switching. Not done: `/config` TUI, prompt
   queue UI, skills/workflows, model routing rules.
-- **M5 integrations — not implemented.** MCP client, plugin protocol,
-  files/batch/embeddings APIs, monitors, SSH/container workspaces, supervisor/attach,
-  browser/DB/binary/RE tools. The adapter seams exist (registry, tool registry) but no
-  MCP code is written and none is claimed.
+- **M5 integrations — MCP implemented, rest not.** MCP stdio client ships
+  (`crates/loon-core/src/mcp.rs`): initialize handshake, tools/list, tools/call over
+  newline-delimited JSON-RPC against real spawned servers
+  (`crates/loon-core/tests/mcp.rs`, Python fixture server); `[mcp.servers.*]` config;
+  tools surface as `mcp_<server>_<tool>` and are marked mutating (untrusted until
+  proven read-only). Explicitly not implemented: MCP resources/prompts/sampling,
+  Streamable HTTP, plugin protocol, files/batch/embeddings APIs, monitors,
+  SSH/container workspaces, supervisor/attach, browser/DB/binary/RE tools.
 - **M6 hardening — partially done.** Crash/kill coverage and adversarial provider cases
   (partial streams, drops, malformed frames) are tested; measured benchmarks against the
   spec targets have **not been run** and no numbers are claimed; packaging and the
@@ -94,7 +98,7 @@ keymap session was **not** exercised in this environment and is not claimed.
 | OpenAI Responses streaming | — | ✔ | live |
 | Arbitrary OpenAI-compatible endpoints | — | ✔ (non-SSE fallback, error statuses) | live |
 | Anthropic Messages / Gemini | — | — | ✔ (adapter interface reserved, no implementation) |
-| MCP | — | — | ✔ (not started) |
+| MCP (stdio, tools only) | — | ✔ (fixture server) | live servers, resources/prompts/HTTP |
 
 ## Layout
 
@@ -117,7 +121,7 @@ crates/
 
 ```sh
 cargo build                 # zero warnings
-cargo test                  # 118 tests, all suites green
+cargo test                  # 121 tests, all suites green
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 LOON_HOME=$(mktemp -d) target/debug/loon run "smoke" --output jsonl
