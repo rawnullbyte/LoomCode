@@ -22,6 +22,7 @@ use tokio::sync::{mpsc, Mutex};
 pub enum UiCommand {
     Submit(String),
     Cancel,
+    Slash(loon_core::commands::SlashCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -250,6 +251,7 @@ async fn run_inner(
         .map_err(|e| anyhow::anyhow!("session init: {e}"))?,
     ));
     let (ev_tx, mut ev_rx) = mpsc::channel::<AgentEvent>(1024);
+    let (slash_tx, mut slash_rx) = mpsc::channel::<String>(64);
     agent.lock().await.set_event_sink(ev_tx.clone());
 
     let status = StatusLine {
@@ -270,6 +272,7 @@ async fn run_inner(
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<UiCommand>(32);
 
     // Driver: one turn at a time; cancellation stays responsive while a turn runs.
+    let driver_slash_tx = slash_tx.clone();
     let driver = tokio::spawn(async move {
         let mut running: Option<(
             tokio::task::JoinHandle<TurnResult>,
@@ -295,6 +298,28 @@ async fn run_inner(
                     let a = agent.clone();
                     tokio::spawn(async move { a.lock().await.cancel() });
                 }
+                UiCommand::Slash(cmd) => {
+                    if running.is_some() {
+                        let _ = driver_slash_tx
+                            .send(
+                                "busy: wait for the current turn to finish (Ctrl+C cancels)".into(),
+                            )
+                            .await;
+                    } else {
+                        let a = agent.clone();
+                        let tx = driver_slash_tx.clone();
+                        tokio::spawn(async move {
+                            let mut guard = a.lock().await;
+                            let out = match cmd {
+                                loon_core::commands::SlashCommand::Quit => {
+                                    "use /quit (handled by the interface)".to_string()
+                                }
+                                other => guard.run_slash(other).await.unwrap_or_else(|e| e),
+                            };
+                            let _ = tx.send(out).await;
+                        });
+                    }
+                }
             }
             // Reap finished turns without blocking command handling.
             if let Some((h, _)) = &running {
@@ -307,6 +332,9 @@ async fn run_inner(
 
     let mut events = EventStream::new();
     loop {
+        while let Ok(out) = slash_rx.try_recv() {
+            app.push_block(Block::System(out));
+        }
         while let Ok(ev) = ev_rx.try_recv() {
             match ev {
                 AgentEvent::TextDelta(t) => app.stream_text(&t),
@@ -397,6 +425,15 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             }
             if text == "/quit" || text == "/exit" {
                 app.quit = true;
+                return;
+            }
+            if let Some(parsed) = loon_core::commands::parse(&text) {
+                match parsed {
+                    Ok(cmd) => {
+                        let _ = cmd_tx.send(UiCommand::Slash(cmd)).await;
+                    }
+                    Err(msg) => app.push_block(Block::System(msg)),
+                }
                 return;
             }
             app.cancel_hint_shown = false;

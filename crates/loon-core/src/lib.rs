@@ -4,6 +4,7 @@
 //! journals every state change. The TUI and headless clients are consumers of
 //! [`AgentEvent`]s; they hold no business logic.
 
+pub mod commands;
 pub mod compaction;
 pub mod est;
 pub mod index;
@@ -120,6 +121,8 @@ pub struct Agent {
     pub approval_hook: Option<permissions::ApprovalHook>,
     /// Context summarizer; defaults to a model-backed summarizer (compaction.rs).
     pub summarizer: Option<compaction::Summarizer>,
+    /// Loon data dir (for memory and friends). Set at construction.
+    pub data_dir: PathBuf,
     system_prompt: String,
     session_id: loon_events::EvId,
 }
@@ -228,6 +231,7 @@ impl Agent {
             )),
             approval_hook: None,
             summarizer: None,
+            data_dir: paths.data_dir.clone(),
             cfg,
             system_prompt: system,
             session_id,
@@ -321,6 +325,7 @@ impl Agent {
             )),
             approval_hook: None,
             summarizer: None,
+            data_dir: paths.data_dir.clone(),
             cfg,
             system_prompt: prompt::system_prompt(Path::new(&cwd)),
             session_id,
