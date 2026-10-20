@@ -64,6 +64,12 @@ pub enum SlashCommand {
     },
     /// /mcp — list connected MCP tools.
     Mcp,
+    /// /find <query> — search this session's transcript.
+    Find {
+        query: String,
+    },
+    /// /doctor — offline health checks.
+    Doctor,
     /// /export [path] — write the session as Markdown.
     Export {
         path: Option<String>,
@@ -208,6 +214,10 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         "toolcap" => SlashCommand::ToolCap {
             bytes: args.first().and_then(|a| a.parse().ok()).unwrap_or(0),
         },
+        "find" => SlashCommand::Find {
+            query: args.join(" "),
+        },
+        "doctor" => SlashCommand::Doctor,
         "mcp" => SlashCommand::Mcp,
         "workflows" => SlashCommand::Workflows,
         "autocompact" => SlashCommand::AutoCompact {
@@ -270,6 +280,8 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
             "add an OpenAI-compatible provider",
         ),
         ("combo add NAME provider:model ...", "define a model combo"),
+        ("find <query>", "search this session's transcript"),
+        ("doctor", "offline health checks"),
         ("mcp", "list connected MCP tools"),
         ("workflows", "list user-defined skills (workflows)"),
         (
@@ -614,6 +626,79 @@ impl Agent {
                 self.cfg.tool_output_bytes = bytes;
                 self.ctx.output_limit = bytes;
                 Ok(format!("tool output cap set to {bytes} bytes (session)"))
+            }
+            SlashCommand::Find { query } => {
+                if query.trim().is_empty() {
+                    return Err("usage: /find <query>".into());
+                }
+                let needle = query.to_lowercase();
+                let mut hits = Vec::new();
+                let mut turn = 0usize;
+                let Ok(events) = self.journal.events() else {
+                    return Err("journal unreadable".into());
+                };
+                for e in &events {
+                    match &e.kind {
+                        loon_events::model::EventKind::UserMessage { text } => {
+                            turn += 1;
+                            if text.to_lowercase().contains(&needle) {
+                                hits.push(format!(
+                                    "  turn {turn} you: {}",
+                                    truncate_prompt(text.trim(), 70)
+                                ));
+                            }
+                        }
+                        loon_events::model::EventKind::TextDelta { text, .. }
+                            if text.to_lowercase().contains(&needle) =>
+                        {
+                            hits.push(format!(
+                                "  turn {turn} loon: {}",
+                                truncate_prompt(text.trim(), 70)
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+                if hits.is_empty() {
+                    Ok(format!("no matches for `{query}`"))
+                } else {
+                    Ok(format!(
+                        "{} match(es) for `{query}`:\n{}",
+                        hits.len(),
+                        hits.into_iter().take(20).collect::<Vec<_>>().join("\n")
+                    ))
+                }
+            }
+            SlashCommand::Doctor => {
+                let mut out = String::from("doctor (offline):\n");
+                match crate::open_store(&self.loon_paths()) {
+                    Ok(store) => match store.integrity_check() {
+                        Ok(r) => out.push_str(&format!("  store: {r}\n")),
+                        Err(e) => out.push_str(&format!("  store: ERROR {e}\n")),
+                    },
+                    Err(e) => out.push_str(&format!("  store: ERROR {e}\n")),
+                }
+                let paths = self.loon_paths();
+                match loon_config::Config::load_or_builtin(&paths) {
+                    Ok((_, findings)) if findings.is_empty() => out.push_str("  config: valid\n"),
+                    Ok((_, findings)) => {
+                        out.push_str(&format!("  config: {} finding(s)\n", findings.len()))
+                    }
+                    Err(e) => out.push_str(&format!("  config: ERROR {e}\n")),
+                }
+                out.push_str(&format!(
+                    "  session: {} events journaled\n  model: {} (effort {})\n  permission mode: {}\n  loops: {}\n  skills: {}\n",
+                    self.journal.events().map(|e| e.len()).unwrap_or(0),
+                    self.cfg.model_ref,
+                    self.effort.as_deref().unwrap_or("default"),
+                    format!("{:?}", self.cfg.permissions.mode).to_lowercase(),
+                    self.loops.list().len(),
+                    self.skills.len()
+                ));
+                out.push_str(
+                    "  (offline checks only — network probes are `loon doctor --connect`)",
+                );
+                Ok(out)
             }
             SlashCommand::Mcp => {
                 let mut out = String::new();

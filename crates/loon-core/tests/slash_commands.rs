@@ -189,6 +189,30 @@ async fn slash_commands_execute_honestly() {
         })
         .await
         .is_err());
+
+    // /find over the journal + /doctor offline checks
+    a.run_slash(SlashCommand::Btw {
+        text: "the magic word is xylophone".into(),
+    })
+    .await
+    .unwrap();
+    let out = a
+        .run_slash(SlashCommand::Find {
+            query: "xylophone".into(),
+        })
+        .await
+        .unwrap();
+    assert!(out.contains("1 match"), "{out}");
+    let out = a
+        .run_slash(SlashCommand::Find {
+            query: "nothinghere".into(),
+        })
+        .await
+        .unwrap();
+    assert!(out.contains("no matches"), "{out}");
+    let out = a.run_slash(SlashCommand::Doctor).await.unwrap();
+    assert!(out.contains("store: ok"), "{out}");
+    assert!(out.contains("config: valid"), "{out}");
 }
 
 #[allow(dead_code)] // kept for future tool-site tests
