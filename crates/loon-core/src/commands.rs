@@ -623,6 +623,12 @@ impl Agent {
     /// comment-preserving save path, reported separately so the user knows what stuck.
     async fn run_config_command(&mut self, args: Vec<String>) -> Result<String, String> {
         match args.first().map(|s| s.as_str()) {
+            None | Some("show") if self.events.is_some() => {
+                // Interactive host: open the real settings menu (text stays available
+                // via /config show).
+                self.emit(crate::AgentEvent::OpenConfigMenu);
+                Ok(String::new())
+            }
             None | Some("show") => Ok(self.config_report()),
             Some("set") => {
                 let key = args

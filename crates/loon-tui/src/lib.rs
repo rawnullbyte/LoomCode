@@ -97,6 +97,11 @@ pub struct App {
     /// Pending ask-mode approval: tool, args excerpt, and the answer channel. Modal —
     /// keys other than y/n/Esc are ignored while set.
     pub pending_approval: Option<(String, String, tokio::sync::oneshot::Sender<bool>)>,
+    /// Interactive /config menu: Some(selected row). Modal overlay.
+    pub settings: Option<usize>,
+    /// Menu-local mirrors (optimistically updated on toggle; commands re-apply).
+    pub settings_autocompact: bool,
+    pub settings_effort: String,
 }
 
 impl App {
@@ -121,6 +126,9 @@ impl App {
             transcript_rect: None,
             selection: None,
             pending_approval: None,
+            settings: None,
+            settings_autocompact: true,
+            settings_effort: "medium".into(),
         }
     }
 
@@ -652,6 +660,7 @@ async fn run_inner(
                 }
                 AgentEvent::ModeChanged { mode } => app.status.mode = mode,
                 AgentEvent::ToggleTheme => app.transparent = !app.transparent,
+                AgentEvent::OpenConfigMenu => app.settings = Some(0),
                 AgentEvent::MemberNote(m) => app.push_block(Block::Member(m)),
                 AgentEvent::ApprovalRequested { tool, args_excerpt } => {
                     // Ask mode without a hook (or before one is installed): surface the
@@ -754,6 +763,59 @@ async fn run_inner(
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiCommand>) {
+    // The settings menu is modal: arrows move, Enter toggles/cycles, Esc/q closes.
+    if let Some(selected) = app.settings {
+        const ITEMS: usize = 5;
+        match key.code {
+            KeyCode::Up => {
+                app.settings = Some(if selected == 0 {
+                    ITEMS - 1
+                } else {
+                    selected - 1
+                });
+            }
+            KeyCode::Down => {
+                app.settings = Some((selected + 1) % ITEMS);
+            }
+            KeyCode::Esc | KeyCode::Char('q') => app.settings = None,
+            KeyCode::Enter | KeyCode::Char(' ') => match selected {
+                0 => {
+                    let _ = cmd_tx.send(UiCommand::CycleMode).await;
+                }
+                1 => {
+                    app.settings_autocompact = !app.settings_autocompact;
+                    let _ = cmd_tx
+                        .send(UiCommand::Slash(
+                            loon_core::commands::SlashCommand::AutoCompact {
+                                setting: "toggle".into(),
+                            },
+                        ))
+                        .await;
+                }
+                2 => {
+                    let next = match app.settings_effort.as_str() {
+                        "low" => "medium",
+                        "medium" => "high",
+                        _ => "low",
+                    };
+                    app.settings_effort = next.into();
+                    let _ = cmd_tx
+                        .send(UiCommand::Slash(
+                            loon_core::commands::SlashCommand::Effort { level: next.into() },
+                        ))
+                        .await;
+                }
+                3 => {
+                    let _ = cmd_tx
+                        .send(UiCommand::Slash(loon_core::commands::SlashCommand::Theme))
+                        .await;
+                }
+                _ => app.settings = None,
+            },
+            _ => {}
+        }
+        return;
+    }
     // A pending approval is modal: y approves, n or Esc refuses, everything else is
     // swallowed so the turn cannot be poked while it waits.
     if let Some((tool, _excerpt, answer_tx)) = app.pending_approval.take() {

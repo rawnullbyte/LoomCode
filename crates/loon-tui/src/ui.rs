@@ -178,6 +178,60 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         footer,
     );
 
+    // ── settings menu overlay (bare /config) ────────────────────────────────────
+    if let Some(selected) = app.settings {
+        let w = 56u16.min(area.width.saturating_sub(4));
+        let h = 12u16.min(area.height.saturating_sub(4));
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let rect = ratatui::layout::Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        f.render_widget(ratatui::widgets::Clear, rect);
+        let items: [String; 5] = [
+            format!("permission mode: {}   (enter cycles)", app.status.mode),
+            format!(
+                "autocompact: {}   (enter toggles)",
+                if app.settings_autocompact {
+                    "on"
+                } else {
+                    "off"
+                }
+            ),
+            format!(
+                "effort: {}   (enter cycles low/medium/high)",
+                app.settings_effort
+            ),
+            "theme: enter to cycle transparent/opaque".to_string(),
+            "done".to_string(),
+        ];
+        let mut rows: Vec<Line> = vec![Line::styled(
+            " settings — arrows move · enter toggles · esc closes ".to_string(),
+            theme.accent_bold(),
+        )];
+        for (i, item) in items.iter().enumerate() {
+            if i == selected {
+                rows.push(Line::from(vec![
+                    Span::styled(" › ", theme.accent_bold()),
+                    Span::styled(item.clone(), theme.accent_bold()),
+                ]));
+            } else {
+                rows.push(Line::from(vec![
+                    Span::styled("   ", theme.dim()),
+                    Span::styled(item.clone(), theme.base()),
+                ]));
+            }
+        }
+        let block = RtBlock::default()
+            .borders(Borders::ALL)
+            .border_style(theme.border())
+            .style(theme.base());
+        f.render_widget(Paragraph::new(rows).block(block).style(theme.base()), rect);
+    }
+
     // text cursor at the recorded cursor position (hidden while busy streaming to
     // avoid flicker)
     if !app.status.busy {

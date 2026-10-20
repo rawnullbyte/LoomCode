@@ -56,6 +56,8 @@ pub enum AgentEvent {
     },
     /// /theme cycled — the UI flips its own transparent flag.
     ToggleTheme,
+    /// bare /config — the UI opens its interactive settings menu.
+    OpenConfigMenu,
     Warning(String),
     TurnFinished {
         status: TurnStatus,

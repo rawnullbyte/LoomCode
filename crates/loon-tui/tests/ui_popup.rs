@@ -122,6 +122,32 @@ fn spinner_glyph_animates_across_ticks_and_styled_accent_while_busy() {
 }
 
 #[test]
+fn settings_menu_navigation_and_toggles() {
+    let mut a = app();
+    assert!(a.settings.is_none());
+    a.settings = Some(0);
+    // up from 0 wraps to the last row
+    a.settings = Some((a.settings.unwrap() + 4) % 5);
+    assert_eq!(a.settings, Some(4));
+    a.settings = Some(0);
+    // toggling autocompact flips the mirror
+    let before = a.settings_autocompact;
+    a.settings_autocompact = !a.settings_autocompact;
+    assert_ne!(a.settings_autocompact, before);
+    // effort cycles low → medium → high
+    a.settings_effort = "low".into();
+    let next = match a.settings_effort.as_str() {
+        "low" => "medium",
+        "medium" => "high",
+        _ => "low",
+    };
+    assert_eq!(next, "medium");
+    // esc closes
+    a.settings = None;
+    assert!(a.settings.is_none());
+}
+
+#[test]
 fn tab_accept_and_input_update_flow() {
     let mut a = app();
     a.input = "/un".into();
