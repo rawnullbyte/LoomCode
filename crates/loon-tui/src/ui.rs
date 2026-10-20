@@ -46,36 +46,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     });
 
     // ── status line: animated while busy, quiet when idle ───────────────────────
-    let left = if app.status.busy {
+    // idle: nothing (the banner already said who we are); busy: spinner only
+    let status_spans: Vec<Span> = if app.status.busy {
         let elapsed = app.elapsed_secs();
         let verb = VERBS[(app.tick as usize / 80) % VERBS.len()];
-        Span::styled(
+        vec![Span::styled(
             format!("{} {}… {}s", app.spinner_glyph(), verb, elapsed),
             theme.accent_bold(),
-        )
+        )]
     } else {
-        Span::styled(" ready".to_string(), theme.ok())
+        vec![]
     };
-    let mut status_spans: Vec<Span> = vec![left];
-    let info = format!(
-        " · {}{}{} · {}",
-        app.status.model,
-        app.status
-            .member
-            .as_ref()
-            .map(|m| format!(" (via {m})"))
-            .unwrap_or_default(),
-        if app.status.context_est > 0 {
-            format!(" · ~{}k ctx", app.status.context_est / 1000)
-        } else {
-            String::new()
-        },
-        app.status.mode,
-    );
-    status_spans.push(Span::styled(
-        truncate_str(&info, status.width as usize),
-        theme.dim(),
-    ));
     f.render_widget(
         Paragraph::new(Line::from(status_spans)).style(theme.base()),
         status,
@@ -128,9 +109,9 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             let desc = c.description.clone();
             let row = if idx == selected {
                 Line::from(vec![
-                    Span::styled("› ", theme.accent_bold()),
-                    Span::styled(format!("/{display}"), theme.accent_bold()),
-                    Span::styled(format!("  {desc}"), theme.dim()),
+                    Span::styled("› ", theme.menu_selected()),
+                    Span::styled(format!("/{display}"), theme.menu_selected()),
+                    Span::styled(format!("  {desc}"), theme.menu_selected()),
                 ])
             } else {
                 Line::from(vec![
@@ -154,7 +135,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         "›".to_string()
     };
     let block = RtBlock::default()
-        .borders(Borders::TOP)
+        .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(theme.border());
     let input_line = Line::from(vec![
         Span::styled(prompt.clone(), theme.accent_bold()),
@@ -177,6 +158,45 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         )),
         footer,
     );
+
+    // ── model picker overlay (bare /model) ──────────────────────────────────────
+    if let Some((refs, selected)) = &app.model_picker {
+        let rows_n = refs.len().min(10) as u16;
+        let w = 48u16.min(area.width.saturating_sub(4));
+        let h = (rows_n + 2).min(area.height.saturating_sub(4));
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let rect = ratatui::layout::Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        f.render_widget(ratatui::widgets::Clear, rect);
+        let mut rows: Vec<Line> = vec![Line::styled(
+            " switch model — arrows · enter · esc ".to_string(),
+            theme.accent_bold(),
+        )];
+        for (i, r) in refs.iter().take(rows_n as usize).enumerate() {
+            let current = *r == app.status.model;
+            if i == *selected {
+                rows.push(Line::from(Span::styled(
+                    format!("› {r}{}", if current { "  (current)" } else { "" }),
+                    theme.menu_selected(),
+                )));
+            } else {
+                rows.push(Line::from(Span::styled(
+                    format!("  {r}"),
+                    if current { theme.ok() } else { theme.base() },
+                )));
+            }
+        }
+        let block = RtBlock::default()
+            .borders(Borders::ALL)
+            .border_style(theme.border())
+            .style(theme.base());
+        f.render_widget(Paragraph::new(rows).block(block).style(theme.base()), rect);
+    }
 
     // ── settings menu overlay (bare /config) ────────────────────────────────────
     if let Some(selected) = app.settings {
@@ -215,8 +235,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         for (i, item) in items.iter().enumerate() {
             if i == selected {
                 rows.push(Line::from(vec![
-                    Span::styled(" › ", theme.accent_bold()),
-                    Span::styled(item.clone(), theme.accent_bold()),
+                    Span::styled(" › ", theme.menu_selected()),
+                    Span::styled(item.clone(), theme.menu_selected()),
                 ]));
             } else {
                 rows.push(Line::from(vec![

@@ -58,6 +58,10 @@ pub enum AgentEvent {
     ToggleTheme,
     /// bare /config — the UI opens its interactive settings menu.
     OpenConfigMenu,
+    /// bare /model — the UI opens the model picker over these refs.
+    OpenModelPicker {
+        refs: Vec<String>,
+    },
     Warning(String),
     TurnFinished {
         status: TurnStatus,
@@ -122,6 +126,9 @@ pub struct AgentConfig {
     pub context_window: u64,
     /// Host-provided extra tools (e.g. MCP), merged into the registry at construction.
     pub extra_tools: Vec<Arc<dyn loon_tools::Tool>>,
+    /// Ultra Loop: the project's check command run automatically after edit batches
+    /// (e.g. "cargo test"). None disables the automatic verification cycle.
+    pub check_command: Option<String>,
 }
 
 impl From<&loon_config::SessionCfg> for AgentConfig {
@@ -135,6 +142,7 @@ impl From<&loon_config::SessionCfg> for AgentConfig {
             permissions: loon_config::Permissions::default(),
             context_window: 128_000,
             extra_tools: Vec::new(),
+            check_command: None,
         }
     }
 }
@@ -172,6 +180,8 @@ pub struct Agent {
     pub effort: Option<String>,
     /// /goal: session goal, injected into every request as a leading system message.
     pub session_goal: Option<String>,
+    /// Ultra Loop baseline check result (established on the first verify).
+    baseline: Option<crate::verify::CheckResult>,
     system_prompt: String,
     session_id: loon_events::EvId,
 }
@@ -286,6 +296,7 @@ impl Agent {
             loops: Arc::new(loops::LoopRegistry::new()),
             effort: None,
             session_goal: None,
+            baseline: None,
             cfg,
             system_prompt: system,
             session_id,
@@ -334,14 +345,14 @@ impl Agent {
         self.cancel_tx.clone()
     }
 
-    /// Shift+Tab cycle order: bypass → auto → ask (manual) → allowlist → bypass.
+    /// Shift+Tab cycle order: bypass → auto → ask (manual) → bypass. (Allowlist
+    /// stays available in config for scripted setups but is out of the cycle.)
     pub fn next_permission_mode(mode: loon_config::PermissionMode) -> loon_config::PermissionMode {
         use loon_config::PermissionMode::*;
         match mode {
             Bypass => Auto,
             Auto => Ask,
-            Ask => Allowlist,
-            Allowlist => Bypass,
+            Ask | Allowlist => Bypass,
         }
     }
 
@@ -474,6 +485,7 @@ impl Agent {
             loops: Arc::new(loops::LoopRegistry::new()),
             effort: None,
             session_goal: None,
+            baseline: None,
             cfg,
             system_prompt: prompt::system_prompt(Path::new(&cwd)),
             session_id,
@@ -574,6 +586,28 @@ impl Agent {
                 tokio::spawn(async move { runner.run(&model_ref, &req_for_task, tx).await });
 
             let mut step_text = String::new();
+            let mut mutated_this_step = false;
+            // Ultra Loop step 1: the baseline is taken BEFORE any edit of this turn —
+            // a red baseline means pre-existing failures, not the agent's doing.
+            if self.baseline.is_none() {
+                if let Some(cmd) = self.cfg.check_command.clone() {
+                    let runner = crate::verify::shell_runner(
+                        self.ctx.ws.root().to_path_buf(),
+                        std::time::Duration::from_secs(600),
+                    );
+                    let mut verifier = crate::verify::Verifier::new(cmd, runner);
+                    let b = verifier.establish_baseline().await;
+                    self.emit(AgentEvent::MemberNote(format!(
+                        "ultra loop baseline: {}",
+                        if b.ok {
+                            "green".into()
+                        } else {
+                            format!("RED — {} ", b.output_excerpt.lines().last().unwrap_or(""))
+                        }
+                    )));
+                    self.baseline = Some(b);
+                }
+            }
             let mut tool_calls = Vec::new();
             let mut member_logged = false;
             let mut member_for_request: Option<MemberAttempt> = None;
@@ -762,10 +796,38 @@ impl Agent {
                 }
                 let call_id = loon_events::EvId::now_v7();
                 let result = self.execute_tool(&call_id, &call).await;
+                if result.mutated {
+                    mutated_this_step = true;
+                }
                 self.history.push(loon_providers::ChatMessage::tool_result(
                     call.id.clone(),
                     result.model_text.clone(),
                 ));
+            }
+            // ── Ultra Loop: verify after every edit batch ────────────────────────
+            if mutated_this_step {
+                if let Some(cmd) = self.cfg.check_command.clone() {
+                    let cwd = self.ctx.ws.root().to_path_buf();
+                    let runner =
+                        crate::verify::shell_runner(cwd, std::time::Duration::from_secs(600));
+                    let mut verifier = crate::verify::Verifier::new(cmd, runner);
+                    let (check, class) = verifier.verify().await;
+                    let verdict = format!("ultra loop: {} → {}", check.ok, class.describe());
+                    let _ = self.journal.append(
+                        None,
+                        EventKind::Warning {
+                            message: verdict.clone(),
+                        },
+                    );
+                    self.emit(AgentEvent::MemberNote(verdict));
+                    if class == crate::verify::Classification::Introduced {
+                        self.history.push(loon_providers::ChatMessage::user(format!(
+                            "[ultra loop] your last edit batch broke the check command (`{}`). \
+                             Re-read the failure, fix it, and verify again before continuing.",
+                            self.cfg.check_command.clone().unwrap_or_default()
+                        )));
+                    }
+                }
             }
             if status == TurnStatus::Cancelled {
                 break;
@@ -818,6 +880,7 @@ impl Agent {
                 return ToolRunOutcome {
                     model_text: format!("ERROR: {msg}"),
                     ok: false,
+                    mutated: false,
                 };
             }
         };
@@ -836,6 +899,7 @@ impl Agent {
                 return ToolRunOutcome {
                     model_text: format!("ERROR: {msg}"),
                     ok: false,
+                    mutated: false,
                 };
             }
         };
@@ -851,6 +915,7 @@ impl Agent {
             return ToolRunOutcome {
                 model_text: format!("ERROR: invalid arguments: {e}"),
                 ok: false,
+                mutated: false,
             };
         }
 
@@ -895,6 +960,7 @@ impl Agent {
             return ToolRunOutcome {
                 model_text: decision.refusal_text(),
                 ok: false,
+                mutated: false,
             };
         }
 
@@ -973,6 +1039,8 @@ impl Agent {
                 ToolRunOutcome {
                     model_text: out.text,
                     ok: out.ok,
+                    // file-mutating tools attach before/after hashes; detect via that
+                    mutated: out.structured.get("after_sha256").is_some(),
                 }
             }
             Err(e) => {
@@ -995,6 +1063,7 @@ impl Agent {
                 ToolRunOutcome {
                     model_text: format!("ERROR: {e}"),
                     ok: false,
+                    mutated: false,
                 }
             }
         }
@@ -1018,6 +1087,8 @@ struct ToolRunOutcome {
     model_text: String,
     #[allow(dead_code)] // consumed by the journal event; kept for symmetry with ToolOutput
     ok: bool,
+    /// True when this call mutated files (drives the Ultra Loop verify cycle).
+    mutated: bool,
 }
 
 async fn cancel_changed(rx: &mut watch::Receiver<bool>) {
@@ -1148,7 +1219,7 @@ mod auto_mode_tests {
     }
 
     #[test]
-    fn shift_tab_cycle_covers_all_four_modes() {
+    fn shift_tab_cycle_bypass_auto_ask() {
         assert_eq!(
             Agent::next_permission_mode(PermissionMode::Bypass),
             PermissionMode::Auto
@@ -1157,9 +1228,10 @@ mod auto_mode_tests {
             Agent::next_permission_mode(PermissionMode::Auto),
             PermissionMode::Ask
         );
+        // allowlist is out of the interactive cycle (config-only), back to bypass
         assert_eq!(
             Agent::next_permission_mode(PermissionMode::Ask),
-            PermissionMode::Allowlist
+            PermissionMode::Bypass
         );
         assert_eq!(
             Agent::next_permission_mode(PermissionMode::Allowlist),

@@ -185,6 +185,7 @@ fn kill9_mid_request_leaves_a_consistent_resumable_session() {
             permissions: Default::default(),
             context_window: 128_000,
             extra_tools: Vec::new(),
+            check_command: None,
         },
         registry,
         ToolRegistry::standard(),

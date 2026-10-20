@@ -71,6 +71,14 @@ impl Theme {
     pub fn border(&self) -> Style {
         self.bg(Style::default().fg(self.fg_dim))
     }
+    /// Menu/selected rows (autocomplete, settings): dim background bar.
+    pub fn menu_selected(&self) -> Style {
+        // DarkGray bg is the deliberate highlight; kept in both modes
+        Style::default()
+            .fg(self.fg_accent)
+            .add_modifier(Modifier::BOLD)
+            .bg(Color::DarkGray)
+    }
 
     fn bg(&self, mut s: Style) -> Style {
         if self.transparent {
@@ -108,14 +116,18 @@ pub fn member_fg() -> Style {
 pub fn accent_fg() -> Style {
     Style::default().fg(Color::Cyan).bg(Color::Reset)
 }
-/// Selection highlight: underline + brightened fg — never reverse video, bg stays
-/// Reset so the transparency invariant holds under selected text.
+/// Selection highlight during an active drag: a real dim background so it is
+/// unmistakably visible. Deliberate exception to the idle-rendering bg=Reset
+/// invariant: a selection is transient user intent (and disappears on release).
 pub fn selection_fg() -> Style {
+    Style::default().fg(Color::White).bg(Color::Rgb(58, 58, 92))
+}
+/// Menu/selected rows (autocomplete, settings): dim background bar, fg-only theme.
+pub fn menu_selected() -> Style {
     Style::default()
-        .fg(Color::Reset)
-        .add_modifier(ratatui::style::Modifier::UNDERLINED)
+        .fg(Color::Cyan)
         .add_modifier(ratatui::style::Modifier::BOLD)
-        .bg(Color::Reset)
+        .bg(Color::DarkGray)
 }
 pub fn pending_fg() -> Style {
     Style::default().fg(Color::Cyan).bg(Color::Reset)

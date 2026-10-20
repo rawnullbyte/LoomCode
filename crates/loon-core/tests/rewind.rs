@@ -32,6 +32,7 @@ fn cfg() -> AgentConfig {
         permissions: loon_config::Permissions::default(),
         context_window: 128_000,
         extra_tools: Vec::new(),
+        check_command: None,
     }
 }
 

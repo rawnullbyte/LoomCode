@@ -83,6 +83,7 @@ impl loon_tools::Tool for DelegateTool {
             permissions: self.cfg.permissions.clone(),
             context_window: self.cfg.context_window,
             extra_tools: Vec::new(), // children never inherit MCP tools
+            check_command: None,
         };
         // The child's toolset mirrors the parent's minus delegation (no recursion).
         let tools = loon_tools::ToolRegistry::standard().with_extra(vec![Arc::new(MemoryTool {

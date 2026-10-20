@@ -144,6 +144,7 @@ async fn bench_turn_overhead_mock() {
                 permissions: Default::default(),
                 context_window: 128_000,
                 extra_tools: Vec::new(),
+                check_command: None,
             },
             registry,
             loon_tools::ToolRegistry::standard(),

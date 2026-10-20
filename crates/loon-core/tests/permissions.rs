@@ -34,6 +34,7 @@ fn cfg_with(mode: PermissionMode, mut perms: Permissions, _ws: &std::path::Path)
         permissions: perms,
         context_window: 128_000,
         extra_tools: Vec::new(),
+        check_command: None,
     }
 }
 

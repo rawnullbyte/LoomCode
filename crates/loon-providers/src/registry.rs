@@ -92,6 +92,15 @@ impl ProviderRegistry {
         self.combos.keys().cloned().collect()
     }
 
+    /// All selectable model references: model names and `combo:NAME` entries.
+    pub fn list_refs(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.models.keys().cloned().collect();
+        let mut combos: Vec<String> = self.combos.keys().map(|c| format!("combo:{c}")).collect();
+        out.append(&mut combos);
+        out.sort();
+        out
+    }
+
     pub fn resolve(&self, model_ref: &str) -> Result<ResolvedModel, String> {
         if let Some(name) = model_ref.strip_prefix("combo:") {
             if self.combos.contains_key(name) {

@@ -113,12 +113,15 @@ fn spinner_glyph_animates_across_ticks_and_styled_accent_while_busy() {
         Color::Cyan,
         "busy spinner styled accent (transparent theme)"
     );
-    // idle status is a quiet "ready"
+    // idle status is intentionally blank (the banner carries identity)
     a.status.busy = false;
     a.turn_started = None;
     let t2 = draw(&mut a);
     let idle = row_text(&t2, 0, 80);
-    assert!(idle.contains("ready"), "{idle}");
+    assert!(
+        idle.trim().is_empty(),
+        "idle status must be empty: {idle:?}"
+    );
 }
 
 #[test]

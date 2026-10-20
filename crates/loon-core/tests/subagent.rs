@@ -50,6 +50,7 @@ async fn delegate_runs_a_child_session_and_returns_its_report() {
         permissions: Default::default(),
         context_window: 128_000,
         extra_tools: Vec::new(),
+        check_command: None,
     };
     let tools = loon_core::subagent::default_tools(&paths, &ws, &cfg, registry.clone(), None);
     let mut agent = Agent::new_session(&paths, cfg, registry, tools, ws.clone(), true).unwrap();

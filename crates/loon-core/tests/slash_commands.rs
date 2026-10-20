@@ -36,6 +36,7 @@ fn agent(tmp: &std::path::Path, ws: &std::path::Path) -> Agent {
             permissions: Default::default(),
             context_window: 128_000,
             extra_tools: Vec::new(),
+            check_command: None,
         },
         registry,
         loon_core::standard_tools(&paths, ws),
@@ -226,6 +227,7 @@ async fn agent_side_loop_cancel_via_tool() {
         permissions: Default::default(),
         context_window: 128_000,
         extra_tools: Vec::new(),
+        check_command: None,
     };
     let tools = loon_core::subagent::default_tools(
         &paths,

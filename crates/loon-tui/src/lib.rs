@@ -99,6 +99,8 @@ pub struct App {
     pub pending_approval: Option<(String, String, tokio::sync::oneshot::Sender<bool>)>,
     /// Interactive /config menu: Some(selected row). Modal overlay.
     pub settings: Option<usize>,
+    /// Model picker (bare /model): Some((refs, selected)). Modal overlay.
+    pub model_picker: Option<(Vec<String>, usize)>,
     /// Menu-local mirrors (optimistically updated on toggle; commands re-apply).
     pub settings_autocompact: bool,
     pub settings_effort: String,
@@ -127,6 +129,7 @@ impl App {
             selection: None,
             pending_approval: None,
             settings: None,
+            model_picker: None,
             settings_autocompact: true,
             settings_effort: "medium".into(),
         }
@@ -656,6 +659,7 @@ async fn run_inner(
                 AgentEvent::ModeChanged { mode } => app.status.mode = mode,
                 AgentEvent::ToggleTheme => app.transparent = !app.transparent,
                 AgentEvent::OpenConfigMenu => app.settings = Some(0),
+                AgentEvent::OpenModelPicker { refs } => app.model_picker = Some((refs, 0)),
                 AgentEvent::MemberNote(m) => app.push_block(Block::Member(m)),
                 AgentEvent::ApprovalRequested { tool, args_excerpt } => {
                     // Ask mode without a hook (or before one is installed): surface the
@@ -758,6 +762,37 @@ async fn run_inner(
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiCommand>) {
+    // The model picker is modal: arrows move, Enter switches, Esc closes.
+    if let Some((refs, selected)) = app.model_picker.clone() {
+        match key.code {
+            KeyCode::Up => {
+                app.model_picker = Some((
+                    refs.clone(),
+                    if selected == 0 {
+                        refs.len() - 1
+                    } else {
+                        selected - 1
+                    },
+                ));
+            }
+            KeyCode::Down => {
+                app.model_picker = Some((refs.clone(), (selected + 1) % refs.len()));
+            }
+            KeyCode::Esc | KeyCode::Char('q') => app.model_picker = None,
+            KeyCode::Enter | KeyCode::Char(' ') => {
+                if let Some(r) = refs.get(selected).cloned() {
+                    let _ = cmd_tx
+                        .send(UiCommand::Slash(loon_core::commands::SlashCommand::Model {
+                            reference: Some(r),
+                        }))
+                        .await;
+                }
+                app.model_picker = None;
+            }
+            _ => {}
+        }
+        return;
+    }
     // The settings menu is modal: arrows move, Enter toggles/cycles, Esc/q closes.
     if let Some(selected) = app.settings {
         const ITEMS: usize = 5;

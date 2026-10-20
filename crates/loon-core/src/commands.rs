@@ -54,6 +54,14 @@ pub enum SlashCommand {
     Usage,
     /// /init — generate AGENTS.md for this workspace.
     Init,
+    /// /provider add NAME BASE_URL [api] [key_env] | list
+    Provider {
+        args: Vec<String>,
+    },
+    /// /combo add NAME provider:model [provider:model...] | list
+    Combo {
+        args: Vec<String>,
+    },
     /// /mcp — list connected MCP tools.
     Mcp,
     /// /workflows — list user-defined skills (workflows).
@@ -170,6 +178,12 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         "theme" => SlashCommand::Theme,
         "usage" => SlashCommand::Usage,
         "init" => SlashCommand::Init,
+        "provider" => SlashCommand::Provider {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
+        "combo" => SlashCommand::Combo {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
         "mcp" => SlashCommand::Mcp,
         "workflows" => SlashCommand::Workflows,
         "autocompact" => SlashCommand::AutoCompact {
@@ -227,6 +241,11 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
         ),
         ("model [REF]", "show or switch model/combos:NAME"),
         ("config [set K V]", "show or change + persist configuration"),
+        (
+            "provider add NAME URL [api] [key_env]",
+            "add an OpenAI-compatible provider",
+        ),
+        ("combo add NAME provider:model ...", "define a model combo"),
         ("mcp", "list connected MCP tools"),
         ("workflows", "list user-defined skills (workflows)"),
         (
@@ -370,6 +389,12 @@ impl Agent {
                 }
             }
             SlashCommand::Model { reference } => match reference {
+                None if self.events.is_some() => {
+                    self.emit(crate::AgentEvent::OpenModelPicker {
+                        refs: self.registry.list_refs(),
+                    });
+                    Ok(String::new())
+                }
                 None => Ok(format!(
                     "current model: {} (context window: {} tokens)",
                     self.cfg.model_ref, self.cfg.context_window
@@ -486,6 +511,60 @@ impl Agent {
                     result.assistant_text
                 ))
             }
+            SlashCommand::Provider { args } => match args.first().map(|s| s.as_str()) {
+                Some("list") => {
+                    let mut out = String::new();
+                    for (name, def) in self.providers_snapshot() {
+                        out.push_str(&format!(
+                            "  {name}: {} ({})\n",
+                            def.base_url,
+                            def.api.as_str()
+                        ));
+                    }
+                    Ok(if out.is_empty() {
+                        "no providers configured".into()
+                    } else {
+                        out
+                    })
+                }
+                Some("add") => {
+                    let name = args
+                        .get(1)
+                        .ok_or("usage: /provider add NAME URL [api] [key_env]")?;
+                    let url = args.get(2).ok_or("missing BASE_URL")?;
+                    let api = args.get(3).map(|s| s.as_str()).unwrap_or("chat");
+                    let key_env = args.get(4).cloned();
+                    self.persist_provider(name, url, api, key_env.as_deref())
+                }
+                _ => Err("usage: /provider add NAME URL [api] [key_env] | /provider list".into()),
+            },
+            SlashCommand::Combo { args } => match args.first().map(|s| s.as_str()) {
+                Some("list") => {
+                    let mut out = String::new();
+                    for (name, members) in self.combos_snapshot() {
+                        out.push_str(&format!("  {name}: {members}\n"));
+                    }
+                    Ok(if out.is_empty() {
+                        "no combos configured".into()
+                    } else {
+                        out
+                    })
+                }
+                Some("add") => {
+                    let name = args
+                        .get(1)
+                        .ok_or("usage: /combo add NAME provider:model ...")?;
+                    let members: Vec<&str> = args
+                        .get(2..)
+                        .map(|a| a.iter().map(|s| s.as_str()).collect())
+                        .unwrap_or_default();
+                    if members.is_empty() {
+                        return Err("at least one provider:model member required".into());
+                    }
+                    self.persist_combo(name, &members)
+                }
+                _ => Err("usage: /combo add NAME provider:model ... | /combo list".into()),
+            },
             SlashCommand::Mcp => {
                 let mut out = String::new();
                 for spec in self.tools.specs() {
@@ -618,28 +697,14 @@ impl Agent {
         }
     }
 
-    /// /config — `show` (default) renders the effective configuration; `set <key>
-    /// <value>` changes the live session AND persists to the config file through the
-    /// comment-preserving save path, reported separately so the user knows what stuck.
-    async fn run_config_command(&mut self, args: Vec<String>) -> Result<String, String> {
-        match args.first().map(|s| s.as_str()) {
-            None | Some("show") if self.events.is_some() => {
-                // Interactive host: open the real settings menu (text stays available
-                // via /config show).
-                self.emit(crate::AgentEvent::OpenConfigMenu);
-                Ok(String::new())
-            }
-            None | Some("show") => Ok(self.config_report()),
-            Some("set") => {
-                let key = args
-                    .get(1)
-                    .ok_or("usage: /config set <key> <value> — keys: model, max_steps, context_window, permission_mode, tool_output_bytes")?;
-                let value = args.get(2).ok_or("missing <value>")?;
-                self.config_set(key, value)
-            }
-            Some(other) => Err(format!(
-                "unknown /config subcommand `{other}` — use /config or /config set <key> <value>"
-            )),
+    /// /config — interactive hosts ALWAYS open the settings menu (no key=value
+    /// typing). Headless hosts get the text report.
+    async fn run_config_command(&mut self, _args: Vec<String>) -> Result<String, String> {
+        if self.events.is_some() {
+            self.emit(crate::AgentEvent::OpenConfigMenu);
+            Ok(String::new())
+        } else {
+            Ok(self.config_report())
         }
     }
 
@@ -664,6 +729,7 @@ impl Agent {
         )
     }
 
+    #[allow(dead_code)] // retained: the settings menu will persist through these
     fn config_set(&mut self, key: &str, value: &str) -> Result<String, String> {
         let applied = match key {
             "model" => {
@@ -723,6 +789,7 @@ impl Agent {
     /// Persist one scalar to the user's config.toml, preserving comments and unknown
     /// tables (save goes through toml_edit overlay). Session-effective even if this
     /// fails, and the result says which happened.
+    #[allow(dead_code)] // retained: the settings menu will persist through these
     fn persist_config_value(&self, key: &str, value: &str) -> Result<(), String> {
         let paths = loon_config::LoonPaths {
             config_dir: self.config_dir.clone(),
@@ -796,6 +863,110 @@ impl Agent {
 
     fn paths_data_dir(&self) -> Result<std::path::PathBuf, String> {
         Ok(self.data_dir.clone())
+    }
+
+    fn providers_snapshot(&self) -> Vec<(String, loon_config::Provider)> {
+        // Config-driven listing; the live registry does not expose provider defs.
+        let paths = self.loon_paths();
+        let Ok((cfg, _)) = loon_config::Config::load_or_builtin(&paths) else {
+            return Vec::new();
+        };
+        cfg.providers.into_iter().collect()
+    }
+
+    fn combos_snapshot(&self) -> Vec<(String, String)> {
+        let paths = self.loon_paths();
+        let Ok((cfg, _)) = loon_config::Config::load_or_builtin(&paths) else {
+            return Vec::new();
+        };
+        cfg.combos
+            .into_iter()
+            .map(|(name, combo)| {
+                let members: Vec<String> = combo
+                    .members
+                    .iter()
+                    .map(|m| format!("{}:{}", m.provider, m.model))
+                    .collect();
+                (name, members.join(", "))
+            })
+            .collect()
+    }
+
+    /// Persist a new provider to config.toml. The LIVE registry is immutable, so new
+    /// entries load next session — stated plainly, never implied otherwise.
+    fn persist_provider(
+        &self,
+        name: &str,
+        url: &str,
+        api: &str,
+        key_env: Option<&str>,
+    ) -> Result<String, String> {
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            return Err("provider name must be alphanumeric/-/_".into());
+        }
+        let paths = self.loon_paths();
+        let (mut cfg, _) =
+            loon_config::Config::load_or_builtin(&paths).map_err(|e| e.to_string())?;
+        cfg.providers.insert(
+            name.to_string(),
+            loon_config::Provider {
+                base_url: url.to_string(),
+                api: match api {
+                    "responses" => loon_config::ApiFamily::Responses,
+                    _ => loon_config::ApiFamily::Chat,
+                },
+                api_key_env: key_env.filter(|k| !k.is_empty()).map(str::to_string),
+                ..loon_config::Provider::default()
+            },
+        );
+        cfg.save(&paths).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "provider `{name}` saved to config.toml — restart (or /new after adding models) to use it"
+        ))
+    }
+
+    fn persist_combo(&self, name: &str, members: &[&str]) -> Result<String, String> {
+        let paths = self.loon_paths();
+        let (mut cfg, _) =
+            loon_config::Config::load_or_builtin(&paths).map_err(|e| e.to_string())?;
+        let mut parsed = Vec::new();
+        for m in members {
+            let (provider, model) = m
+                .split_once(':')
+                .ok_or_else(|| format!("member `{m}` must be provider:model"))?;
+            // accept either a models-key name or provider:model-id spelling
+            if cfg.models.contains_key(model) {
+                let def = &cfg.models[model];
+                parsed.push(loon_config::ComboMember {
+                    provider: def.provider.clone(),
+                    model: def.id.clone(),
+                    max_retries: None,
+                });
+            } else {
+                parsed.push(loon_config::ComboMember {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                    max_retries: None,
+                });
+            }
+        }
+        cfg.combos.insert(
+            name.to_string(),
+            loon_config::Combo {
+                mode: loon_config::ComboMode::Fallback,
+                members: parsed,
+                requires: loon_config::ComboRequires::default(),
+                cost_ceiling: None,
+                persistent_rotation: false,
+            },
+        );
+        cfg.save(&paths).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "combo `{name}` saved to config.toml — usable as combo:{name} next session"
+        ))
     }
 
     /// /usage: per-day request and token totals from RequestFinished events, rendered

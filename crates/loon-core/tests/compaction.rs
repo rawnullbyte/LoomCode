@@ -40,6 +40,7 @@ fn agent(tmp: &tempfile::TempDir, scripts: Vec<MockScript>) -> Agent {
             permissions: Default::default(),
             context_window: 128_000,
             extra_tools: Vec::new(),
+            check_command: None,
         },
         registry,
         ToolRegistry::standard(),
