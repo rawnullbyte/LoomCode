@@ -64,6 +64,20 @@ pub enum SlashCommand {
     },
     /// /mcp — list connected MCP tools.
     Mcp,
+    /// /export [path] — write the session as Markdown.
+    Export {
+        path: Option<String>,
+    },
+    /// /clear — wipe the visible transcript (TUI).
+    Clear,
+    /// hidden: settings-menu dispatch for max steps.
+    MaxSteps {
+        value: u32,
+    },
+    /// hidden: settings-menu dispatch for the tool output cap.
+    ToolCap {
+        bytes: usize,
+    },
     /// /workflows — list user-defined skills (workflows).
     Workflows,
     /// /autocompact on|off|toggle — enable/disable context compaction.
@@ -183,6 +197,16 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         },
         "combo" => SlashCommand::Combo {
             args: args.iter().map(|s| s.to_string()).collect(),
+        },
+        "export" => SlashCommand::Export {
+            path: (!args.is_empty()).then(|| args.join(" ")),
+        },
+        "clear" => SlashCommand::Clear,
+        "maxsteps" => SlashCommand::MaxSteps {
+            value: args.first().and_then(|a| a.parse().ok()).unwrap_or(0),
+        },
+        "toolcap" => SlashCommand::ToolCap {
+            bytes: args.first().and_then(|a| a.parse().ok()).unwrap_or(0),
         },
         "mcp" => SlashCommand::Mcp,
         "workflows" => SlashCommand::Workflows,
@@ -565,6 +589,32 @@ impl Agent {
                 }
                 _ => Err("usage: /combo add NAME provider:model ... | /combo list".into()),
             },
+            SlashCommand::Export { path } => {
+                let path = path.unwrap_or_else(|| {
+                    format!("loon-session-{}.md", &self.session_id.to_string()[..8])
+                });
+                let written = self.export_markdown(std::path::Path::new(&path))?;
+                Ok(format!("exported to {written}"))
+            }
+            SlashCommand::Clear => {
+                self.emit(crate::AgentEvent::ClearTranscript);
+                Ok(String::new())
+            }
+            SlashCommand::MaxSteps { value } => {
+                if value == 0 {
+                    return Err("max steps must be > 0".into());
+                }
+                self.cfg.max_steps = value;
+                Ok(format!("max steps set to {value} (session)"))
+            }
+            SlashCommand::ToolCap { bytes } => {
+                if bytes == 0 {
+                    return Err("output cap must be > 0".into());
+                }
+                self.cfg.tool_output_bytes = bytes;
+                self.ctx.output_limit = bytes;
+                Ok(format!("tool output cap set to {bytes} bytes (session)"))
+            }
             SlashCommand::Mcp => {
                 let mut out = String::new();
                 for spec in self.tools.specs() {

@@ -94,6 +94,8 @@ pub struct App {
     pub transcript_rect: Option<(u16, u16, u16, u16)>,
     /// Active text selection (drag); Some while selecting, copied on release.
     pub selection: Option<SelRange>,
+    /// Text queued for clipboard write (Ctrl+Y copies the last answer).
+    pub pending_copy: Option<String>,
     /// Pending ask-mode approval: tool, args excerpt, and the answer channel. Modal —
     /// keys other than y/n/Esc are ignored while set.
     pub pending_approval: Option<(String, String, tokio::sync::oneshot::Sender<bool>)>,
@@ -106,6 +108,8 @@ pub struct App {
     /// Menu-local mirrors (optimistically updated on toggle; commands re-apply).
     pub settings_autocompact: bool,
     pub settings_effort: String,
+    pub settings_max_steps: u32,
+    pub settings_tool_cap: usize,
 }
 
 impl App {
@@ -130,11 +134,14 @@ impl App {
             transcript_rect: None,
             selection: None,
             pending_approval: None,
+            pending_copy: None,
             settings: None,
             model_picker: None,
             effort_picker: None,
             settings_autocompact: true,
             settings_effort: "medium".into(),
+            settings_max_steps: 24,
+            settings_tool_cap: 65_536,
         }
     }
 
@@ -642,6 +649,43 @@ async fn run_inner(
         while let Ok(out) = slash_rx.try_recv() {
             app.push_block(Block::System(out));
         }
+        if let Some(text) = app.pending_copy.take() {
+            use std::io::Write;
+            let b64 = {
+                use std::fmt::Write as _;
+                let mut out = String::new();
+                const T: &[u8; 64] =
+                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                let bytes = text.as_bytes();
+                for chunk in bytes.chunks(3) {
+                    let b = [
+                        chunk[0],
+                        chunk.get(1).copied().unwrap_or(0),
+                        chunk.get(2).copied().unwrap_or(0),
+                    ];
+                    let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+                    let _ = write!(
+                        out,
+                        "{}{}{}{}",
+                        T[(n >> 18) as usize & 63],
+                        T[(n >> 12) as usize & 63],
+                        if chunk.len() > 1 {
+                            T[(n >> 6) as usize & 63]
+                        } else {
+                            b'='
+                        },
+                        if chunk.len() > 2 {
+                            T[n as usize & 63]
+                        } else {
+                            b'='
+                        },
+                    );
+                }
+                out
+            };
+            let _ = write!(std::io::stdout(), "\x1b]52;c;{b64}\x07");
+            let _ = std::io::stdout().flush();
+        }
         while let Ok((req, answer_tx)) = approval_rx.try_recv() {
             app.push_block(Block::System(format!(
                 "approve? (y/n) {} {}",
@@ -664,6 +708,18 @@ async fn run_inner(
                 AgentEvent::OpenConfigMenu => app.settings = Some(0),
                 AgentEvent::OpenModelPicker { refs } => app.model_picker = Some((refs, 0)),
                 AgentEvent::OpenEffortPicker => app.effort_picker = Some(1),
+                AgentEvent::ClearTranscript => {
+                    let banner = if matches!(app.blocks.first(), Some(crate::Block::Rich(_))) {
+                        app.blocks.first().cloned()
+                    } else {
+                        None
+                    };
+                    app.blocks.clear();
+                    if let Some(b) = banner {
+                        app.blocks.push(b);
+                    }
+                    app.scroll_from_bottom = None;
+                }
                 AgentEvent::MemberNote(m) => app.push_block(Block::Member(m)),
                 AgentEvent::ApprovalRequested { tool, args_excerpt } => {
                     // Ask mode without a hook (or before one is installed): surface the
@@ -819,7 +875,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
     }
     // The settings menu is modal: arrows move, Enter toggles/cycles, Esc/q closes.
     if let Some(selected) = app.settings {
-        const ITEMS: usize = 5;
+        const ITEMS: usize = 7;
         match key.code {
             KeyCode::Up => {
                 app.settings = Some(if selected == 0 {
@@ -860,6 +916,33 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
                         .await;
                 }
                 3 => {
+                    let next = match app.settings_max_steps {
+                        12 => 24,
+                        24 => 48,
+                        48 => 96,
+                        _ => 12,
+                    };
+                    app.settings_max_steps = next;
+                    let _ = cmd_tx
+                        .send(UiCommand::Slash(
+                            loon_core::commands::SlashCommand::MaxSteps { value: next },
+                        ))
+                        .await;
+                }
+                4 => {
+                    let next = match app.settings_tool_cap {
+                        4_096 => 65_536,
+                        65_536 => 262_144,
+                        _ => 4_096,
+                    };
+                    app.settings_tool_cap = next;
+                    let _ = cmd_tx
+                        .send(UiCommand::Slash(
+                            loon_core::commands::SlashCommand::ToolCap { bytes: next },
+                        ))
+                        .await;
+                }
+                5 => {
                     let _ = cmd_tx
                         .send(UiCommand::Slash(loon_core::commands::SlashCommand::Theme))
                         .await;

@@ -238,7 +238,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // ── settings menu overlay (bare /config) ────────────────────────────────────
     if let Some(selected) = app.settings {
         let w = 56u16.min(area.width.saturating_sub(4));
-        let h = 12u16.min(area.height.saturating_sub(4));
+        let h = 14u16.min(area.height.saturating_sub(4));
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = area.y + (area.height.saturating_sub(h)) / 2;
         let rect = ratatui::layout::Rect {
@@ -248,7 +248,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             height: h,
         };
         f.render_widget(ratatui::widgets::Clear, rect);
-        let items: [String; 5] = [
+        let items: [String; 7] = [
             format!("permission mode: {}   (enter cycles)", app.status.mode),
             format!(
                 "autocompact: {}   (enter toggles)",
@@ -261,6 +261,17 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             format!(
                 "effort: {}   (enter cycles low/medium/high)",
                 app.settings_effort
+            ),
+            format!("max steps: {}   (enter cycles)", app.settings_max_steps),
+            format!(
+                "tool output cap: {}   (enter cycles)",
+                if app.settings_tool_cap >= 262_144 {
+                    "256k".to_string()
+                } else if app.settings_tool_cap >= 65_536 {
+                    "64k".to_string()
+                } else {
+                    format!("{}b", app.settings_tool_cap)
+                }
             ),
             "theme: enter to cycle transparent/opaque".to_string(),
             "done".to_string(),

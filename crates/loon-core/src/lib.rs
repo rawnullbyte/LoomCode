@@ -64,6 +64,8 @@ pub enum AgentEvent {
     },
     /// bare /effort — the UI opens the effort picker.
     OpenEffortPicker,
+    /// /clear — the UI wipes its visible transcript (journal untouched).
+    ClearTranscript,
     Warning(String),
     TurnFinished {
         status: TurnStatus,
@@ -341,6 +343,32 @@ impl Agent {
             cache_dir: base.join("cache"),
             runtime_dir: base.join("runtime"),
         }
+    }
+
+    /// /export: write the session as Markdown (events → readable transcript).
+    pub fn export_markdown(&self, path: &std::path::Path) -> Result<String, String> {
+        let events = self.journal.events().map_err(|e| e.to_string())?;
+        let mut out = format!("# Loon session {}\n\n", &self.session_id.to_string()[..8]);
+        for e in &events {
+            match &e.kind {
+                loon_events::model::EventKind::UserMessage { text } => {
+                    out.push_str(&format!("## you\n\n{text}\n\n"));
+                }
+                loon_events::model::EventKind::TextDelta { text, .. } => {
+                    out.push_str(text);
+                }
+                loon_events::model::EventKind::ToolExecutionFinished { name, excerpt, .. } => {
+                    out.push_str(&format!(
+                        "\n\n> `{name}`: {}\n\n",
+                        excerpt.lines().next().unwrap_or("")
+                    ));
+                }
+                _ => {}
+            }
+        }
+        std::fs::write(path, out.trim_end().to_string() + "\n")
+            .map_err(|e| format!("export: {e}"))?;
+        Ok(path.display().to_string())
     }
 
     pub fn cancel_handle(&self) -> tokio::sync::watch::Sender<bool> {
