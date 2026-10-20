@@ -82,9 +82,18 @@ tests; also handy for trying Loon without touching your real config).
   Streamable HTTP, plugin protocol, files/batch/embeddings APIs, monitors,
   SSH/container workspaces, supervisor/attach, browser/DB/binary/RE tools.
 - **M6 hardening — partially done.** Crash/kill coverage and adversarial provider cases
-  (partial streams, drops, malformed frames) are tested; measured benchmarks against the
-  spec targets have **not been run** and no numbers are claimed; packaging and the
-  portability matrix are not done.
+  (partial streams, drops, malformed frames) are tested. Measured benchmarks exist as an
+  opt-in harness (`cargo test --release -p loon-cli --test bench -- --ignored --nocapture`),
+  run on the development machine (Linux, release build, tmp-backed tempdir) — **local
+  measurements, not vendor-grade benchmark results**:
+  - `loon --version` startup: mean 5 ms, p50 5 ms, p95 13 ms (n=20)
+  - repo index, 100k files: cold scan 0.30 s (~330k files/s); warm scan 0.36 s — the
+    mtime cache currently reuses metadata but does **not** skip the walk+stat, so warm
+    is not faster; a zero-walk fast path is future work
+  - per-turn overhead with the mock provider (session create + journal + one request):
+    mean 2 ms (n=25) — bounds Loon's own cost; real-model latency is provider-dominated
+    and not claimed
+  Not done: packaging, portability matrix, cross-machine benchmark runs.
 
 Interactive TUI note: rendering, layout, and state transitions are verified on
 `TestBackend`; key-handling paths are unit-tested where practical, but a full interactive
