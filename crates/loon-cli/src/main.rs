@@ -210,20 +210,16 @@ async fn run_headless(cli: Cli) -> i32 {
     let mut agent_cfg = AgentConfig::from(&cfg.session);
     agent_cfg.permissions = cfg.permissions.clone();
     agent_cfg.context_window = effective_context_window(&cfg, &cfg.session.model);
-    let mut agent = match Agent::new_session(
-        &paths,
-        agent_cfg,
-        registry.clone(),
-        loon_core::standard_tools(&paths, &workspace),
-        workspace,
-        true,
-    ) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("loon: session: {e}");
-            return 1;
-        }
-    };
+    let tools =
+        loon_core::subagent::default_tools(&paths, &workspace, &agent_cfg, registry.clone());
+    let mut agent =
+        match Agent::new_session(&paths, agent_cfg, registry.clone(), tools, workspace, true) {
+            Ok(a) => a,
+            Err(e) => {
+                eprintln!("loon: session: {e}");
+                return 1;
+            }
+        };
 
     let mode = output.clone().unwrap_or_else(|| "text".into());
     let jsonl = mode == "jsonl" || mode == "json";

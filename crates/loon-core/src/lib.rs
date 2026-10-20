@@ -13,6 +13,7 @@ pub mod permissions;
 pub mod prompt;
 pub mod replay;
 pub mod rewind;
+pub mod subagent;
 pub mod verify;
 
 use loon_config::LoonPaths;
@@ -244,6 +245,15 @@ impl Agent {
 
     pub fn cancel(&self) {
         let _ = self.cancel_tx.send(true);
+    }
+
+    /// Replace this agent's cancellation signal with an external one (subagents stop
+    /// when their parent stops). Cancelling *this* agent afterwards only flips the
+    /// external channel's local flag consumers already hold — the parent remains the
+    /// source of truth.
+    pub fn adopt_cancel_channel(&mut self, rx: tokio::sync::watch::Receiver<bool>) {
+        self.cancel_rx = rx.clone();
+        self.ctx.cancel = rx;
     }
 
     pub fn is_cancelled(&self) -> bool {

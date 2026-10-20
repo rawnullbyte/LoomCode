@@ -243,8 +243,8 @@ async fn run_inner(
         Agent::new_session(
             paths,
             cfg.clone(),
-            registry,
-            loon_core::standard_tools(paths, &cwd),
+            registry.clone(),
+            loon_core::subagent::default_tools(paths, &cwd, &cfg, registry),
             cwd.clone(),
             false,
         )
