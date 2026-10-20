@@ -8,6 +8,7 @@ pub mod commands;
 pub mod compaction;
 pub mod est;
 pub mod index;
+pub mod mcp;
 pub mod memory;
 pub mod permissions;
 pub mod prompt;
@@ -65,6 +66,17 @@ pub enum TurnStatus {
     },
 }
 
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("model_ref", &self.model_ref)
+            .field("max_steps", &self.max_steps)
+            .field("context_window", &self.context_window)
+            .field("extra_tools", &self.extra_tools.len())
+            .finish()
+    }
+}
+
 /// What one turn produced.
 #[derive(Debug, Clone)]
 pub struct TurnResult {
@@ -74,7 +86,7 @@ pub struct TurnResult {
     pub usage: Usage,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentConfig {
     pub model_ref: String,
     pub max_steps: u32,
@@ -86,6 +98,8 @@ pub struct AgentConfig {
     /// Effective context window in tokens (from the model def / combo minimum). 0
     /// disables compaction. Unknown windows fall back to a conservative 128k default.
     pub context_window: u64,
+    /// Host-provided extra tools (e.g. MCP), merged into the registry at construction.
+    pub extra_tools: Vec<Arc<dyn loon_tools::Tool>>,
 }
 
 impl From<&loon_config::SessionCfg> for AgentConfig {
@@ -98,6 +112,7 @@ impl From<&loon_config::SessionCfg> for AgentConfig {
             allow_retry_after_partial_stream: s.allow_retry_after_partial_stream,
             permissions: loon_config::Permissions::default(),
             context_window: 128_000,
+            extra_tools: Vec::new(),
         }
     }
 }

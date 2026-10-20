@@ -132,6 +132,12 @@ async fn tui_main() -> i32 {
     agent_cfg.permissions = cfg.permissions.clone();
     agent_cfg.context_window = effective_context_window(&cfg, &cfg.session.model);
     let transparent = cfg.appearance.mode == loon_config::AppearanceMode::Transparent;
+    // MCP servers connect before the TUI session (errors are visible; never silent).
+    let (mcp_tools, mcp_errors) = loon_core::mcp::connect_all(&cfg.mcp.servers).await;
+    for e in &mcp_errors {
+        eprintln!("loon: {e}");
+    }
+    agent_cfg.extra_tools = mcp_tools;
     match loon_tui::run(&paths, agent_cfg, registry, transparent, cwd).await {
         Ok(()) => 0,
         Err(e) => {
@@ -210,8 +216,21 @@ async fn run_headless(cli: Cli) -> i32 {
     let mut agent_cfg = AgentConfig::from(&cfg.session);
     agent_cfg.permissions = cfg.permissions.clone();
     agent_cfg.context_window = effective_context_window(&cfg, &cfg.session.model);
+    // MCP servers: connect before the session; failures are visible, never silent.
+    let (mcp_tools, mcp_errors) = loon_core::mcp::connect_all(&cfg.mcp.servers).await;
+    for e in &mcp_errors {
+        eprintln!("loon: {e}");
+    }
+    if !mcp_tools.is_empty() {
+        eprintln!(
+            "loon: {} MCP tool(s) registered from {} server(s)",
+            mcp_tools.len(),
+            cfg.mcp.servers.len()
+        );
+    }
     let tools =
-        loon_core::subagent::default_tools(&paths, &workspace, &agent_cfg, registry.clone());
+        loon_core::subagent::default_tools(&paths, &workspace, &agent_cfg, registry.clone())
+            .with_extra(mcp_tools);
     let mut agent =
         match Agent::new_session(&paths, agent_cfg, registry.clone(), tools, workspace, true) {
             Ok(a) => a,

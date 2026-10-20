@@ -46,6 +46,7 @@ async fn model_can_save_memory_and_next_session_sees_it() {
             allow_retry_after_partial_stream: false,
             permissions: Default::default(),
             context_window: 128_000,
+            extra_tools: Vec::new(),
         },
         registry,
         loon_core::standard_tools(&paths, &ws),
@@ -95,6 +96,7 @@ async fn ask_mode_requires_approval_for_memory_writes() {
                 ..Permissions::default()
             },
             context_window: 128_000,
+            extra_tools: Vec::new(),
         },
         registry,
         loon_core::standard_tools(&paths, &ws),
@@ -130,6 +132,7 @@ async fn ask_mode_requires_approval_for_memory_writes() {
                 ..Permissions::default()
             },
             context_window: 128_000,
+            extra_tools: Vec::new(),
         },
         registry2,
         loon_core::standard_tools(&paths, &ws),

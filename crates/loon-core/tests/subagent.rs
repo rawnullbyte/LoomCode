@@ -49,6 +49,7 @@ async fn delegate_runs_a_child_session_and_returns_its_report() {
         allow_retry_after_partial_stream: false,
         permissions: Default::default(),
         context_window: 128_000,
+        extra_tools: Vec::new(),
     };
     let tools = loon_core::subagent::default_tools(&paths, &ws, &cfg, registry.clone());
     let mut agent = Agent::new_session(&paths, cfg, registry, tools, ws.clone(), true).unwrap();

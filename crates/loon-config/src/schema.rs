@@ -197,6 +197,29 @@ impl Default for Permissions {
     }
 }
 
+/// One MCP stdio server entry: command to spawn, args, env, timeout.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: std::collections::BTreeMap<String, String>,
+    #[serde(default = "default_mcp_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_mcp_timeout() -> u64 {
+    60
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Mcp {
+    /// Named stdio MCP servers; tools surface as `mcp_<server>_<tool>`.
+    #[serde(default)]
+    pub servers: BTreeMap<String, McpServerConfig>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Appearance {
     /// `transparent` never paints a background; `opaque` is explicit opt-in only.

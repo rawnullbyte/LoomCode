@@ -11,8 +11,8 @@ pub mod validate;
 pub use paths::LoonPaths;
 pub use schema::{
     ApiFamily, Appearance, AppearanceMode, CapState, CapabilityOverrides, Combo, ComboMember,
-    ComboMode, ComboRequires, ModelDef, PermissionMode, PermissionRule, Permissions, Provider,
-    SessionCfg,
+    ComboMode, ComboRequires, Mcp, McpServerConfig, ModelDef, PermissionMode, PermissionRule,
+    Permissions, Provider, SessionCfg,
 };
 pub use validate::{ConfigError, Finding, Validator};
 
@@ -37,6 +37,8 @@ pub struct Config {
     pub models: std::collections::BTreeMap<String, ModelDef>,
     #[serde(default)]
     pub combos: std::collections::BTreeMap<String, Combo>,
+    #[serde(default)]
+    pub mcp: Mcp,
 }
 
 impl Config {
@@ -75,6 +77,7 @@ impl Config {
             providers,
             models,
             combos: Default::default(),
+            mcp: Mcp::default(),
         }
     }
 

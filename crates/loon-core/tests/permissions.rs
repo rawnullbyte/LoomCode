@@ -33,6 +33,7 @@ fn cfg_with(mode: PermissionMode, mut perms: Permissions, _ws: &std::path::Path)
         allow_retry_after_partial_stream: false,
         permissions: perms,
         context_window: 128_000,
+        extra_tools: Vec::new(),
     }
 }
 

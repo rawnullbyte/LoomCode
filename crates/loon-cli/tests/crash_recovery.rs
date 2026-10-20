@@ -184,6 +184,7 @@ fn kill9_mid_request_leaves_a_consistent_resumable_session() {
             allow_retry_after_partial_stream: false,
             permissions: Default::default(),
             context_window: 128_000,
+            extra_tools: Vec::new(),
         },
         registry,
         ToolRegistry::standard(),

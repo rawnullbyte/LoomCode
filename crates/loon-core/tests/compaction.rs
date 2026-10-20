@@ -39,6 +39,7 @@ fn agent(tmp: &tempfile::TempDir, scripts: Vec<MockScript>) -> Agent {
             allow_retry_after_partial_stream: false,
             permissions: Default::default(),
             context_window: 128_000,
+            extra_tools: Vec::new(),
         },
         registry,
         ToolRegistry::standard(),
