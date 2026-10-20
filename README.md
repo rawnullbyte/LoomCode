@@ -60,7 +60,7 @@ tests; also handy for trying Loon without touching your real config).
   tool loop — deny rules bind every mode, allowlist is exact + component-prefix, ask
   gates via an approval hook and refuses headless, redacted audit JSONL
   (`crates/loon-core/tests/permissions.rs`, 5 tests); real `kill -9` crash-recovery test
-  (`crates/loon-cli/tests/crash_recovery.rs`). Not done: git2 shadow repository.
+  (`crates/loon-cli/tests/crash_recovery.rs`). Per-file shadow history IS implemented from the CAS journal (`/shadow <path>` lists every mutation with hashes, restorable via /undo//rewind); a git2-based shadow *repository* is not built.
 - **M3 context — core implemented.** Hierarchical compaction with replay-identical
   summaries (`tests/compaction.rs` — replay reproduces live history exactly); persistent
   memory (global + workspace scopes, `memory` tool, prompt loading, `tests/memory.rs`);

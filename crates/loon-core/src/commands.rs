@@ -64,6 +64,10 @@ pub enum SlashCommand {
     },
     /// /mcp — list connected MCP tools.
     Mcp,
+    /// /shadow <path> — the mutation history of one file, restorable via /undo.
+    Shadow {
+        path: String,
+    },
     /// /sessions search <query> — find text across all sessions.
     SessionsSearch {
         query: String,
@@ -225,6 +229,9 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         "sessions" => SlashCommand::SessionsSearch {
             query: args.join(" "),
         },
+        "shadow" => SlashCommand::Shadow {
+            path: args.join(" "),
+        },
         "mcp" => SlashCommand::Mcp,
         "workflows" => SlashCommand::Workflows,
         "autocompact" => SlashCommand::AutoCompact {
@@ -290,6 +297,7 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
         ("find <query>", "search this session's transcript"),
         ("doctor", "offline health checks"),
         ("sessions search <query>", "find text across all sessions"),
+        ("shadow <path>", "mutation history of one file (restorable)"),
         ("mcp", "list connected MCP tools"),
         ("workflows", "list user-defined skills (workflows)"),
         (
@@ -746,6 +754,45 @@ impl Agent {
                         hits.join("\n")
                     ))
                 }
+            }
+            SlashCommand::Shadow { path } => {
+                if path.trim().is_empty() {
+                    return Err("usage: /shadow <path>".into());
+                }
+                let events = self.events()?;
+                let mut out = format!("mutation history for {path}:\n");
+                let mut found = 0usize;
+                for e in &events {
+                    if let loon_events::model::EventKind::FileMutated {
+                        path: p,
+                        tool,
+                        before_sha256,
+                        after_sha256,
+                        ..
+                    } = &e.kind
+                    {
+                        if !p.ends_with(path.trim()) {
+                            continue;
+                        }
+                        found += 1;
+                        let action = if before_sha256.is_empty() {
+                            "created"
+                        } else {
+                            "modified"
+                        };
+                        out.push_str(&format!(
+                            "  seq {} {action} by {tool} (before {}, after {})\n",
+                            e.seq,
+                            &before_sha256[..8.min(before_sha256.len())],
+                            &after_sha256[..8.min(after_sha256.len())]
+                        ));
+                    }
+                }
+                if found == 0 {
+                    return Ok(format!("no mutations recorded for `{path}`"));
+                }
+                out.push_str("restore with /undo (newest first) or /rewind — every state above is CAS-snapshotted");
+                Ok(out)
             }
             SlashCommand::Mcp => {
                 let mut out = String::new();
