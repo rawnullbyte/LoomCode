@@ -95,8 +95,15 @@ tests; also handy for trying Loon without touching your real config).
     and not claimed
   Not done: packaging, portability matrix, cross-machine benchmark runs.
 
-Interactive TUI note: rendering, layout, and state transitions are verified on
-`TestBackend`; key-handling paths are unit-tested where practical, but a full interactive
+### Interactive TUI
+
+Transparent-mode ratatui with: slash-command autocomplete (windowed popup, Tab/Up/Down/
+Esc, driven by the canonical command table), an animated status line (palindrome spinner
+glyphs `·✢✳✶✻✽`, cycling verbs, elapsed seconds), animated pending-tool markers (never a
+check mark before a result exists — pinned by test), and a streaming block caret. All
+animation is foreground-only; the transparent invariant (every app-owned cell keeps the
+terminal background, no reverse video) is verified by buffer-walk tests on `TestBackend`
+(`crates/loon-tui/tests/transparency.rs`, `tests/ui_popup.rs`). A full interactive
 keymap session was **not** exercised in this environment and is not claimed.
 
 ## Compatibility matrix
@@ -130,7 +137,7 @@ crates/
 
 ```sh
 cargo build                 # zero warnings
-cargo test                  # 121 tests, all suites green
+cargo test                  # 132 tests, all suites green
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 LOON_HOME=$(mktemp -d) target/debug/loon run "smoke" --output jsonl
