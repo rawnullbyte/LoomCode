@@ -64,6 +64,10 @@ pub enum SlashCommand {
     },
     /// /mcp — list connected MCP tools.
     Mcp,
+    /// /sessions search <query> — find text across all sessions.
+    SessionsSearch {
+        query: String,
+    },
     /// /find <query> — search this session's transcript.
     Find {
         query: String,
@@ -218,6 +222,9 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
             query: args.join(" "),
         },
         "doctor" => SlashCommand::Doctor,
+        "sessions" => SlashCommand::SessionsSearch {
+            query: args.join(" "),
+        },
         "mcp" => SlashCommand::Mcp,
         "workflows" => SlashCommand::Workflows,
         "autocompact" => SlashCommand::AutoCompact {
@@ -282,6 +289,7 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
         ("combo add NAME provider:model ...", "define a model combo"),
         ("find <query>", "search this session's transcript"),
         ("doctor", "offline health checks"),
+        ("sessions search <query>", "find text across all sessions"),
         ("mcp", "list connected MCP tools"),
         ("workflows", "list user-defined skills (workflows)"),
         (
@@ -699,6 +707,45 @@ impl Agent {
                     "  (offline checks only — network probes are `loon doctor --connect`)",
                 );
                 Ok(out)
+            }
+            SlashCommand::SessionsSearch { query } => {
+                if query.trim().is_empty() {
+                    return Err("usage: /sessions search <query>".into());
+                }
+                let store = crate::open_store(&self.loon_paths()).map_err(|e| e.to_string())?;
+                let sessions = store.list_sessions().map_err(|e| e.to_string())?;
+                let needle = query.to_lowercase();
+                let mut hits = Vec::new();
+                for meta in &sessions {
+                    let Ok(events) = store.events(meta.id) else {
+                        continue;
+                    };
+                    for e in &events {
+                        if let loon_events::model::EventKind::UserMessage { text } = &e.kind {
+                            if text.to_lowercase().contains(&needle) {
+                                hits.push(format!(
+                                    "  {} · {} · {}",
+                                    &meta.id.to_string()[..8],
+                                    meta.title,
+                                    truncate_prompt(text.trim(), 60)
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    if hits.len() >= 20 {
+                        break;
+                    }
+                }
+                if hits.is_empty() {
+                    Ok(format!("no sessions match `{query}`"))
+                } else {
+                    Ok(format!(
+                        "{} session(s) matching `{query}` (newest first, /resume <n> to open):\n{}",
+                        hits.len(),
+                        hits.join("\n")
+                    ))
+                }
             }
             SlashCommand::Mcp => {
                 let mut out = String::new();
