@@ -222,25 +222,40 @@ impl App {
                 Block::User(t) => push("you › ", t, theme::user_fg()),
                 Block::Assistant(t) => push("loon › ", t, theme::assistant_fg()),
                 Block::Tool {
-                    name, ok, excerpt, ..
+                    name,
+                    ok,
+                    excerpt,
+                    pending,
                 } => {
-                    let mark = if *ok { "✓" } else { "✗" };
-                    push(
-                        &format!("  {mark} {name}: "),
-                        excerpt,
-                        if *ok {
-                            theme::tool_ok_fg()
-                        } else {
-                            theme::tool_err_fg()
-                        },
-                    );
+                    // Pending tools get the animated glyph in accent — never a check
+                    // mark, which would claim a result that does not exist yet.
+                    let (mark, style) = if *pending {
+                        (self.spinner_glyph(), theme::pending_fg())
+                    } else if *ok {
+                        ('✓', theme::tool_ok_fg())
+                    } else {
+                        ('✗', theme::tool_err_fg())
+                    };
+                    push(&format!("  {mark} {name}: "), excerpt, style);
                 }
                 Block::System(t) => push("· ", t, theme::system_fg()),
                 Block::Member(t) => push("↻ ", t, theme::member_fg()),
             }
         }
         if let Some(s) = &self.streaming {
-            push("loon › ", s, theme::assistant_fg());
+            let wrapped = wrap_text(s, w.saturating_sub(7).max(4));
+            for (i, seg) in wrapped.iter().enumerate() {
+                let lead = if i == 0 { "loon › " } else { "       " };
+                lines.push(ratatui::text::Line::styled(
+                    format!("{lead}{seg}"),
+                    theme::assistant_fg(),
+                ));
+            }
+            // block caret at the end of the streaming text, accent-colored
+            if let Some(last) = lines.last_mut() {
+                last.spans
+                    .push(ratatui::text::Span::styled("▊", theme::accent_fg()));
+            }
         }
         lines
     }
@@ -607,6 +622,33 @@ mod tests {
             .join("\n");
         assert!(joined.contains("Hello world"));
         assert!(!joined.contains("you ›"), "no user block yet");
+    }
+
+    #[test]
+    fn pending_tool_never_shows_a_checkmark_and_stream_caret_renders() {
+        let mut app = app_for_test();
+        app.tool_started("bash", "{\"command\": \"cargo test\"}");
+        let lines = app.transcript_lines(80);
+        let joined: String = lines
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !joined.contains("✓ bash"),
+            "pending must not claim success: {joined}"
+        );
+        assert!(
+            joined.contains(&format!("{}", app.spinner_glyph())),
+            "{joined}"
+        );
+        // streaming: caret span appended with accent fg
+        app.stream_text("working on it");
+        let lines = app.transcript_lines(80);
+        let last = lines.last().unwrap();
+        let caret = last.spans.last().unwrap();
+        assert_eq!(caret.content, "▊");
+        assert_eq!(caret.style.fg, Some(ratatui::style::Color::Cyan));
     }
 
     pub fn app_for_test() -> App {

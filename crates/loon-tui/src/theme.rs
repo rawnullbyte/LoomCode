@@ -105,3 +105,9 @@ pub fn system_fg() -> Style {
 pub fn member_fg() -> Style {
     Style::default().fg(Color::Yellow).bg(Color::Reset)
 }
+pub fn accent_fg() -> Style {
+    Style::default().fg(Color::Cyan).bg(Color::Reset)
+}
+pub fn pending_fg() -> Style {
+    Style::default().fg(Color::Cyan).bg(Color::Reset)
+}
