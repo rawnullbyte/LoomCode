@@ -34,11 +34,12 @@ impl LoonPaths {
             .map(PathBuf::from)
             .unwrap_or_else(|_| state.join("runtime"));
         LoonPaths {
-            config_dir: config.join("loon"),
-            data_dir: data.join("loon"),
-            state_dir: state.join("loon"),
-            cache_dir: cache.join("loon"),
-            runtime_dir: runtime.join("loon"),
+            // Loom (repo LoomCode) — the user-facing name and directory.
+            config_dir: xdg_or_legacy(&config, "loom", "loon"),
+            data_dir: xdg_or_legacy(&data, "loom", "loon"),
+            state_dir: xdg_or_legacy(&state, "loom", "loon"),
+            cache_dir: xdg_or_legacy(&cache, "loom", "loon"),
+            runtime_dir: xdg_or_legacy(&runtime, "loom", "loon"),
         }
     }
 
@@ -73,6 +74,18 @@ impl LoonPaths {
                 std::fs::set_permissions(&self.runtime_dir, std::fs::Permissions::from_mode(0o700));
         }
         Ok(())
+    }
+}
+
+/// Prefer the new `loom` directory; if only the legacy `loon` tree exists (with a
+/// config file in it), keep using it so nobody loses state on upgrade.
+fn xdg_or_legacy(base: &Path, new: &str, legacy: &str) -> PathBuf {
+    let new_path = base.join(new);
+    let legacy_path = base.join(legacy);
+    if !new_path.exists() && legacy_path.join("config.toml").exists() {
+        legacy_path
+    } else {
+        new_path
     }
 }
 

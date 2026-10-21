@@ -151,7 +151,7 @@ impl App {
         self.blocks.insert(0, Block::Rich(self.banner_lines()));
     }
 
-    /// Banner content: animated spark + version, model, workspace — nothing else.
+    /// Banner content: animated spark cluster + version, model, workspace.
     fn banner_lines(&self) -> Vec<ratatui::text::Line<'static>> {
         vec![
             ratatui::text::Line::from(vec![
@@ -160,7 +160,7 @@ impl App {
                     theme::accent_fg(),
                 ),
                 ratatui::text::Span::styled(
-                    format!("Loon v{}", env!("CARGO_PKG_VERSION")),
+                    format!("Loom v{}", env!("CARGO_PKG_VERSION")),
                     theme::user_fg(),
                 ),
             ]),
@@ -176,18 +176,38 @@ impl App {
         ]
     }
 
-    /// Intro burst animation: grows, shimmers, settles on the logo glyph (forward,
-    /// reverse, hold).
-    fn intro_frame(&self) -> &'static str {
-        const FRAMES: [&str; 7] = ["·", "✦", "✦˖", "✧˖·", "✻ ✧", "✶ ✦˖", "✦"];
-        let n = FRAMES.len() as u64;
-        if self.tick < n {
-            FRAMES[self.tick as usize]
-        } else if self.tick < 2 * n {
-            FRAMES[((2 * n - 1 - self.tick) as usize).min(n as usize - 1)]
-        } else {
-            FRAMES[n as usize - 1]
+    /// Intro burst: a traveling multi-character spark pattern that blooms outward,
+    /// shimmers, and settles on the logo glyph. Several glyphs move at different
+    /// speeds (i, i*2 offsets) so it reads as an algorithm, not one flipping char.
+    fn intro_frame(&self) -> String {
+        const CELLS: [&str; 7] = ["·", "˖", "✧", "✦", "✻", "✶", "✽"];
+        const WIDTH: usize = 7;
+        let t = self.tick;
+        if t > 24 {
+            return "✦".to_string(); // settled logo glyph
         }
+        let mut cells = [" "; WIDTH].to_vec();
+        // three traveling sparks at different speeds and phases
+        for (speed, glyph) in [(1usize, "✦"), (2, "✧"), (3, "˖")] {
+            let pos = (t as usize * speed) % (WIDTH * 2);
+            let pos = if pos >= WIDTH {
+                WIDTH * 2 - 1 - pos
+            } else {
+                pos
+            };
+            if cells[pos] == " " {
+                cells[pos] = glyph;
+            }
+        }
+        // center bloom grows with time
+        let bloom = (t as usize).min(4);
+        for k in 0..bloom {
+            let p = 3usize.saturating_sub(k);
+            if cells[p] == " " {
+                cells[p] = CELLS[(t as usize + k) % CELLS.len()];
+            }
+        }
+        cells.concat()
     }
 
     /// While the intro plays, rebuild the banner from the current animation frame.
@@ -291,6 +311,23 @@ impl App {
             excerpt: format!("… {}", args_excerpt.lines().next().unwrap_or("")),
             pending: true,
         });
+    }
+
+    /// Turn over: no tool call may keep claiming it is still running. Blocks whose
+    /// result never arrived (cancelled turn, dropped stream) flip to ✗ cancelled.
+    pub fn finish_all_pending(&mut self) {
+        for b in &mut self.blocks {
+            if let Block::Tool { name, pending, .. } = b {
+                if *pending {
+                    *b = Block::Tool {
+                        name: name.clone(),
+                        ok: false,
+                        excerpt: "cancelled — no result arrived".into(),
+                        pending: false,
+                    };
+                }
+            }
+        }
     }
 
     pub fn tool_finished(&mut self, name: &str, ok: bool, excerpt: &str) {
@@ -650,6 +687,32 @@ async fn run_inner(
             app.push_block(Block::System(out));
         }
         if let Some(text) = app.pending_copy.take() {
+            // System clipboard first (terminals frequently reject OSC 52); OSC 52 is
+            // the fallback for ssh/headless setups.
+            let via_cmd = |cmd: &str, args: &[&str]| -> bool {
+                use std::io::Write as _;
+                match std::process::Command::new(cmd)
+                    .args(args)
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                {
+                    Ok(mut child) => {
+                        if let Some(stdin) = child.stdin.as_mut() {
+                            let _ = stdin.write_all(text.as_bytes());
+                        }
+                        matches!(child.wait(), Ok(st) if st.success())
+                    }
+                    Err(_) => false,
+                }
+            };
+            let delivered = via_cmd("wl-copy", &[])
+                || via_cmd("xclip", &["-selection", "clipboard"])
+                || via_cmd("pbcopy", &[]);
+            if delivered {
+                continue;
+            }
             use std::io::Write;
             let b64 = {
                 use std::fmt::Write as _;
@@ -746,6 +809,7 @@ async fn run_inner(
                     }
                     app.status.busy = false;
                     app.turn_started = None;
+                    app.finish_all_pending();
                 }
             }
         }
@@ -875,7 +939,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
     }
     // The settings menu is modal: arrows move, Enter toggles/cycles, Esc/q closes.
     if let Some(selected) = app.settings {
-        const ITEMS: usize = 7;
+        const ITEMS: usize = 8;
         match key.code {
             KeyCode::Up => {
                 app.settings = Some(if selected == 0 {
@@ -945,6 +1009,24 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
                 5 => {
                     let _ = cmd_tx
                         .send(UiCommand::Slash(loon_core::commands::SlashCommand::Theme))
+                        .await;
+                }
+                6 => {
+                    // model picker
+                    let _ = cmd_tx
+                        .send(UiCommand::Slash(loon_core::commands::SlashCommand::Model {
+                            reference: None,
+                        }))
+                        .await;
+                    app.settings = None;
+                }
+                7 => {
+                    let _ = cmd_tx
+                        .send(UiCommand::Slash(
+                            loon_core::commands::SlashCommand::Provider {
+                                args: vec!["list".into()],
+                            },
+                        ))
                         .await;
                 }
                 _ => app.settings = None,
@@ -1154,7 +1236,20 @@ fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) -> Option<String
         }
         MouseEventKind::Up(MouseButton::Left) => {
             let sel = app.selection?;
-            let text = selected_text(app, sel);
+            let mut text = selected_text(app, sel);
+            // strip transcript furniture from every copied line: prefixes and the
+            // per-line prompt markers are display, not content
+            let mut cleaned = Vec::new();
+            for line in text.split('\n') {
+                let l = line
+                    .trim_start()
+                    .trim_start_matches("you › ")
+                    .trim_start_matches("loon › ")
+                    .trim_start_matches("· ")
+                    .trim_start_matches("↻ ");
+                cleaned.push(l.to_string());
+            }
+            text = cleaned.join("\n");
             if text.trim().is_empty() {
                 app.selection = None;
                 return None;

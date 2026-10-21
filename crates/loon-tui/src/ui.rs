@@ -238,7 +238,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     // ── settings menu overlay (bare /config) ────────────────────────────────────
     if let Some(selected) = app.settings {
         let w = 56u16.min(area.width.saturating_sub(4));
-        let h = 14u16.min(area.height.saturating_sub(4));
+        let h = 15u16.min(area.height.saturating_sub(4));
         let x = area.x + (area.width.saturating_sub(w)) / 2;
         let y = area.y + (area.height.saturating_sub(h)) / 2;
         let rect = ratatui::layout::Rect {
@@ -248,7 +248,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             height: h,
         };
         f.render_widget(ratatui::widgets::Clear, rect);
-        let items: [String; 7] = [
+        let items: [String; 8] = [
             format!("permission mode: {}   (enter cycles)", app.status.mode),
             format!(
                 "autocompact: {}   (enter toggles)",
@@ -274,17 +274,19 @@ pub fn draw(f: &mut Frame, app: &mut App) {
                 }
             ),
             "theme: enter to cycle transparent/opaque".to_string(),
-            "done".to_string(),
+            "model…".to_string(),
+            "providers list".to_string(),
         ];
-        let mut rows: Vec<Line> = vec![Line::styled(
-            " settings — arrows move · enter toggles · esc closes ".to_string(),
-            theme.accent_bold(),
-        )];
+        let mut rows: Vec<Line> = vec![Line::styled(" Settings ".to_string(), theme.accent_bold())];
         for (i, item) in items.iter().enumerate() {
             if i == selected {
+                let pad = w
+                    .saturating_sub(4)
+                    .saturating_sub(item.chars().count() as u16);
                 rows.push(Line::from(vec![
                     Span::styled(" › ", theme.menu_selected()),
                     Span::styled(item.clone(), theme.menu_selected()),
+                    Span::styled(" ".repeat(pad as usize), theme.menu_selected()),
                 ]));
             } else {
                 rows.push(Line::from(vec![
