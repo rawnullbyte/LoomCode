@@ -276,6 +276,106 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
     Some(Ok(cmd))
 }
 
+/// One configurable setting: the single source of truth that drives `/config`
+/// suggestions (keys, then values), validation and persistence.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SettingDef {
+    pub key: &'static str,
+    pub description: &'static str,
+    pub kind: SettingKind,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SettingKind {
+    Bool,
+    Int { min: u64, max: u64 },
+    Enum(&'static [&'static str]),
+    Text,
+}
+
+impl SettingKind {
+    /// Value suggestions for the completion popup.
+    pub fn suggestions(&self) -> Vec<String> {
+        match self {
+            SettingKind::Bool => vec!["true".into(), "false".into()],
+            SettingKind::Enum(vals) => vals.iter().map(|s| s.to_string()).collect(),
+            SettingKind::Int { .. } | SettingKind::Text => Vec::new(),
+        }
+    }
+}
+
+/// Every setting `/config` understands — typing `/config ` suggests these keys,
+/// typing `/config <key> ` suggests its values.
+pub fn settings_registry() -> Vec<SettingDef> {
+    use SettingKind::*;
+    vec![
+        SettingDef {
+            key: "tips",
+            description: "show the input placeholder tip",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "theme",
+            description: "transparent | opaque",
+            kind: Enum(&["transparent", "opaque"]),
+        },
+        SettingDef {
+            key: "permission_mode",
+            description: "bypass | auto | ask | allowlist",
+            kind: Enum(&["bypass", "auto", "ask", "allowlist"]),
+        },
+        SettingDef {
+            key: "effort",
+            description: "low | medium | high output budget",
+            kind: Enum(&["low", "medium", "high"]),
+        },
+        SettingDef {
+            key: "model",
+            description: "model key or combo:NAME",
+            kind: Text,
+        },
+        SettingDef {
+            key: "context_window",
+            description: "tokens; 0 disables compaction",
+            kind: Int {
+                min: 0,
+                max: 10_000_000,
+            },
+        },
+        SettingDef {
+            key: "max_steps",
+            description: "tool/request steps per turn",
+            kind: Int {
+                min: 1,
+                max: 10_000,
+            },
+        },
+        SettingDef {
+            key: "tool_output_bytes",
+            description: "tool output cap in bytes",
+            kind: Int {
+                min: 1_024,
+                max: 100_000_000,
+            },
+        },
+        SettingDef {
+            key: "check_command",
+            description: "Ultra Loop verify command (e.g. cargo test)",
+            kind: Text,
+        },
+        SettingDef {
+            key: "autocompact",
+            description: "on | off — alias for context_window 128k/0",
+            kind: Enum(&["on", "off"]),
+        },
+    ]
+}
+
+/// Look up one setting by key.
+pub fn setting_def(key: &str) -> Option<SettingDef> {
+    settings_registry().into_iter().find(|d| d.key == key)
+}
+
 /// The canonical command table: (name, one-line description). Single source of truth
 /// for `/help` and the TUI autocomplete — a command listed here must parse.
 pub fn command_list() -> Vec<(&'static str, &'static str)> {
@@ -989,15 +1089,219 @@ impl Agent {
         }
     }
 
-    /// /config — interactive hosts ALWAYS open the settings menu (no key=value
-    /// typing). Headless hosts get the text report.
-    async fn run_config_command(&mut self, _args: Vec<String>) -> Result<String, String> {
-        if self.events.is_some() {
-            self.emit(crate::AgentEvent::OpenConfigMenu);
-            Ok(String::new())
-        } else {
-            Ok(self.config_report())
+    /// /config — bare opens the settings menu; `/config <key>` shows one setting;
+    /// `/config <key> <value>` validates against the registry, applies it live and
+    /// persists it. Unknown keys are refused with the list of valid ones.
+    async fn run_config_command(&mut self, args: Vec<String>) -> Result<String, String> {
+        match (args.first().map(|s| s.as_str()), args.get(1)) {
+            (None, _) => {
+                if self.events.is_some() {
+                    self.emit(crate::AgentEvent::OpenConfigMenu);
+                    Ok(String::new())
+                } else {
+                    Ok(self.config_report())
+                }
+            }
+            (Some(key), None) => {
+                let def = setting_def(key).ok_or_else(|| {
+                    format!(
+                        "unknown setting `{key}` — try: {}",
+                        settings_registry()
+                            .iter()
+                            .map(|d| d.key)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                })?;
+                Ok(format!(
+                    "{key} = {}  ({})  [{}]",
+                    self.setting_value(key),
+                    def.description,
+                    match def.kind {
+                        SettingKind::Bool => "true|false",
+                        SettingKind::Enum(_) => "one of the listed values",
+                        SettingKind::Int { .. } => "integer",
+                        SettingKind::Text => "text",
+                    }
+                ))
+            }
+            (Some(key), Some(value)) => self.config_apply(key, value),
         }
+    }
+
+    /// Current value of one setting, as text.
+    pub fn setting_value(&self, key: &str) -> String {
+        match key {
+            "tips" => self.tips.to_string(),
+            "theme" => if self.transparent_request {
+                "transparent"
+            } else {
+                "opaque"
+            }
+            .to_string(),
+            "permission_mode" => format!("{:?}", self.cfg.permissions.mode).to_lowercase(),
+            "effort" => self.effort.clone().unwrap_or_else(|| "medium".into()),
+            "model" => self.cfg.model_ref.clone(),
+            "context_window" => self.cfg.context_window.to_string(),
+            "max_steps" => self.cfg.max_steps.to_string(),
+            "tool_output_bytes" => self.cfg.tool_output_bytes.to_string(),
+            "check_command" => self.cfg.check_command.clone().unwrap_or_default(),
+            "autocompact" => if self.cfg.context_window == 0 {
+                "off"
+            } else {
+                "on"
+            }
+            .to_string(),
+            _ => String::new(),
+        }
+    }
+
+    /// Validate against the registry, apply to the live session, persist.
+    pub fn config_apply(&mut self, key: &str, value: &str) -> Result<String, String> {
+        let def = setting_def(key)
+            .ok_or_else(|| format!("unknown setting `{key}` — /config lists valid keys"))?;
+        let value = value.trim();
+        match &def.kind {
+            SettingKind::Bool => {
+                if !["true", "false"].contains(&value) {
+                    return Err(format!("{key} expects true|false, got `{value}`"));
+                }
+            }
+            SettingKind::Enum(vals) => {
+                if !vals.contains(&value) {
+                    return Err(format!("{key} expects one of: {}", vals.join(" | ")));
+                }
+            }
+            SettingKind::Int { min, max } => {
+                let n: u64 = value
+                    .parse()
+                    .map_err(|_| format!("{key} expects an integer"))?;
+                if n < *min || n > *max {
+                    return Err(format!("{key} must be between {min} and {max}"));
+                }
+            }
+            SettingKind::Text => {}
+        }
+        let applied = match key {
+            "tips" => {
+                self.tips = value == "true";
+                format!("tips = {}", self.tips)
+            }
+            "theme" => {
+                self.transparent_request = value == "transparent";
+                self.emit(crate::AgentEvent::SetTransparent {
+                    transparent: self.transparent_request,
+                });
+                format!("theme = {value}")
+            }
+            "permission_mode" => {
+                self.cfg.permissions.mode = match value {
+                    "bypass" => loon_config::PermissionMode::Bypass,
+                    "auto" => loon_config::PermissionMode::Auto,
+                    "ask" => loon_config::PermissionMode::Ask,
+                    _ => loon_config::PermissionMode::Allowlist,
+                };
+                format!("permission_mode = {value}")
+            }
+            "effort" => {
+                self.effort = Some(value.to_string());
+                format!("effort = {value}")
+            }
+            "model" => {
+                self.registry.resolve(value)?;
+                self.cfg.model_ref = value.to_string();
+                format!("model = {value}")
+            }
+            "context_window" => {
+                self.cfg.context_window = value.parse().unwrap_or(0);
+                format!("context_window = {}", self.cfg.context_window)
+            }
+            "max_steps" => {
+                self.cfg.max_steps = value.parse().unwrap_or(24);
+                format!("max_steps = {}", self.cfg.max_steps)
+            }
+            "tool_output_bytes" => {
+                let n: usize = value.parse().unwrap_or(65_536);
+                self.cfg.tool_output_bytes = n;
+                self.ctx.output_limit = n;
+                format!("tool_output_bytes = {n}")
+            }
+            "check_command" => {
+                self.cfg.check_command = if value.is_empty() || value == "none" {
+                    None
+                } else {
+                    Some(value.to_string())
+                };
+                format!(
+                    "check_command = {}",
+                    self.cfg
+                        .check_command
+                        .clone()
+                        .unwrap_or_else(|| "(none)".into())
+                )
+            }
+            "autocompact" => {
+                let enable = value == "on";
+                self.cfg.context_window = if enable { 128_000 } else { 0 };
+                format!("autocompact = {value}")
+            }
+            other => return Err(format!("unknown setting `{other}`")),
+        };
+        let persisted = self.persist_setting(key, value);
+        Ok(match persisted {
+            Ok(()) => format!("{applied}; saved to config.toml"),
+            Err(e) => format!("{applied}; NOT persisted: {e}"),
+        })
+    }
+
+    /// Persist one setting through the comment-preserving config save.
+    fn persist_setting(&self, key: &str, value: &str) -> Result<(), String> {
+        let paths = self.loon_paths();
+        let (mut cfg, findings) =
+            loon_config::Config::load_or_builtin(&paths).map_err(|e| e.to_string())?;
+        if !findings.is_empty() {
+            return Err("existing config has validation findings; not overwriting".into());
+        }
+        match key {
+            "tips" => cfg.ui.tips = value == "true",
+            "theme" => {
+                cfg.appearance.mode = if value == "transparent" {
+                    loon_config::AppearanceMode::Transparent
+                } else {
+                    loon_config::AppearanceMode::Opaque
+                }
+            }
+            "permission_mode" => {
+                cfg.permissions.mode = match value {
+                    "bypass" => loon_config::PermissionMode::Bypass,
+                    "auto" => loon_config::PermissionMode::Auto,
+                    "ask" => loon_config::PermissionMode::Ask,
+                    _ => loon_config::PermissionMode::Allowlist,
+                }
+            }
+            "model" => cfg.session.model = value.to_string(),
+            "context_window" => {
+                if let Some(def) = cfg.models.get_mut(&self.cfg.model_ref) {
+                    def.context_window = Some(value.parse().map_err(|_| "bad integer")?);
+                } else {
+                    cfg.session.context_window = Some(value.parse().map_err(|_| "bad integer")?);
+                }
+            }
+            "max_steps" => cfg.session.max_steps = value.parse().map_err(|_| "bad integer")?,
+            "tool_output_bytes" => {
+                cfg.session.tool_output_bytes = value.parse().map_err(|_| "bad integer")?
+            }
+            "check_command" => {
+                cfg.session.check_command = if value.is_empty() || value == "none" {
+                    None
+                } else {
+                    Some(value.to_string())
+                }
+            }
+            "effort" | "autocompact" => {} // session-scoped on purpose; nothing to persist
+            other => return Err(format!("unknown setting {other}")),
+        }
+        cfg.save(&paths).map_err(|e| e.to_string())
     }
 
     fn config_report(&self) -> String {

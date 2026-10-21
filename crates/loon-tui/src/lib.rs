@@ -112,6 +112,8 @@ pub struct App {
     pub settings_effort: String,
     pub settings_max_steps: u32,
     pub settings_tool_cap: usize,
+    /// `[ui] tips`: show the rotating input placeholder.
+    pub tips: bool,
 }
 
 impl App {
@@ -145,6 +147,7 @@ impl App {
             settings_effort: "medium".into(),
             settings_max_steps: 24,
             settings_tool_cap: 65_536,
+            tips: true,
         }
     }
 
@@ -154,73 +157,76 @@ impl App {
         self.blocks.insert(0, Block::Rich(self.banner_lines()));
     }
 
-    /// Banner content: animated spark cluster + version, model, workspace.
+    /// Static LOOM block-art rows (single-width cells so the wave grid maths is exact).
+    const LOGO: [&'static str; 3] = [
+        "█   █▀▀█ █▀▀█ █▀▄▀█",
+        "█   █  █ █  █ █ ▀ █",
+        "█▄▄ ▀▀▀▀ ▀▀▀▀ ▀   ▀",
+    ];
+
+    /// Banner: an animated multi-line ASCII logo (two diagonal sparkle waves travelling
+    /// across the block art, phase-shifted per row), then version, model, workspace.
     fn banner_lines(&self) -> Vec<ratatui::text::Line<'static>> {
-        vec![
-            // per-character gradient title: hue slides along the string and over
-            // time — the Claude-Code-style alive title, not a single flipping glyph
-            {
-                let title = format!("Loom v{}", env!("CARGO_PKG_VERSION"));
-                let mut spans: Vec<ratatui::text::Span> = vec![ratatui::text::Span::styled(
-                    format!("{} ", self.intro_frame()),
-                    theme::accent_fg(),
-                )];
-                let phase = self.tick as f32 * 0.12;
-                for (i, ch) in title.char_indices() {
-                    let hue = (phase + i as f32 * 0.09).rem_euclid(1.0);
+        let t = self.tick as f32;
+        let sparks = ['✦', '✧', '˖', '·'];
+        let mut coded: Vec<ratatui::text::Line<'static>> = Vec::new();
+        for (y, row) in Self::LOGO.iter().enumerate() {
+            let chars: Vec<char> = row.chars().collect();
+            let mut spans: Vec<ratatui::text::Span> =
+                vec![ratatui::text::Span::styled("  ", theme::system_fg())];
+            for (x, ch) in chars.iter().enumerate() {
+                // two waves, opposite directions, different wavelengths
+                let w1 = ((x as f32) * 0.55 + (y as f32) * 1.10 - t * 0.35).sin();
+                let w2 = ((x as f32) * 0.23 - (y as f32) * 0.70 + t * 0.21).sin();
+                let lit = w1 > 0.62 || w2 > 0.86;
+                if lit && *ch != ' ' {
+                    let spark = sparks[(x + y + self.tick as usize) % sparks.len()];
+                    let hue = (t * 0.03 + x as f32 * 0.05 + y as f32 * 0.11).rem_euclid(1.0);
                     spans.push(ratatui::text::Span::styled(
-                        ch.to_string(),
+                        spark.to_string(),
                         ratatui::style::Style::default()
-                            .fg(crate::theme::hsv_to_rgb(hue, 0.75, 1.0))
+                            .fg(crate::theme::hsv_to_rgb(hue, 0.65, 1.0))
                             .bg(ratatui::style::Color::Reset),
                     ));
+                } else {
+                    spans.push(ratatui::text::Span::styled(
+                        ch.to_string(),
+                        if *ch == ' ' {
+                            theme::system_fg()
+                        } else {
+                            theme::user_fg()
+                        },
+                    ));
                 }
-                ratatui::text::Line::from(spans)
-            },
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                format!("   {}", self.status.model),
-                theme::system_fg(),
-            )),
-            ratatui::text::Line::from(ratatui::text::Span::styled(
-                format!("   {}", self.status.cwd),
-                theme::system_fg(),
-            )),
-            ratatui::text::Line::default(),
-        ]
-    }
-
-    /// Intro burst: a traveling multi-character spark pattern that blooms outward,
-    /// shimmers, and settles on the logo glyph. Several glyphs move at different
-    /// speeds (i, i*2 offsets) so it reads as an algorithm, not one flipping char.
-    fn intro_frame(&self) -> String {
-        const CELLS: [&str; 7] = ["·", "˖", "✧", "✦", "✻", "✶", "✽"];
-        const WIDTH: usize = 7;
-        let t = self.tick;
-        if t > 24 {
-            return "✦".to_string(); // settled logo glyph
-        }
-        let mut cells = [" "; WIDTH].to_vec();
-        // three traveling sparks at different speeds and phases
-        for (speed, glyph) in [(1usize, "✦"), (2, "✧"), (3, "˖")] {
-            let pos = (t as usize * speed) % (WIDTH * 2);
-            let pos = if pos >= WIDTH {
-                WIDTH * 2 - 1 - pos
-            } else {
-                pos
-            };
-            if cells[pos] == " " {
-                cells[pos] = glyph;
             }
+            coded.push(ratatui::text::Line::from(spans));
         }
-        // center bloom grows with time
-        let bloom = (t as usize).min(4);
-        for k in 0..bloom {
-            let p = 3usize.saturating_sub(k);
-            if cells[p] == " " {
-                cells[p] = CELLS[(t as usize + k) % CELLS.len()];
+        {
+            let mut spans: Vec<ratatui::text::Span> =
+                vec![ratatui::text::Span::styled("  ", theme::system_fg())];
+            let title = format!("Loom v{}", env!("CARGO_PKG_VERSION"));
+            let phase = self.tick as f32 * 0.12;
+            for (i, ch) in title.chars().enumerate() {
+                let hue = (phase + i as f32 * 0.09).rem_euclid(1.0);
+                spans.push(ratatui::text::Span::styled(
+                    ch.to_string(),
+                    ratatui::style::Style::default()
+                        .fg(crate::theme::hsv_to_rgb(hue, 0.75, 1.0))
+                        .bg(ratatui::style::Color::Reset),
+                ));
             }
+            coded.push(ratatui::text::Line::from(spans));
         }
-        cells.concat()
+        coded.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+            format!("  {}", self.status.model),
+            theme::system_fg(),
+        )));
+        coded.push(ratatui::text::Line::from(ratatui::text::Span::styled(
+            format!("  {}", self.status.cwd),
+            theme::system_fg(),
+        )));
+        coded.push(ratatui::text::Line::default());
+        coded
     }
 
     /// While the intro plays, rebuild the banner from the current animation frame.
@@ -781,6 +787,7 @@ async fn run_inner(
                 }
                 AgentEvent::ModeChanged { mode } => app.status.mode = mode,
                 AgentEvent::ToggleTheme => app.transparent = !app.transparent,
+                AgentEvent::SetTransparent { transparent } => app.transparent = transparent,
                 AgentEvent::OpenConfigMenu => app.settings = Some(0),
                 AgentEvent::OpenModelPicker { refs } => app.model_picker = Some((refs, 0)),
                 AgentEvent::OpenEffortPicker => app.effort_picker = Some(1),

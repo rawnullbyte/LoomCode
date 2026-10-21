@@ -137,10 +137,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let block = RtBlock::default()
         .borders(Borders::TOP | Borders::BOTTOM)
         .border_style(theme.border());
-    let input_line = Line::from(vec![
-        Span::styled(prompt.clone(), theme.accent_bold()),
-        Span::styled(format!(" {}", app.input), theme.base()),
-    ]);
+    // Empty input + tips enabled: show a rotating placeholder like [CC]'s prompt.
+    let placeholder = if app.input.is_empty() && app.tips {
+        Some(placeholder_tip(app.tick))
+    } else {
+        None
+    };
+    let input_line = match &placeholder {
+        Some(tip) => Line::from(vec![
+            Span::styled(prompt.clone(), theme.accent_bold()),
+            Span::styled(format!(" {tip}"), theme.dim()),
+        ]),
+        None => Line::from(vec![
+            Span::styled(prompt.clone(), theme.accent_bold()),
+            Span::styled(format!(" {}", app.input), theme.base()),
+        ]),
+    };
     let para = Paragraph::new(input_line).block(block).style(theme.base());
     f.render_widget(para, input);
 
@@ -434,6 +446,19 @@ fn permission_footer(mode: &str) -> String {
         other => return format!("{MODE_GLYPH} {other} {MODE_HINT}"),
     };
     format!("{MODE_GLYPH} {label} {MODE_HINT}")
+}
+
+/// Rotating placeholder tips, one per ~6 s at 20 fps — Claude-Code's prompt feel.
+fn placeholder_tip(tick: u64) -> &'static str {
+    const TIPS: [&str; 6] = [
+        "Try \"write a test for src/lib.rs\"",
+        "Try \"explain the parser module\"",
+        "Try \"fix the failing build\"",
+        "/ for commands · shift+tab cycles permissions",
+        "Try \"review my last change\"",
+        "Try \"where is the config loaded?\"",
+    ];
+    TIPS[(tick as usize / 120) % TIPS.len()]
 }
 
 fn truncate_str(s: &str, w: usize) -> String {

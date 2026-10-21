@@ -56,6 +56,10 @@ pub enum AgentEvent {
     },
     /// /theme cycled — the UI flips its own transparent flag.
     ToggleTheme,
+    /// `/config theme <mode>` — the UI sets its transparency explicitly.
+    SetTransparent {
+        transparent: bool,
+    },
     /// bare /config — the UI opens its interactive settings menu.
     OpenConfigMenu,
     /// bare /model — the UI opens the model picker over these refs.
@@ -186,6 +190,11 @@ pub struct Agent {
     pub effort: Option<String>,
     /// /goal: session goal, injected into every request as a leading system message.
     pub session_goal: Option<String>,
+    /// `tips = true|false`: show the input placeholder hint (Claude-Code style).
+    pub tips: bool,
+    /// Whether this session renders transparently (mirrors the appearance config;
+    /// `/config theme` flips it and emits SetTransparent for the UI).
+    pub transparent_request: bool,
     /// Ultra Loop baseline check result (established on the first verify).
     baseline: Option<crate::verify::CheckResult>,
     /// Whether the session has been auto-titled from its first prompt.
@@ -221,6 +230,88 @@ pub fn standard_tools(paths: &LoonPaths, cwd: &Path) -> ToolRegistry {
 }
 
 impl Agent {
+    /// Build the tool context shared by every constructor: workspace sandbox (with
+    /// configured extra write roots) plus the journal-backed blob sink for snapshots.
+    fn build_ctx(
+        cfg: &AgentConfig,
+        cwd: &Path,
+        cancel_rx: watch::Receiver<bool>,
+        journal: &Arc<Journal>,
+    ) -> loon_events::Result<ToolCtx> {
+        let extra_roots: Vec<PathBuf> = cfg
+            .permissions
+            .extra_write_roots
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let ws = loon_workspace::Workspace::new(cwd, extra_roots).map_err(|e| {
+            loon_events::EventsError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                e.to_string(),
+            ))
+        })?;
+        let j = journal.clone();
+        Ok(ToolCtx {
+            ws: Arc::new(ws),
+            output_limit: cfg.tool_output_bytes,
+            default_timeout: std::time::Duration::from_secs(120),
+            child_env: Default::default(),
+            cancel: cancel_rx,
+            blob_sink: Some(Arc::new(move |data: &[u8]| j.put_blob(data).ok())),
+        })
+    }
+
+    /// Assemble an Agent from its parts — the single place every constructor ends,
+    /// so new fields are added once rather than in each constructor.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        paths: &LoonPaths,
+        cfg: AgentConfig,
+        registry: Arc<ProviderRegistry>,
+        tools: ToolRegistry,
+        journal: Arc<Journal>,
+        cwd: PathBuf,
+        history: Vec<loon_providers::ChatMessage>,
+        system_prompt: String,
+        session_id: loon_events::EvId,
+    ) -> loon_events::Result<Agent> {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (steering_tx, steering_rx) = mpsc::channel(64);
+        let ctx = Agent::build_ctx(&cfg, &cwd, cancel_rx.clone(), &journal)?;
+        let audit_path = paths.state_dir.join("audit.jsonl");
+        Ok(Agent {
+            permissions: Arc::new(permissions::PermissionEngine::new(
+                &cfg.permissions,
+                Some(audit_path),
+            )),
+            skills: skills::load(&paths.data_dir, &cwd),
+            data_dir: paths.data_dir.clone(),
+            config_dir: paths.config_dir.clone(),
+            journal,
+            registry,
+            tools,
+            ctx,
+            history,
+            cancel_tx,
+            cancel_rx,
+            steering_rx,
+            steering_tx,
+            events: None,
+            approval_hook: None,
+            summarizer: None,
+            loops: Arc::new(loops::LoopRegistry::new()),
+            effort: None,
+            session_goal: None,
+            tips: true,
+            transparent_request: true,
+            baseline: None,
+            titled: std::sync::atomic::AtomicBool::new(false),
+            cfg,
+            system_prompt,
+            session_id,
+        })
+    }
+
     /// Create a session agent. `cwd` is the workspace root; AGENTS.md there (if any) is
     /// included as task guidance.
     pub fn new_session(
@@ -242,7 +333,6 @@ impl Agent {
         };
         let store = open_store(paths)?;
         let journal = Arc::new(Journal::create_default(&store, &meta)?);
-        // (blob_sink attached below, after ctx is built)
         let system = prompt::system_prompt(&cwd);
         journal.append(
             None,
@@ -252,64 +342,17 @@ impl Agent {
                 headless,
             },
         )?;
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (steering_tx, steering_rx) = mpsc::channel(64);
-        let extra_roots: Vec<PathBuf> = cfg
-            .permissions
-            .extra_write_roots
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        let ctx = ToolCtx {
-            ws: Arc::new(
-                loon_workspace::Workspace::new(&cwd, extra_roots).map_err(|e| {
-                    loon_events::EventsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        e.to_string(),
-                    ))
-                })?,
-            ),
-            output_limit: cfg.tool_output_bytes,
-            default_timeout: std::time::Duration::from_secs(120),
-            child_env: Default::default(),
-            cancel: cancel_rx.clone(),
-            blob_sink: None,
-        };
-        let mut ctx = ctx;
-        {
-            let j = journal.clone();
-            ctx.blob_sink = Some(Arc::new(move |data: &[u8]| j.put_blob(data).ok()));
-        }
-        let audit_path = paths.state_dir.join("audit.jsonl");
-        Ok(Agent {
-            journal,
+        Agent::assemble(
+            paths,
+            cfg,
             registry,
             tools,
-            ctx,
-            history: Vec::new(),
-            cancel_tx,
-            cancel_rx,
-            steering_rx,
-            steering_tx,
-            events: None,
-            permissions: Arc::new(permissions::PermissionEngine::new(
-                &cfg.permissions,
-                Some(audit_path),
-            )),
-            approval_hook: None,
-            summarizer: None,
-            data_dir: paths.data_dir.clone(),
-            config_dir: paths.config_dir.clone(),
-            skills: skills::load(&paths.data_dir, Path::new(&cwd)),
-            loops: Arc::new(loops::LoopRegistry::new()),
-            effort: None,
-            session_goal: None,
-            baseline: None,
-            titled: std::sync::atomic::AtomicBool::new(false),
-            cfg,
-            system_prompt: system,
+            journal,
+            cwd,
+            Vec::new(),
+            system,
             session_id,
-        })
+        )
     }
 
     pub fn session_id(&self) -> loon_events::EvId {
@@ -467,65 +510,19 @@ impl Agent {
             }
         }
         let history = replay::replay_history(&events, truncate_at);
-        let (cancel_tx, cancel_rx) = watch::channel(false);
-        let (steering_tx, steering_rx) = mpsc::channel(64);
-        let extra_roots: Vec<PathBuf> = cfg
-            .permissions
-            .extra_write_roots
-            .iter()
-            .map(PathBuf::from)
-            .collect();
-        let ctx = ToolCtx {
-            ws: Arc::new(
-                loon_workspace::Workspace::new(PathBuf::from(&cwd), extra_roots).map_err(|e| {
-                    loon_events::EventsError::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        e.to_string(),
-                    ))
-                })?,
-            ),
-            output_limit: cfg.tool_output_bytes,
-            default_timeout: std::time::Duration::from_secs(120),
-            child_env: Default::default(),
-            cancel: cancel_rx.clone(),
-            blob_sink: None,
-        };
         let journal = Arc::new(journal);
-        let mut ctx = ctx;
-        {
-            let j = journal.clone();
-            ctx.blob_sink = Some(Arc::new(move |data: &[u8]| j.put_blob(data).ok()));
-        }
-        let audit_path = paths.state_dir.join("audit.jsonl");
-        Ok(Agent {
-            journal,
+        let system = prompt::system_prompt(Path::new(&cwd));
+        Agent::assemble(
+            paths,
+            cfg,
             registry,
             tools,
-            ctx,
+            journal,
+            PathBuf::from(&cwd),
             history,
-            cancel_tx,
-            cancel_rx,
-            steering_rx,
-            steering_tx,
-            events: None,
-            permissions: Arc::new(permissions::PermissionEngine::new(
-                &cfg.permissions,
-                Some(audit_path),
-            )),
-            approval_hook: None,
-            summarizer: None,
-            data_dir: paths.data_dir.clone(),
-            config_dir: paths.config_dir.clone(),
-            skills: skills::load(&paths.data_dir, Path::new(&cwd)),
-            loops: Arc::new(loops::LoopRegistry::new()),
-            effort: None,
-            session_goal: None,
-            baseline: None,
-            titled: std::sync::atomic::AtomicBool::new(false),
-            cfg,
-            system_prompt: prompt::system_prompt(Path::new(&cwd)),
+            system,
             session_id,
-        })
+        )
     }
 
     /// Run one user turn to completion, journaling everything.

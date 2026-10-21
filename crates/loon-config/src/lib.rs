@@ -12,7 +12,7 @@ pub use paths::LoonPaths;
 pub use schema::{
     ApiFamily, Appearance, AppearanceMode, CapState, CapabilityOverrides, Combo, ComboMember,
     ComboMode, ComboRequires, Mcp, McpServerConfig, ModelDef, PermissionMode, PermissionRule,
-    Permissions, Provider, SessionCfg,
+    Permissions, Provider, SessionCfg, UiCfg,
 };
 pub use validate::{ConfigError, Finding, Validator};
 
@@ -31,6 +31,8 @@ pub struct Config {
     pub permissions: Permissions,
     #[serde(default)]
     pub session: SessionCfg,
+    #[serde(default)]
+    pub ui: UiCfg,
     #[serde(default)]
     pub providers: std::collections::BTreeMap<String, Provider>,
     #[serde(default)]
@@ -74,6 +76,7 @@ impl Config {
             appearance: Appearance::default(),
             permissions: Permissions::default(),
             session: SessionCfg::default(),
+            ui: UiCfg::default(),
             providers,
             models,
             combos: Default::default(),

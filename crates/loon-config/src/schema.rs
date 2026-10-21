@@ -279,6 +279,58 @@ pub struct SessionCfg {
     /// Opt-in: allow combo to restart a partially-streamed request from scratch.
     #[serde(default)]
     pub allow_retry_after_partial_stream: bool,
+    /// Context window override when the model def has none (0 = use the model's).
+    #[serde(default)]
+    pub context_window: Option<u64>,
+    /// Ultra Loop verify command (e.g. "cargo test"); None disables the loop.
+    #[serde(default)]
+    pub check_command: Option<String>,
+    /// Output budget level: low | medium | high.
+    #[serde(default)]
+    pub effort: Option<String>,
+}
+
+/// UI/behavior settings (the `[ui]` table). Defaults mirror Claude-Code's feel.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UiCfg {
+    /// Show the input placeholder tip ("Try \"write a test for …\"").
+    #[serde(default = "yes")]
+    pub tips: bool,
+    /// Placeholder tip text (empty = rotate built-in suggestions).
+    #[serde(default)]
+    pub tip_text: String,
+    /// Permission-mode footer row.
+    #[serde(default = "yes")]
+    pub footer: bool,
+    /// Show the animated welcome banner.
+    #[serde(default = "yes")]
+    pub welcome_banner: bool,
+    /// Turn spinner verbs, one shown at a time.
+    #[serde(default)]
+    pub spinner_verbs: Vec<String>,
+    /// Max visible rows in the slash-command popup.
+    #[serde(default = "default_popup_rows")]
+    pub popup_rows: u16,
+}
+
+fn yes() -> bool {
+    true
+}
+fn default_popup_rows() -> u16 {
+    6
+}
+
+impl Default for UiCfg {
+    fn default() -> Self {
+        UiCfg {
+            tips: true,
+            tip_text: String::new(),
+            footer: true,
+            welcome_banner: true,
+            spinner_verbs: vec![],
+            popup_rows: default_popup_rows(),
+        }
+    }
 }
 
 fn default_model() -> String {
@@ -302,6 +354,9 @@ impl Default for SessionCfg {
             tool_output_bytes: default_tool_output(),
             max_retries: default_retries(),
             allow_retry_after_partial_stream: false,
+            context_window: None,
+            check_command: None,
+            effort: None,
         }
     }
 }
