@@ -68,6 +68,11 @@ pub enum SlashCommand {
     Shadow {
         path: String,
     },
+    /// /shadow-restore <seq> <path> — restore the file to its state BEFORE seq.
+    ShadowRestore {
+        seq: u64,
+        path: String,
+    },
     /// /sessions search <query> — find text across all sessions.
     SessionsSearch {
         query: String,
@@ -229,6 +234,10 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         "sessions" => SlashCommand::SessionsSearch {
             query: args.join(" "),
         },
+        "shadow-restore" => SlashCommand::ShadowRestore {
+            seq: args.first().and_then(|a| a.parse().ok()).unwrap_or(0),
+            path: args.get(1..).map(|a| a.join(" ")).unwrap_or_default(),
+        },
         "shadow" => SlashCommand::Shadow {
             path: args.join(" "),
         },
@@ -298,6 +307,10 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
         ("doctor", "offline health checks"),
         ("sessions search <query>", "find text across all sessions"),
         ("shadow <path>", "mutation history of one file (restorable)"),
+        (
+            "shadow-restore <seq> <path>",
+            "restore a file to its state before seq",
+        ),
         ("mcp", "list connected MCP tools"),
         ("workflows", "list user-defined skills (workflows)"),
         (
@@ -588,7 +601,11 @@ impl Agent {
                     let key_env = args.get(4).cloned();
                     self.persist_provider(name, url, api, key_env.as_deref())
                 }
-                _ => Err("usage: /provider add NAME URL [api] [key_env] | /provider list".into()),
+                None if self.events.is_some() => {
+                    self.emit(crate::AgentEvent::OpenProviderForm);
+                    Ok(String::new())
+                }
+                _ => Err("usage: /provider (opens a form) | /provider list".into()),
             },
             SlashCommand::Combo { args } => match args.first().map(|s| s.as_str()) {
                 Some("list") => {
@@ -793,6 +810,44 @@ impl Agent {
                 }
                 out.push_str("restore with /undo (newest first) or /rewind — every state above is CAS-snapshotted");
                 Ok(out)
+            }
+            SlashCommand::ShadowRestore { seq, path } => {
+                if path.trim().is_empty() || seq == 0 {
+                    return Err("usage: /shadow-restore <seq> <path> — see /shadow <path>".into());
+                }
+                let events = self.events()?;
+                // find the mutation at/before seq for this path, take its before-blob
+                let target = events.iter().rev().find_map(|e| match &e.kind {
+                    loon_events::model::EventKind::FileMutated {
+                        path: p,
+                        before_blob,
+                        before_sha256,
+                        ..
+                    } if p.ends_with(path.trim()) && e.seq <= seq => {
+                        Some((before_blob.clone(), before_sha256.clone()))
+                    }
+                    _ => None,
+                });
+                let Some((Some(blob), before_sha)) = target else {
+                    return Err(format!(
+                        "no snapshotted state before seq {seq} for `{path}` (creations have no prior state)"
+                    ));
+                };
+                let content = self
+                    .journal
+                    .read_blob(&loon_events::model::BlobRef {
+                        sha256: blob.sha256.clone(),
+                        bytes: blob.bytes,
+                    })
+                    .map_err(|e| format!("blob read: {e}"))?;
+                let p = self.ctx.ws.root().join(path.trim());
+                std::fs::write(&p, &content).map_err(|e| format!("write: {e}"))?;
+                Ok(format!(
+                    "restored `{}` to its pre-seq-{seq} state (sha {}, {} bytes) — journaled on your next edit",
+                    path.trim(),
+                    &before_sha[..8.min(before_sha.len())],
+                    content.len()
+                ))
             }
             SlashCommand::Mcp => {
                 let mut out = String::new();

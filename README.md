@@ -113,7 +113,7 @@ keymap session was **not** exercised in this environment and is not claimed.
 
 ## Packaging and portability
 
-- `cargo install --path crates/loon-cli` builds the optimized `loon` binary (release
+- `cargo install --path crates/loon-cli` builds the optimized `loom` binary (release
   profile: thin LTO, stripped, single codegen unit).
 - Dependencies are chosen for portability: `reqwest` with rustls (no OpenSSL linkage),
   `rusqlite` bundled (no system SQLite required), `ratatui`/`crossterm` for the TUI.

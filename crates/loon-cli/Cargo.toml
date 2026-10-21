@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "loon"
+name = "loom"
 path = "src/main.rs"
 
 [dependencies]

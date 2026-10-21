@@ -105,6 +105,8 @@ pub struct App {
     pub model_picker: Option<(Vec<String>, usize)>,
     /// Effort picker (bare /effort): Some(selected). Modal overlay.
     pub effort_picker: Option<usize>,
+    /// Add-provider form: Some((field values, focused index)). Modal overlay.
+    pub provider_form: Option<(Vec<String>, usize)>,
     /// Menu-local mirrors (optimistically updated on toggle; commands re-apply).
     pub settings_autocompact: bool,
     pub settings_effort: String,
@@ -138,6 +140,7 @@ impl App {
             settings: None,
             model_picker: None,
             effort_picker: None,
+            provider_form: None,
             settings_autocompact: true,
             settings_effort: "medium".into(),
             settings_max_steps: 24,
@@ -154,16 +157,26 @@ impl App {
     /// Banner content: animated spark cluster + version, model, workspace.
     fn banner_lines(&self) -> Vec<ratatui::text::Line<'static>> {
         vec![
-            ratatui::text::Line::from(vec![
-                ratatui::text::Span::styled(
-                    format!(" {} ", self.intro_frame()),
+            // per-character gradient title: hue slides along the string and over
+            // time — the Claude-Code-style alive title, not a single flipping glyph
+            {
+                let title = format!("Loom v{}", env!("CARGO_PKG_VERSION"));
+                let mut spans: Vec<ratatui::text::Span> = vec![ratatui::text::Span::styled(
+                    format!("{} ", self.intro_frame()),
                     theme::accent_fg(),
-                ),
-                ratatui::text::Span::styled(
-                    format!("Loom v{}", env!("CARGO_PKG_VERSION")),
-                    theme::user_fg(),
-                ),
-            ]),
+                )];
+                let phase = self.tick as f32 * 0.12;
+                for (i, ch) in title.char_indices() {
+                    let hue = (phase + i as f32 * 0.09).rem_euclid(1.0);
+                    spans.push(ratatui::text::Span::styled(
+                        ch.to_string(),
+                        ratatui::style::Style::default()
+                            .fg(crate::theme::hsv_to_rgb(hue, 0.75, 1.0))
+                            .bg(ratatui::style::Color::Reset),
+                    ));
+                }
+                ratatui::text::Line::from(spans)
+            },
             ratatui::text::Line::from(ratatui::text::Span::styled(
                 format!("   {}", self.status.model),
                 theme::system_fg(),
@@ -212,11 +225,11 @@ impl App {
 
     /// While the intro plays, rebuild the banner from the current animation frame.
     pub fn update_intro(&mut self) {
-        if self.tick < 2 * 7 {
-            let lines = self.banner_lines();
-            if let Some(Block::Rich(existing)) = self.blocks.first_mut() {
-                *existing = lines;
-            }
+        // spark animates for the intro; the gradient title is rebuilt every tick so
+        // the hue keeps sliding (one line — negligible)
+        let lines = self.banner_lines();
+        if let Some(Block::Rich(existing)) = self.blocks.first_mut() {
+            *existing = lines;
         }
     }
 
@@ -771,6 +784,9 @@ async fn run_inner(
                 AgentEvent::OpenConfigMenu => app.settings = Some(0),
                 AgentEvent::OpenModelPicker { refs } => app.model_picker = Some((refs, 0)),
                 AgentEvent::OpenEffortPicker => app.effort_picker = Some(1),
+                AgentEvent::OpenProviderForm => {
+                    app.provider_form = Some((vec![String::new(); 4], 0))
+                }
                 AgentEvent::ClearTranscript => {
                     let banner = if matches!(app.blocks.first(), Some(crate::Block::Rich(_))) {
                         app.blocks.first().cloned()
@@ -886,6 +902,59 @@ async fn run_inner(
 }
 
 async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiCommand>) {
+    // The add-provider form is modal: type into fields, Tab/arrows move, Enter saves.
+    if let Some((fields, focused)) = app.provider_form.clone() {
+        let mut fields = fields;
+        match key.code {
+            KeyCode::Esc => app.provider_form = None,
+            KeyCode::Backspace => {
+                if let Some(f) = fields.get_mut(focused) {
+                    f.pop();
+                }
+                app.provider_form = Some((fields, focused));
+            }
+            KeyCode::Tab | KeyCode::Down => {
+                app.provider_form = Some((fields, (focused + 1) % 4));
+            }
+            KeyCode::Up => {
+                app.provider_form = Some((fields, if focused == 0 { 3 } else { focused - 1 }));
+            }
+            KeyCode::Enter => {
+                let name = fields[0].trim().to_string();
+                let url = fields[1].trim().to_string();
+                if name.is_empty() || url.is_empty() {
+                    app.push_block(Block::System(
+                        "provider needs at least a name and a base URL".into(),
+                    ));
+                    app.provider_form = Some((fields, focused));
+                    return;
+                }
+                let mut args = vec!["add".to_string(), name, url];
+                let api = fields[2].trim();
+                if !api.is_empty() {
+                    args.push(api.to_string());
+                    let key_env = fields[3].trim();
+                    if !key_env.is_empty() {
+                        args.push(key_env.to_string());
+                    }
+                }
+                let _ = cmd_tx
+                    .send(UiCommand::Slash(
+                        loon_core::commands::SlashCommand::Provider { args },
+                    ))
+                    .await;
+                app.provider_form = None;
+            }
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(f) = fields.get_mut(focused) {
+                    f.push(c);
+                }
+                app.provider_form = Some((fields, focused));
+            }
+            _ => {}
+        }
+        return;
+    }
     // The effort picker is modal: arrows move, Enter sets, Esc closes.
     if let Some(selected) = app.effort_picker {
         const LEVELS: [&str; 3] = ["low", "medium", "high"];

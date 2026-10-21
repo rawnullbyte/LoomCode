@@ -64,7 +64,7 @@ id = "slow-1"
 }
 
 fn spawn_loon(home: &std::path::Path, ws: &std::path::Path, prompt: &str) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_loon"))
+    Command::new(env!("CARGO_BIN_EXE_loom"))
         .args([
             "run",
             prompt,

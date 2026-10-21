@@ -64,6 +64,8 @@ pub enum AgentEvent {
     },
     /// bare /effort — the UI opens the effort picker.
     OpenEffortPicker,
+    /// bare /provider — the UI opens the add-provider form.
+    OpenProviderForm,
     /// /clear — the UI wipes its visible transcript (journal untouched).
     ClearTranscript,
     Warning(String),

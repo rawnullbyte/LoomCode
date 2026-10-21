@@ -73,8 +73,8 @@ impl Theme {
     }
     /// Menu/selected rows (autocomplete, settings): dim background bar.
     pub fn menu_selected(&self) -> Style {
-        // DarkGray bg bar with the terminal's own fg (accent-on-darkgray clashed)
-        Style::default().fg(Color::Reset).bg(Color::DarkGray)
+        // explicit RGB — kitty remaps 8-bit palette entries to its theme
+        Style::default().fg(Color::Reset).bg(Color::Rgb(64, 64, 88))
     }
 
     fn bg(&self, mut s: Style) -> Style {
@@ -113,17 +113,35 @@ pub fn member_fg() -> Style {
 pub fn accent_fg() -> Style {
     Style::default().fg(Color::Cyan).bg(Color::Reset)
 }
+/// HSV (0..1) to RGB — used by the animated gradient title.
+pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> ratatui::style::Color {
+    let i = (h * 6.0).floor() as i32 % 6;
+    let f = h * 6.0 - (h * 6.0).floor();
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - f * s);
+    let t = v * (1.0 - (1.0 - f) * s);
+    let (r, g, b) = match i.rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    ratatui::style::Color::Rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+}
+
 /// Selection highlight during an active drag: a real dim background so it is
 /// unmistakably visible. Deliberate exception to the idle-rendering bg=Reset
 /// invariant: a selection is transient user intent (and disappears on release).
 pub fn selection_fg() -> Style {
-    // keep the terminal's own foreground (white-on-dark was unreadable); the bg
-    // carries the highlight
-    Style::default().fg(Color::Reset).bg(Color::DarkGray)
+    // explicit RGB: 8-bit palette entries (DarkGray) get remapped by kitty's theme
+    Style::default().fg(Color::Reset).bg(Color::Rgb(64, 64, 88))
 }
 /// Menu/selected rows (autocomplete, settings): dim background bar, fg-only theme.
 pub fn menu_selected() -> Style {
-    Style::default().fg(Color::Reset).bg(Color::DarkGray)
+    // explicit RGB for the same kitty-remap reason
+    Style::default().fg(Color::Reset).bg(Color::Rgb(64, 64, 88))
 }
 pub fn pending_fg() -> Style {
     Style::default().fg(Color::Cyan).bg(Color::Reset)

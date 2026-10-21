@@ -28,7 +28,7 @@ fn human(n: u64) -> String {
 #[test]
 #[ignore]
 fn bench_cli_startup() {
-    let exe = env!("CARGO_BIN_EXE_loon");
+    let exe = env!("CARGO_BIN_EXE_loom");
     let runs = 20;
     let mut times_ms = Vec::with_capacity(runs);
     for _ in 0..runs {

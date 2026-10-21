@@ -198,6 +198,51 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         f.render_widget(Paragraph::new(rows).block(block).style(theme.base()), rect);
     }
 
+    // ── add-provider form overlay (bare /provider) ──────────────────────────────
+    if let Some((fields, focused)) = &app.provider_form {
+        let labels = [
+            "name",
+            "base url",
+            "api (chat|responses)",
+            "api key env var",
+        ];
+        let w = 64u16.min(area.width.saturating_sub(4));
+        let h = 8u16.min(area.height.saturating_sub(4));
+        let x = area.x + (area.width.saturating_sub(w)) / 2;
+        let y = area.y + (area.height.saturating_sub(h)) / 2;
+        let rect = ratatui::layout::Rect {
+            x,
+            y,
+            width: w,
+            height: h,
+        };
+        f.render_widget(ratatui::widgets::Clear, rect);
+        let mut rows: Vec<Line> = vec![Line::styled(
+            " Add provider ".to_string(),
+            theme.accent_bold(),
+        )];
+        for (i, (label, value)) in labels.iter().zip(fields.iter()).enumerate() {
+            let style = if i == *focused {
+                theme.menu_selected()
+            } else {
+                theme.base()
+            };
+            rows.push(Line::from(vec![
+                Span::styled(format!(" {label:<22}"), style),
+                Span::styled(value.clone(), style),
+            ]));
+        }
+        rows.push(Line::styled(
+            "  tab next · enter saves to config · esc cancels".to_string(),
+            theme.dim(),
+        ));
+        let block = RtBlock::default()
+            .borders(Borders::ALL)
+            .border_style(theme.border())
+            .style(theme.base());
+        f.render_widget(Paragraph::new(rows).block(block).style(theme.base()), rect);
+    }
+
     // ── effort picker overlay (bare /effort) ────────────────────────────────────
     if let Some(selected) = app.effort_picker {
         let w = 36u16.min(area.width.saturating_sub(4));
