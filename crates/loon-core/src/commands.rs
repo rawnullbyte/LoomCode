@@ -989,7 +989,14 @@ impl Agent {
                             .iter()
                             .map(|m| crate::catalog::MenuItem {
                                 label: m.title.clone(),
-                                detail: format!("{} · {}", &m.id.to_string()[..8], m.cwd),
+                                // Same recency the text listing shows, so the picker
+                                // and `/resume` without a UI agree about the order.
+                                detail: format!(
+                                    "{} · {} · {}",
+                                    &m.id.to_string()[..8],
+                                    crate::worklog::relative_time(m.updated_ms),
+                                    m.cwd
+                                ),
                                 command: format!("/resume {}", m.id),
                             })
                             .collect();

@@ -219,8 +219,14 @@ for a collapsed run. The diff is clipped after 60 changed lines per side (120 fo
 rewrite) and says so rather than truncating silently; a rewrite that changes nothing
 produces no diff at all. Every stored
 diff line keeps its own row, so colouring stays per-line no matter how large the edit is.
-The same colouring applies to a diff pasted into an assistant answer, and fenced code blocks
-render as code. One request-level `t/s` counter
+The same colouring applies to a diff pasted into an assistant answer.
+
+Fenced code blocks are **syntax highlighted** by their fence tag — Rust, Python,
+JavaScript/TypeScript/Go/Java, shell, JSON and TOML — with keywords, strings, numbers and
+comments styled separately. The highlighter is a tolerant lexer rather than a parser: an
+excerpt cut mid-string still renders, and highlighting never changes the underlying text,
+so copying a command out of the transcript yields exactly what was shown. An unknown fence
+tag falls back to plain code. One request-level `t/s` counter
 covers thinking, writing and tool arguments together. `~` marks a character-based estimate
 until the provider reports total output/completion tokens. Reasoning tokens are not added
 again. The timer includes request latency, resets on each request/retry and freezes during

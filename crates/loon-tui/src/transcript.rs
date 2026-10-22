@@ -171,9 +171,19 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
     let mut first = true;
     let markdown = style == theme::assistant_fg();
     let mut code = false;
+    // The fence's info string picks the highlighting family; it is remembered until
+    // the closing fence so every line of the block is tokenized the same way.
+    let mut lang = crate::code::Lang::Plain;
     for para in text.split('\n') {
         let trimmed = para.trim_start();
         let fence = markdown && trimmed.starts_with("```");
+        if fence {
+            lang = if code {
+                crate::code::Lang::Plain
+            } else {
+                crate::code::Lang::from_tag(trimmed.trim_start_matches("```"))
+            };
+        }
         let body_style = if markdown && (fence || code) {
             theme::tool_ok_fg()
         } else if markdown && trimmed.starts_with('#') {
@@ -217,9 +227,16 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
                                 },
                             ));
                         }
+                    } else if code {
+                        // Real syntax highlighting inside a fenced block: keywords,
+                        // strings, numbers and comments are separated by language, so
+                        // a Rust block does not read like a wall of one colour.
+                        for (piece, style) in crate::code::highlight(&text, lang) {
+                            spans.push(Span::styled(piece, style));
+                        }
                     } else {
-                        // Fenced code and diff lines inside prose keep their own
-                        // colour: a pasted patch in an answer reads like a patch.
+                        // Diff lines inside prose keep their own colour: a pasted patch
+                        // in an answer reads like a patch.
                         let line_style = diff_style(&text).unwrap_or(body_style);
                         spans.push(Span::styled(text, line_style));
                     }
@@ -1113,4 +1130,90 @@ fn a_large_diff_reaches_the_transcript_intact() {
         diff_rows >= 112,
         "each diff line needs its own row, got {diff_rows} of 112"
     );
+}
+
+#[cfg(test)]
+mod code_highlight_tests {
+    use super::*;
+
+    fn styles(rows: &[TranscriptRow], needle: &str) -> Vec<Style> {
+        rows.iter()
+            .filter_map(|r| {
+                let text: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                if !text.contains(needle) {
+                    return None;
+                }
+                Some(
+                    r.line
+                        .spans
+                        .iter()
+                        .filter(|s| !s.content.trim().is_empty())
+                        .map(|s| s.style)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn a_rust_fence_is_highlighted_by_language() {
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        app.push_block(crate::Block::Assistant(
+            "Here:\n```rust\nfn main() {\n    let s = \"hi\"; // note\n}\n```\nDone.".into(),
+        ));
+        let rows = app.transcript_rows(80);
+        let code = styles(&rows, "fn main");
+        assert!(
+            code.contains(&crate::code::keyword_style()),
+            "`fn` must be styled as a keyword, got {code:?}"
+        );
+        let line = styles(&rows, "let s =");
+        assert!(
+            line.contains(&crate::code::string_style()),
+            "the string literal must be styled, got {line:?}"
+        );
+        assert!(
+            line.contains(&crate::code::comment_style()),
+            "the comment must be styled, got {line:?}"
+        );
+    }
+
+    #[test]
+    fn prose_outside_the_fence_is_not_highlighted_as_code() {
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        app.push_block(crate::Block::Assistant(
+            "```rust\nlet x = 1;\n```\nfn is just a word here".into(),
+        ));
+        let rows = app.transcript_rows(80);
+        let prose = styles(&rows, "fn is just");
+        assert!(
+            !prose.contains(&crate::code::keyword_style()),
+            "code styling must stop at the closing fence, got {prose:?}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_fence_tag_still_renders_without_losing_text() {
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        app.push_block(crate::Block::Assistant(
+            "```brainfuck\n+++[>+<-]\n```".into(),
+        ));
+        let rows = app.transcript_rows(80);
+        let text: String = rows
+            .iter()
+            .map(|r| {
+                r.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("+++[>+<-]"), "code text must survive: {text}");
+    }
 }

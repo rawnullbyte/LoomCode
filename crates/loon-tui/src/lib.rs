@@ -6,6 +6,7 @@
 //! foreground color/underline — never reverse video. Opaque mode is explicit opt-in.
 
 pub mod clipboard;
+pub mod code;
 pub mod driver;
 pub mod manager;
 pub mod motion;
