@@ -548,7 +548,9 @@ fn resolve_prefix(want: &str) -> Result<loon_events::EvId, i32> {
         _ => {
             eprintln!("loon: `{want}` matches {} sessions:", hits.len());
             for m in hits.iter().take(10) {
-                eprintln!("  {} · {}", m.id, m.title);
+                // One candidate per line; a legacy title with newlines would
+                // otherwise look like additional candidates.
+                eprintln!("  {} · {}", m.id, one_line(&m.title));
             }
             Err(1)
         }
@@ -742,7 +744,9 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
                 eprintln!(
                     "delete session {short} ({} events) titled `{}`?",
                     store.events(sid).map(|e| e.len()).unwrap_or(0),
-                    meta.title
+                    // A stored title can predate the one-line rule; the prompt is
+                    // one line, so a newline in it would split the question.
+                    one_line(&meta.title)
                 );
                 eprint!("type the session id prefix to confirm: ");
                 use std::io::Write as _;

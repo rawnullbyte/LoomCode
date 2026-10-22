@@ -669,3 +669,119 @@ fn json_and_jsonl_agree_about_the_same_turn() {
         "the document must carry the events, got: {doc}"
     );
 }
+
+/// The delete confirmation is a single prompt line, so a stored title that still
+/// holds newlines (written before the one-line rule) must be flattened before it
+/// is quoted back — otherwise the question splits across lines.
+#[test]
+fn delete_confirmation_flattens_a_stored_multiline_title() {
+    use std::io::Write as _;
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    assert!(loom()
+        .args(["run", "seed"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let list = loom().args(["sessions", "list"]).output().unwrap();
+    let id = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().next().map(str::to_string))
+        .expect("one session exists");
+
+    // A legacy-style title, written through the journal API.
+    let paths = loon_config::LoonPaths {
+        config_dir: home.path().join("config"),
+        data_dir: home.path().join("data"),
+        state_dir: home.path().join("state"),
+        cache_dir: home.path().join("cache"),
+        runtime_dir: home.path().join("runtime"),
+    };
+    let store = loon_core::open_store(&paths).expect("open store");
+    let sid: loon_events::EvId = id.parse().expect("session id");
+    let journal = loon_events::Journal::open_default(&store, &paths.sessions_dir(), sid)
+        .expect("open journal")
+        .0;
+    journal
+        .rename_session("legacy\nsecond line")
+        .expect("rewrite the title");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["sessions", "delete", &id])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"nope\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("legacy\nsecond line"),
+        "the confirmation must quote a one-line title, got: {err:?}"
+    );
+    assert!(
+        err.contains("legacy second line"),
+        "the title should appear flattened, got: {err:?}"
+    );
+}
+
+/// An ambiguous selector lists one candidate per line. A stored title with
+/// newlines must be flattened, or one candidate looks like several.
+#[test]
+fn ambiguous_selector_lists_one_candidate_per_line() {
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    // Three sessions so a short prefix is ambiguous.
+    for prompt in ["one", "two", "three"] {
+        assert!(loom()
+            .args(["run", prompt])
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+    let paths = loon_config::LoonPaths {
+        config_dir: home.path().join("config"),
+        data_dir: home.path().join("data"),
+        state_dir: home.path().join("state"),
+        cache_dir: home.path().join("cache"),
+        runtime_dir: home.path().join("runtime"),
+    };
+    let store = loon_core::open_store(&paths).expect("open store");
+    let sessions = loon_events::list_all_sessions(&store, &paths.sessions_dir()).unwrap();
+    let first = sessions[0].id;
+    loon_events::Journal::open_default(&store, &paths.sessions_dir(), first)
+        .expect("open journal")
+        .0
+        .rename_session("legacy\nsecond line")
+        .expect("rewrite the title");
+
+    // A one-character prefix is ambiguous across three sessions.
+    let prefix = &first.to_string()[..1];
+    let out = loom()
+        .args(["sessions", "export", prefix])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "an ambiguous prefix must be refused");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("legacy\nsecond line"),
+        "each candidate must stay on one line, got: {err:?}"
+    );
+    assert!(
+        err.contains("legacy second line"),
+        "the title should appear flattened, got: {err:?}"
+    );
+}
