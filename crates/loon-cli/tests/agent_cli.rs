@@ -481,3 +481,61 @@ fn a_multiline_prompt_does_not_break_the_sessions_table() {
         "the rest of the prompt must not become table rows, got: {text:?}"
     );
 }
+
+/// A resumed session runs in the directory it was started in. When that directory
+/// is gone the error must say so — it used to blame `--cwd`, a flag the user never
+/// typed, sending them hunting for an argument that does not exist.
+#[test]
+fn resume_names_the_sessions_missing_directory_not_a_cwd_flag() {
+    let home = tempfile::tempdir().unwrap();
+    let origin = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let loom = |dir: &std::path::Path| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c.current_dir(dir);
+        c
+    };
+    assert!(loom(origin.path())
+        .args(["run", "seed"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let list = loom(origin.path())
+        .args(["sessions", "list"])
+        .output()
+        .unwrap();
+    let id = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().next().map(str::to_string))
+        .expect("one session exists");
+
+    // The workspace disappears between the original run and the resume.
+    let gone = origin.path().to_path_buf();
+    drop(origin);
+    let out = loom(elsewhere.path())
+        .args(["resume", &id, "next"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(64));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("loon: --cwd"),
+        "resume must not blame a flag the user did not pass, got: {err}"
+    );
+    assert!(
+        err.contains(&gone.display().to_string()),
+        "it should name the missing directory, got: {err}"
+    );
+
+    // An explicit bad --cwd still reports the flag, because there the user did pass it.
+    let explicit = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "--cwd", "/nope-not-here", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(explicit.status.code(), Some(64));
+    assert!(String::from_utf8_lossy(&explicit.stderr).contains("--cwd"));
+}

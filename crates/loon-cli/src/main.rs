@@ -266,11 +266,29 @@ async fn run_session(
     if let Some(m) = model {
         cfg.session.model = m.clone();
     }
+    // Resuming runs tools in the directory the session was started in, not wherever
+    // the user happened to type `loom`: the prompt, memory and file tools must agree
+    // about one workspace. An explicit --cwd still wins.
+    let resumed_cwd = match session {
+        Some(id) => loon_core::Agent::session_cwd(&paths, id),
+        None => None,
+    };
+    let from_session = resumed_cwd.is_some();
     let workspace = cwd
         .clone()
+        .or(resumed_cwd)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     if !workspace.is_dir() {
-        eprintln!("loon: --cwd {} is not a directory", workspace.display());
+        // Name the real source: on `resume` the directory comes from the session, so
+        // blaming a `--cwd` flag the user never typed sends them looking for one.
+        if cwd.is_none() && from_session {
+            eprintln!(
+                "loon: the session's working directory {} no longer exists (pass --cwd to override)",
+                workspace.display()
+            );
+        } else {
+            eprintln!("loon: --cwd {} is not a directory", workspace.display());
+        }
         return 64;
     }
 

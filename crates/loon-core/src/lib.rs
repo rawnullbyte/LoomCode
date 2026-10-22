@@ -882,6 +882,18 @@ impl Agent {
     }
 
     /// Rebuild an agent over an existing session (resume). Replays journal into history.
+    /// The working directory a session was started in, as recorded by its
+    /// `SessionStarted` event. Resuming must run tools in that directory, not in
+    /// whichever directory the user happens to invoke `loom` from.
+    pub fn session_cwd(paths: &LoonPaths, session_id: loon_events::EvId) -> Option<PathBuf> {
+        let store = open_store(paths).ok()?;
+        let (_, events) = Journal::open_default(&store, &paths.sessions_dir(), session_id).ok()?;
+        events.iter().rev().find_map(|ev| match &ev.kind {
+            EventKind::SessionStarted { cwd, .. } if !cwd.is_empty() => Some(PathBuf::from(cwd)),
+            _ => None,
+        })
+    }
+
     pub fn resume(
         paths: &LoonPaths,
         session_id: loon_events::EvId,
