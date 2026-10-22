@@ -540,19 +540,22 @@ impl Agent {
             headless,
         };
         let store = open_store(paths)?;
-        let journal = Arc::new(Journal::create_default(&store, &meta)?);
+        // The session exists only in memory until its first write: no row, no events.
+        // Opening the app and quitting without sending anything therefore leaves
+        // nothing behind in `/resume` or `loom sessions list`.
+        let journal = Arc::new(Journal::create_pending(
+            &store,
+            &meta,
+            Some(EventKind::SessionStarted {
+                cwd: cwd.display().to_string(),
+                model: cfg.model_ref.clone(),
+                headless,
+            }),
+        ));
         let system = prompt::system_prompt_with_memory(
             &cwd,
             &memory::MemoryPaths::resolve(&paths.data_dir, &cwd),
         );
-        journal.append(
-            None,
-            EventKind::SessionStarted {
-                cwd: cwd.display().to_string(),
-                model: cfg.model_ref.clone(),
-                headless,
-            },
-        )?;
         Agent::assemble(
             paths,
             cfg,
@@ -568,6 +571,12 @@ impl Agent {
 
     pub fn session_id(&self) -> loon_events::EvId {
         self.session_id
+    }
+
+    /// True while this session exists only in memory; the first append, rename or resume
+    /// materializes it into the store.
+    pub fn is_pending(&self) -> bool {
+        self.journal.is_pending()
     }
 
     pub fn cancel(&self) {

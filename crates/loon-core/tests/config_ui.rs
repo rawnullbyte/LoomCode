@@ -445,6 +445,21 @@ async fn session_controls_are_editable_in_settings_and_persist_with_the_session(
     assert!(a
         .config_apply("supervisor_model", "missing/not-a-model")
         .is_err());
+    // Settings must not resurrect an empty session: nothing sent yet, so the store
+    // still has no trace of it.
+    let store = loon_core::open_store(&paths).unwrap();
+    assert!(
+        store.list_sessions().unwrap().is_empty(),
+        "settings on a message-less session must not create a session row"
+    );
+    // A real user action afterwards materializes it (/btw journals a user message
+    // without a model turn), and only then can a fresh agent resume it and read the
+    // persisted settings back.
+    a.run_slash(SlashCommand::Btw {
+        text: "settings should survive".into(),
+    })
+    .await
+    .unwrap();
     let resumed = Agent::resume(
         &paths,
         a.session_id(),

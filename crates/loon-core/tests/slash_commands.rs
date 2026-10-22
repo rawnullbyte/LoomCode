@@ -320,3 +320,53 @@ fn clear_is_an_alias_for_new() {
         .iter()
         .any(|(name, _)| *name == "clear"));
 }
+
+/// Regression: `/new` (and `/clear`) must not persist a session until the user actually
+/// says something, and `/resume` must not be polluted with empty sessions.
+#[tokio::test]
+async fn new_and_clear_do_not_persist_an_empty_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut a = agent(tmp.path(), &ws);
+
+    // Fresh session: nothing written.
+    let store = loon_core::open_store(&loon_config::LoonPaths {
+        config_dir: tmp.path().join("config"),
+        data_dir: tmp.path().join("data"),
+        state_dir: tmp.path().join("state"),
+        cache_dir: tmp.path().join("cache"),
+        runtime_dir: tmp.path().join("runtime"),
+    })
+    .unwrap();
+    assert!(store.list_sessions().unwrap().is_empty());
+
+    // /new twice: still nothing to resume.
+    for _ in 0..2 {
+        a.run_slash(SlashCommand::New).await.unwrap();
+    }
+    assert!(
+        store.list_sessions().unwrap().is_empty(),
+        "switching sessions without a message must not create sessions"
+    );
+    let out = a
+        .run_slash(SlashCommand::Resume { target: None })
+        .await
+        .unwrap();
+    assert_eq!(out.trim(), "no sessions yet", "resume list must stay empty");
+
+    // Sending one message creates exactly one session, titled from the message.
+    let r = a.run_turn("only real message").await;
+    assert!(matches!(r.status, loon_core::TurnStatus::Completed));
+    let listed = store.list_sessions().unwrap();
+    assert_eq!(listed.len(), 1, "exactly one session after one message");
+    assert_eq!(listed[0].title, "only real message");
+
+    // /new again, then quit: the one real session is untouched and no empty one appears.
+    a.run_slash(SlashCommand::New).await.unwrap();
+    assert_eq!(
+        store.list_sessions().unwrap().len(),
+        1,
+        "a new empty session must not be persisted"
+    );
+}

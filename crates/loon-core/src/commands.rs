@@ -955,6 +955,16 @@ impl Agent {
             SlashCommand::Resume { target } => {
                 let paths = self.loon_paths();
                 let store = crate::open_store(&paths).map_err(|e| e.to_string())?;
+                // This session may still be pending (nothing sent yet). Asking to resume
+                // the session you are already in must succeed rather than reporting
+                // "no sessions yet" — but it must not force it to be written either.
+                if target.as_deref() == Some(&self.session_id().to_string()[..8])
+                    || target
+                        .as_deref()
+                        .is_some_and(|t| self.session_id().to_string().starts_with(t))
+                {
+                    return Ok(format!("resumed session {}", self.session_id()));
+                }
                 let sessions = store.list_sessions().map_err(|e| e.to_string())?;
                 if sessions.is_empty() {
                     return Ok("no sessions yet".into());

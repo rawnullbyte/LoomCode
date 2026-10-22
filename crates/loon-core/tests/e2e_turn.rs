@@ -325,3 +325,110 @@ async fn tool_argument_validation_rejects_bad_calls() {
         events.iter().map(|e| e.summary()).collect::<Vec<_>>()
     );
 }
+
+/// Regression: opening a session and leaving without sending anything must not leave an
+/// empty session behind in the store (that is what `/resume` and `loom sessions list`
+/// enumerate). The session is materialized by the first real message instead.
+#[tokio::test]
+async fn opening_a_session_without_a_message_persists_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::new().into(),
+    ));
+    let agent = Agent::new_session(
+        &paths,
+        agent_cfg("mock"),
+        registry,
+        ToolRegistry::standard(),
+        ws.clone(),
+        false,
+    )
+    .unwrap();
+    let id = agent.session_id();
+
+    let store = loon_core::open_store(&paths).unwrap();
+    assert!(
+        store.list_sessions().unwrap().is_empty(),
+        "no session may be listed before the first message"
+    );
+    assert!(
+        store.session_meta(id).unwrap().is_none(),
+        "the session row must not exist yet"
+    );
+    assert!(
+        agent.journal.is_pending(),
+        "the journal must still be pending (unwritten)"
+    );
+    assert!(
+        agent.journal.events().unwrap().is_empty(),
+        "a lazy session has no events"
+    );
+    drop(agent);
+
+    // A fresh store handle still sees nothing (nothing was written at any point).
+    let store2 = loon_core::open_store(&paths).unwrap();
+    assert!(store2.list_sessions().unwrap().is_empty());
+    assert!(store2.events(id).unwrap().is_empty());
+}
+
+/// The first user message is what creates the session, and the journal still begins with
+/// exactly one SessionStarted header so replays keep working.
+#[tokio::test]
+async fn first_message_materializes_the_session_with_a_started_header() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![MockScript::text("hello")]),
+    ));
+    let mut agent = Agent::new_session(
+        &paths,
+        agent_cfg("mock"),
+        registry,
+        ToolRegistry::standard(),
+        ws,
+        false,
+    )
+    .unwrap();
+    let id = agent.session_id();
+    assert!(agent.journal.is_pending());
+
+    let result = agent.run_turn("first real message").await;
+    assert!(matches!(result.status, loon_core::TurnStatus::Completed));
+    assert!(
+        !agent.journal.is_pending(),
+        "the first message must materialize the session"
+    );
+
+    let store = loon_core::open_store(&paths).unwrap();
+    let listed = store.list_sessions().unwrap();
+    assert_eq!(listed.len(), 1, "exactly one session after one message");
+    assert_eq!(listed[0].id, id);
+    assert_eq!(listed[0].title, "first real message");
+
+    let events = store.events(id).unwrap();
+    let started = events
+        .iter()
+        .filter(|e| matches!(e.kind, EventKind::SessionStarted { .. }))
+        .count();
+    assert_eq!(started, 1, "exactly one SessionStarted header");
+    assert!(
+        matches!(events[0].kind, EventKind::SessionStarted { .. }),
+        "the header must be the first event, got {:?}",
+        events[0].kind
+    );
+    assert!(
+        events.iter().any(
+            |e| matches!(&e.kind, EventKind::UserMessage { text } if text == "first real message")
+        ),
+        "the message must be journaled"
+    );
+}
