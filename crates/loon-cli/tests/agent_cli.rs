@@ -597,3 +597,75 @@ fn output_json_is_one_parseable_document() {
         "the whole output must parse as one JSON value, got: {text}"
     );
 }
+
+/// `json` and `jsonl` describe the same turn in different framings, so a consumer
+/// must be able to map one onto the other. Both are captured from the *same* session
+/// via `resume`, so the comparison is about framing, not about two separate runs.
+#[test]
+fn json_and_jsonl_agree_about_the_same_turn() {
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    assert!(loom()
+        .args(["run", "seed"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let list = loom().args(["sessions", "list"]).output().unwrap();
+    let id = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().next().map(str::to_string))
+        .expect("one session exists");
+
+    let capture = |mode: &str| {
+        let out = loom()
+            .args(["resume", &id, "hello", "--output", mode])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&capture("json")).expect("json is one document");
+    let lines: Vec<serde_json::Value> = capture("jsonl")
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| serde_json::from_str(l).expect("every jsonl line parses"))
+        .collect();
+
+    let header = lines
+        .iter()
+        .find(|v| v["type"] == "session")
+        .expect("jsonl starts with a session header");
+    let turn = lines
+        .iter()
+        .find(|v| v["type"] == "turn")
+        .expect("jsonl ends with a turn record");
+
+    assert_eq!(
+        doc["session"]["session_id"], header["session_id"],
+        "both modes must name the same session"
+    );
+    assert_eq!(
+        doc["turn"]["status"], turn["status"],
+        "both modes must agree about how the turn ended"
+    );
+    assert_eq!(
+        doc["turn"]["assistant_text"], turn["assistant_text"],
+        "both modes must report the same answer"
+    );
+    assert!(
+        doc["events"].as_array().is_some_and(|e| !e.is_empty()),
+        "the document must carry the events, got: {doc}"
+    );
+}
