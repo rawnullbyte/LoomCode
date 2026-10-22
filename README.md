@@ -216,9 +216,10 @@ File mutations show **what changed**, not just that something happened: `edit`, 
 `multi_edit` and `write` append a bounded unified diff to their result, and the transcript
 colours it — removals red, additions green, hunk headers yellow, with `+N −M` as the summary
 for a collapsed run. The diff is clipped after 120 changed lines and says so rather than
-truncating silently; a rewrite that changes nothing produces no diff at all. The same
-colouring applies to a diff pasted into an assistant answer, and fenced code blocks render
-as code. One request-level `t/s` counter
+truncating silently; a rewrite that changes nothing produces no diff at all. Every stored
+diff line keeps its own row, so colouring stays per-line no matter how large the edit is.
+The same colouring applies to a diff pasted into an assistant answer, and fenced code blocks
+render as code. One request-level `t/s` counter
 covers thinking, writing and tool arguments together. `~` marks a character-based estimate
 until the provider reports total output/completion tokens. Reasoning tokens are not added
 again. The timer includes request latency, resets on each request/retry and freezes during

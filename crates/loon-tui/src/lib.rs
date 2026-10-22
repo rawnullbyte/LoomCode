@@ -626,9 +626,11 @@ impl App {
             .iter()
             .rposition(|b| matches!(b, Block::Tool { pending: true, name: n, .. } if n == name))
         {
-            // Keep enough of the result to show a real diff hunk; a three-line cap
-            // would cut every edit to a header and one line.
-            let first_lines: String = excerpt.lines().take(40).collect::<Vec<_>>().join(" ⏎ ");
+            // Keep the whole result: the diff module already bounds its own output
+            // (clipping with an explicit marker), so a second cap here would drop the
+            // tail of a large edit without saying so. The transcript renders excerpts
+            // line by line and the viewport scrolls, so length costs nothing.
+            let first_lines: String = excerpt.lines().collect::<Vec<_>>().join(" ⏎ ");
             let (detail, elapsed) = match &self.blocks[pos] {
                 Block::Tool {
                     detail, started, ..

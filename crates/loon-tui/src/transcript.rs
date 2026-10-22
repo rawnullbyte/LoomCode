@@ -269,7 +269,10 @@ fn push_colored_excerpt(
     let lines = clean(excerpt);
     let mut first = true;
     let mut in_code = false;
-    for para in lines.split('\n') {
+    // Stored excerpts join their lines with `⏎` (see `tool_finished`), so both that
+    // separator and a real newline end a line. Splitting only on newlines would turn a
+    // whole diff into one wrapped paragraph and lose its per-line colouring.
+    for para in lines.split('\n').flat_map(|l| l.split(" ⏎ ")) {
         let trimmed = para.trim_start();
         let fence = trimmed.starts_with("```");
         if fence {
@@ -1015,4 +1018,61 @@ mod diff_rendering_tests {
         );
         assert_eq!(style_of(&rows, "-gone"), Some(theme::tool_err_fg()));
     }
+}
+
+/// The tool result is re-joined with `⏎` for storage before the transcript renders it.
+/// A diff larger than that join's line budget would be cut silently, contradicting the
+/// documented behaviour that a large diff is clipped *with a marker*.
+#[test]
+fn a_large_diff_reaches_the_transcript_intact() {
+    // Build a 112-line diff: under the diff module's own 120-line budget, and over
+    // the old 40-line excerpt cap that used to cut every large edit in half.
+    let mut excerpt = String::from("edited a.rs\n--- a.rs\n+++ a.rs\n@@ -1,56 +1,56 @@\n");
+    for i in 0..56 {
+        excerpt.push_str(&format!("-old line {i}\n"));
+    }
+    for i in 0..56 {
+        excerpt.push_str(&format!("+new line {i}\n"));
+    }
+    let mut app = crate::tests::app_for_test();
+    app.blocks.clear();
+    app.show_tool_details = true;
+    // Feed it the way the agent does: a call starts (pending block), then finishes
+    // with its result. The finish path is where the excerpt is stored.
+    app.tool_started("edit", "{\"path\":\"a.rs\"}", "edit a.rs");
+    app.tool_finished("edit", true, &excerpt);
+    let rows = app.transcript_rows(100);
+    let rendered: String = rows
+        .iter()
+        .map(|r| {
+            r.line
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        rendered.contains("+new line 55"),
+        "the last added line must be visible, not silently dropped; got {} rows ending at: {:?}",
+        rows.len(),
+        rendered.lines().last()
+    );
+    assert!(
+        rendered.contains("-old line 0"),
+        "the first removed line must be visible"
+    );
+    // Each diff line must be its own row so it can carry its own colour.
+    let diff_rows = rows
+        .iter()
+        .filter(|r| {
+            let t: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+            t.trim_start().starts_with("+new line") || t.trim_start().starts_with("-old line")
+        })
+        .count();
+    assert!(
+        diff_rows >= 112,
+        "each diff line needs its own row, got {diff_rows} of 112"
+    );
 }
