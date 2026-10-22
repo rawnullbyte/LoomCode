@@ -134,6 +134,13 @@ rejects is re-asked with the rejected text and the reason it failed, up to three
 If no usable verdict arrives, the turn fails with the reason and the goal is recorded as
 unverified on the plan, so it stays visible instead of quietly dropping out of review. The
 same policy covers context compaction, which asks the model through the same path.
+
+A goal that declines its own verification — `/ultraloop do not verify the goal`, or any
+wording telling the supervisor to never stop — is treated as binding. The supervisor is told
+about it, and if it returns `completed` anyway the verdict is replaced with `continue` and the
+override is journaled, so the run does not stop on a review that ignored the instruction.
+The refusal is read from the goal text itself, so it survives `/resume` and a supervisor model
+swap. A plain status report such as "not done yet" is not a refusal.
 `/ultracode` sets maximum coding effort, and an optional task starts immediately. The
 supervisor never overrides cancellation or permission rules. Provider/network failures and
 unusable reviewer responses are reported as failures, never successful completion.
@@ -381,6 +388,7 @@ distinguished. The UI does not invent progress percentages.
 ## Copying and controls
 
 - **Enter** sends, **Shift+Enter** starts a new line, **Ctrl+Enter** cancels the running request and sends immediately. **Ctrl+Backspace** deletes the previous word. These need the terminal's progressive keyboard protocol; Loom enables it automatically when supported.
+- In the prompt, **Ctrl+Left/Right** moves by a word (the same boundaries Ctrl+Backspace deletes), **Shift+arrows** select text, and **Ctrl+Shift+arrows** select a word at a time. Typing or Backspace replaces the selection, and **Ctrl+C** copies it. Clicking anywhere in a multi-line prompt puts the caret on that line and column.
 - **Esc** twice stops the running turn immediately; a prompt typed while a turn runs is queued, and **Up** on an empty input pulls the newest queued prompt back for editing.
 - Drag a transcript selection to copy; the selected cells are highlighted with a grey background. **Ctrl+Y** copies the last assistant block directly from its source text.
 - Copy preserves source indentation/newlines and Unicode; visual wraps, prompt labels, ANSI escapes and the streaming caret are excluded. The selection uses a stable snapshot while output streams.

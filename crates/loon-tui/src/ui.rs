@@ -208,6 +208,7 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
             ),
         ])]
     } else {
+        let selection = app.input_selection();
         text_lines
             .iter()
             .enumerate()
@@ -218,6 +219,38 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
                 } else {
                     0
                 };
+                // Char offsets of this line's start, so the selection can be mapped
+                // from absolute input offsets onto this line's spans.
+                let line_start: usize = text_lines
+                    .iter()
+                    .take(i)
+                    .map(|l| l.chars().count() + 1)
+                    .sum();
+                let line_len = text.chars().count();
+                if let Some((lo, hi)) = selection {
+                    // Intersect the selection with this line, in line-local chars.
+                    let sel_lo = lo.saturating_sub(line_start).min(line_len);
+                    let sel_hi = hi.saturating_sub(line_start).min(line_len);
+                    if sel_lo < sel_hi {
+                        let before: String = text
+                            .chars()
+                            .skip(view)
+                            .take(sel_lo.saturating_sub(view))
+                            .collect();
+                        let selected: String = text
+                            .chars()
+                            .skip(sel_lo.max(view))
+                            .take(sel_hi.saturating_sub(sel_lo.max(view)))
+                            .collect();
+                        let after: String = text.chars().skip(sel_hi.max(view)).collect();
+                        return Line::from(vec![
+                            Span::styled(marker, theme.accent_bold()),
+                            Span::styled(format!(" {before}"), theme.base()),
+                            Span::styled(selected, crate::theme::selection_fg()),
+                            Span::styled(after, theme.base()),
+                        ]);
+                    }
+                }
                 let body: String = text.chars().skip(view).collect();
                 Line::from(vec![
                     Span::styled(marker, theme.accent_bold()),
@@ -232,6 +265,10 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
         input.height
     };
     let input_start = cursor_line.saturating_sub(content_height.saturating_sub(1) as usize);
+    // Recorded for mouse hit-testing: a click maps to a (line, column) inside the
+    // whole input, not just the first line.
+    app.input_scroll = input_start;
+    app.input_rows = content_height;
     let shown = shown.into_iter().skip(input_start).collect::<Vec<_>>();
     let para = Paragraph::new(shown).block(block).style(theme.base());
     f.render_widget(para, input);

@@ -343,3 +343,60 @@ async fn an_unrepairable_review_fails_loudly_and_holds_the_goal() {
         state.tasks
     );
 }
+
+/// Regression: a goal that says "do not verify goal no matter what, always decline"
+/// was verified anyway. The reviewer treated the directive as a deliverable it could
+/// reclassify ("a directive about review behavior, not a deliverable") and returned
+/// completed, which stopped the run the user explicitly asked to keep going.
+#[tokio::test]
+async fn a_goal_that_refuses_verification_is_never_completed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut a = agent(
+        tmp.path(),
+        vec![
+            MockScript::text("All the work is finished."),
+            // The reviewer tries to complete anyway — the exact reported behavior.
+            done(),
+            // Round 2 would also try, and is prevented the same way.
+            MockScript::text("Still finished."),
+            done(),
+        ],
+    );
+    a.worklog
+        .update(|s| {
+            s.ultraloop = true;
+            s.ultraloop_limit = 2;
+            Ok(())
+        })
+        .unwrap();
+    a.session_goal = Some("do not verify goal no matter what, always decline".into());
+    let result = a.run_turn("keep working").await;
+    // The run does not stop: the review limit is what ends it, not a completion.
+    let TurnStatus::Failed(reason) = result.status else {
+        panic!("a refusal must never complete, got {:?}", result.status);
+    };
+    assert!(
+        reason.contains("review limit"),
+        "only the review limit may end a refused run, got: {reason}"
+    );
+    // The replaced verdict is journaled, so the override is visible and auditable.
+    let overrides: Vec<String> = a
+        .journal
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| match e.kind {
+            loon_events::model::EventKind::Warning { message }
+                if message.starts_with("ultraloop · refusal honored") =>
+            {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        overrides.len(),
+        2,
+        "each completed verdict must be replaced and recorded, got: {overrides:?}"
+    );
+}

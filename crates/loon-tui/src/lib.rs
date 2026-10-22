@@ -142,7 +142,15 @@ pub struct App {
     pub popup_dismissed: bool,
     /// Text cursor position in the input line, as a char offset (0..=len).
     pub cursor: usize,
+    /// Keyboard anchor when Shift selects input text: the fixed end of the selection
+    /// while the cursor moves. `None` means no keyboard selection; typing, clicking
+    /// or any plain caret motion clears it.
+    pub input_anchor: Option<usize>,
     pub input_view_start: usize,
+    /// First input line drawn in the input box (vertical scroll), for click mapping.
+    pub input_scroll: usize,
+    /// Visible input content rows, for click mapping.
+    pub input_rows: u16,
     /// Popup/input geometry recorded by the last draw, for mouse hit-testing.
     pub popup_rect: Option<(u16, u16, u16)>, // (x, y, height) incl. border row
     pub input_rect: Option<(u16, u16)>, // (x, y) of the input text row
@@ -206,7 +214,10 @@ impl App {
             completion_selected: 0,
             popup_dismissed: false,
             cursor: 0,
+            input_anchor: None,
             input_view_start: 0,
+            input_scroll: 0,
+            input_rows: 0,
             popup_rect: None,
             input_rect: None,
             popup_window_start: 0,
@@ -300,10 +311,42 @@ impl App {
         }
     }
 
-    /// Input changed: popup returns, selection resets.
+    /// Input changed: popup returns, keyboard selection resets.
     pub fn input_changed(&mut self) {
         self.completion_selected = 0;
         self.popup_dismissed = false;
+        self.input_anchor = None;
+    }
+
+    /// Selected prompt text, if any: the span between the Shift anchor and the cursor
+    /// (either direction), normalised to (start, end).
+    pub fn input_selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.input_anchor?;
+        let (lo, hi) = if anchor <= self.cursor {
+            (anchor, self.cursor)
+        } else {
+            (self.cursor, anchor)
+        };
+        if lo == hi {
+            None
+        } else {
+            Some((lo, hi))
+        }
+    }
+
+    /// Move the caret, extending or clearing the Shift selection.
+    /// With Shift, the anchor stays where selection started; without, it clears.
+    pub fn move_cursor(&mut self, target: usize, extend: bool) {
+        let count = self.input.chars().count();
+        let target = target.min(count);
+        if extend {
+            if self.input_anchor.is_none() {
+                self.input_anchor = Some(self.cursor);
+            }
+        } else {
+            self.input_anchor = None;
+        }
+        self.cursor = target;
     }
 
     /// Commands matching the current input (popup contents), or empty when hidden.
@@ -1182,11 +1225,18 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
     }
     if key.code == KeyCode::Char('c')
         && key.modifiers.contains(KeyModifiers::CONTROL)
-        && app.selection.is_some()
+        && (app.selection.is_some() || app.input_selection().is_some())
     {
-        app.pending_copy = app.selection.map(|s| selected_text(app, s));
+        app.pending_copy = app.selection.map(|s| selected_text(app, s)).or_else(|| {
+            app.input_selection().map(|(lo, hi)| {
+                let from = app.cursor_byte_offset(lo);
+                let to = app.cursor_byte_offset(hi);
+                app.input[from..to].to_string()
+            })
+        });
         app.selection = None;
         app.selection_snapshot = None;
+        app.input_anchor = None;
         return;
     }
     // A pending approval is modal: y approves, n or Esc refuses, everything else is
@@ -1239,6 +1289,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             }
             app.input.clear();
             app.cursor = 0;
+            app.input_anchor = None;
             app.cancel_armed = false;
             if text.is_empty() {
                 let _ = cmd_tx.send(UiCommand::SendNow(String::new())).await;
@@ -1261,6 +1312,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             let text = app.input.trim().to_string();
             app.input.clear();
             app.cursor = 0;
+            app.input_anchor = None;
             if text.is_empty() {
                 return;
             }
@@ -1274,14 +1326,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
             if app.cursor > 0 {
-                let chars: Vec<char> = app.input.chars().collect();
-                let mut start = app.cursor;
-                while start > 0 && chars[start - 1].is_whitespace() && chars[start - 1] != '\n' {
-                    start -= 1;
-                }
-                while start > 0 && !chars[start - 1].is_whitespace() {
-                    start -= 1;
-                }
+                let start = word_left(&app.input, app.cursor);
                 let from = app.cursor_byte_offset(start);
                 let to = app.cursor_byte_offset(app.cursor);
                 app.input.replace_range(from..to, "");
@@ -1290,7 +1335,13 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             app.input_changed();
         }
         KeyCode::Backspace => {
-            if app.cursor > 0 {
+            // Backspace on a selection deletes the selection, not one more character.
+            if let Some((lo, hi)) = app.input_selection() {
+                let from = app.cursor_byte_offset(lo);
+                let to = app.cursor_byte_offset(hi);
+                app.input.replace_range(from..to, "");
+                app.cursor = lo;
+            } else if app.cursor > 0 {
                 let char_idx = app.cursor - 1;
                 let byte = app.cursor_byte_offset(char_idx);
                 let byte_end = app.cursor_byte_offset(char_idx + 1);
@@ -1299,19 +1350,36 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             }
             app.input_changed();
         }
+        // Arrow keys: plain moves one char, Ctrl moves a whole word (matching
+        // Ctrl+Backspace's word boundaries), Shift extends a selection. The three
+        // combine: Ctrl+Shift+Left selects the word to the left.
         KeyCode::Left => {
-            app.cursor = app.cursor.saturating_sub(1);
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+            let target = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                prev_word_start(&app.input, app.cursor)
+            } else {
+                app.cursor.saturating_sub(1)
+            };
+            app.move_cursor(target, extend);
         }
         KeyCode::Right => {
-            app.cursor = (app.cursor + 1).min(app.input.chars().count());
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+            let target = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                word_right(&app.input, app.cursor)
+            } else {
+                app.cursor + 1
+            };
+            app.move_cursor(target, extend);
         }
         KeyCode::Home => {
             let (line, _) = app.cursor_line_col();
-            app.cursor = app.offset_at(line, 0);
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+            app.move_cursor(app.offset_at(line, 0), extend);
         }
         KeyCode::End => {
             let (line, _) = app.cursor_line_col();
-            app.cursor = app.offset_at(line, usize::MAX);
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+            app.move_cursor(app.offset_at(line, usize::MAX), extend);
         }
         // single-line input: Up/Down jump to the ends (popup navigation keeps
         // priority when the popup is visible). Up on an empty input pulls the most
@@ -1328,15 +1396,24 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         }
         KeyCode::Up if app.completion_count() == 0 && app.input.contains('\n') => {
             let (line, col) = app.cursor_line_col();
-            app.cursor = app.offset_at(line.saturating_sub(1), col);
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+            app.move_cursor(app.offset_at(line.saturating_sub(1), col), extend);
         }
         KeyCode::Down if app.completion_count() == 0 && app.input.contains('\n') => {
             let (line, col) = app.cursor_line_col();
             let last = app.input_lines().len().saturating_sub(1);
-            app.cursor = app.offset_at((line + 1).min(last), col);
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+            app.move_cursor(app.offset_at((line + 1).min(last), col), extend);
         }
-        KeyCode::Up if app.completion_count() == 0 => app.cursor = 0,
-        KeyCode::Down if app.completion_count() == 0 => app.cursor = app.input.chars().count(),
+        KeyCode::Up if app.completion_count() == 0 => {
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+            app.move_cursor(0, extend)
+        }
+        KeyCode::Down if app.completion_count() == 0 => {
+            let end = app.input.chars().count();
+            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
+            app.move_cursor(end, extend)
+        }
         KeyCode::PageUp => {
             app.scroll_from_bottom = Some(app.scroll_from_bottom.unwrap_or(0).saturating_add(10));
         }
@@ -1378,6 +1455,13 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Typing over a selection replaces it, as in any text field.
+            if let Some((lo, hi)) = app.input_selection() {
+                let from = app.cursor_byte_offset(lo);
+                let to = app.cursor_byte_offset(hi);
+                app.input.replace_range(from..to, "");
+                app.cursor = lo;
+            }
             let byte = app.cursor_byte_offset(app.cursor);
             app.input.insert(byte, c);
             app.cursor += 1;
@@ -1485,17 +1569,29 @@ fn handle_mouse(app: &mut App, m: crossterm::event::MouseEvent) -> Option<String
                 });
                 return None;
             }
-            // input row positions the text cursor
+            // input box positions the text cursor, on any visible line
             if let Some((ix, iy)) = app.input_rect {
-                if m.row == iy && m.column > ix {
-                    app.cursor = app.input_view_start
-                        + input_cell_to_cursor(
-                            &app.input
-                                .chars()
-                                .skip(app.input_view_start)
-                                .collect::<String>(),
-                            m.column.saturating_sub(ix + 2) as usize,
-                        );
+                let rows = app.input_rows.max(1);
+                if m.row >= iy && m.row < iy + rows {
+                    let line = app.input_scroll + (m.row - iy) as usize;
+                    let lines = app.input_lines();
+                    let text = lines.get(line)?;
+                    // Column offset: the prompt glyph plus one space sit left of the
+                    // text on the first line, two cells on continuation lines.
+                    let lead = 2u16;
+                    let cell = m.column.saturating_sub(ix + lead) as usize;
+                    // The cursor line may be scrolled horizontally; other lines are
+                    // drawn from their first column.
+                    let (cursor_line, _) = app.cursor_line_col();
+                    let view = if line == cursor_line {
+                        app.input_view_start
+                    } else {
+                        0
+                    };
+                    let col = view
+                        + input_cell_to_cursor(&text.chars().skip(view).collect::<String>(), cell);
+                    app.input_anchor = None;
+                    app.cursor = app.offset_at(line, col);
                 }
             }
             None
@@ -1564,6 +1660,54 @@ fn transcript_point(app: &App, column: u16, row: u16) -> Option<(usize, usize)> 
 fn selected_text(app: &App, sel: SelRange) -> String {
     let width = app.transcript_rect.map(|(_, _, w, _)| w).unwrap_or(80);
     transcript::copy(&app.transcript_rows(width), sel)
+}
+
+/// Start of the word before `cursor`, for Ctrl+Backspace.
+///
+/// Skips spaces backwards, then the word itself. A newline is a hard stop: deleting
+/// must never merge two lines silently.
+fn word_left(text: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut start = cursor.min(chars.len());
+    while start > 0 && chars[start - 1].is_whitespace() && chars[start - 1] != '\n' {
+        start -= 1;
+    }
+    while start > 0 && !chars[start - 1].is_whitespace() {
+        start -= 1;
+    }
+    start
+}
+
+/// Start of the word before `cursor` for Ctrl+Left: same boundaries as
+/// [`word_left`], but a line break is crossed instead of stopping, because moving the
+/// caret destroys nothing. Standing at the start of a line, Ctrl+Left therefore lands
+/// on the start of the previous line's last word rather than doing nothing.
+fn prev_word_start(text: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let start = word_left(text, cursor);
+    if start < cursor.min(chars.len()) || start == 0 {
+        return start;
+    }
+    // `word_left` could not move: a newline is immediately before the caret.
+    let mut at = start;
+    while at > 0 && chars[at - 1] == '\n' {
+        at -= 1;
+    }
+    word_left(text, at)
+}
+
+/// End of the word after `cursor`, for Ctrl+Right: skip the word being finished, then
+/// the whitespace after it, landing at the start of the next word.
+fn word_right(text: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = text.chars().collect();
+    let mut end = cursor.min(chars.len());
+    while end < chars.len() && !chars[end].is_whitespace() {
+        end += 1;
+    }
+    while end < chars.len() && chars[end].is_whitespace() {
+        end += 1;
+    }
+    end
 }
 
 fn input_cell_to_cursor(text: &str, col: usize) -> usize {
@@ -1732,5 +1876,221 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod prompt_editing_tests {
+    use super::*;
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    fn app_with(input: &str) -> App {
+        let mut app = super::tests::app_for_test();
+        app.input = input.to_string();
+        app.cursor = input.chars().count();
+        app
+    }
+
+    async fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        let (tx, _rx) = mpsc::channel(8);
+        handle_key(app, key(code, mods), &tx).await;
+    }
+
+    #[tokio::test]
+    async fn ctrl_arrows_jump_by_a_word() {
+        let mut app = app_with("alpha beta gamma");
+        press(&mut app, KeyCode::Left, KeyModifiers::CONTROL).await;
+        assert_eq!(app.cursor, 11, "Ctrl+Left jumps to the start of 'gamma'");
+        press(&mut app, KeyCode::Left, KeyModifiers::CONTROL).await;
+        assert_eq!(app.cursor, 6, "then to the start of 'beta'");
+        press(&mut app, KeyCode::Right, KeyModifiers::CONTROL).await;
+        assert_eq!(app.cursor, 11, "Ctrl+Right returns to the start of 'gamma'");
+        press(&mut app, KeyCode::Right, KeyModifiers::CONTROL).await;
+        assert_eq!(app.cursor, 16, "and to the end of the input");
+    }
+
+    #[tokio::test]
+    async fn word_motion_matches_ctrl_backspace_boundaries() {
+        // Within a line, what Ctrl+Left skips is exactly what Ctrl+Backspace deletes:
+        // both call `word_left`, so the two can never drift apart.
+        let mut app = app_with("alpha beta");
+        press(&mut app, KeyCode::Left, KeyModifiers::CONTROL).await;
+        assert_eq!(app.cursor, 6);
+        press(&mut app, KeyCode::Backspace, KeyModifiers::CONTROL).await;
+        assert_eq!(
+            app.input, "beta",
+            "deleted exactly the span the caret had skipped (word plus trailing space)"
+        );
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn ctrl_left_crosses_a_line_break_but_backspace_does_not() {
+        let mut app = app_with("first\nsecond");
+        press(&mut app, KeyCode::Left, KeyModifiers::CONTROL).await;
+        assert_eq!(app.cursor, 6, "stops at the start of the second line");
+        press(&mut app, KeyCode::Left, KeyModifiers::CONTROL).await;
+        assert_eq!(
+            app.cursor, 0,
+            "Ctrl+Left crosses the break and lands on the previous word"
+        );
+        // Ctrl+Backspace at the start of a line must not merge the two lines.
+        let mut app = app_with("first\nsecond");
+        app.cursor = 6;
+        press(&mut app, KeyCode::Backspace, KeyModifiers::CONTROL).await;
+        assert_eq!(
+            app.input, "first\nsecond",
+            "nothing to delete across a newline"
+        );
+        assert_eq!(app.cursor, 6);
+    }
+
+    #[tokio::test]
+    async fn shift_arrows_select_input_text() {
+        let mut app = app_with("hello world");
+        press(&mut app, KeyCode::Left, KeyModifiers::SHIFT).await;
+        assert_eq!(
+            app.input_selection(),
+            Some((10, 11)),
+            "one char selected to the left"
+        );
+        press(&mut app, KeyCode::Left, KeyModifiers::SHIFT).await;
+        assert_eq!(app.input_selection(), Some((9, 11)), "the anchor stays put");
+        press(&mut app, KeyCode::Right, KeyModifiers::SHIFT).await;
+        assert_eq!(app.input_selection(), Some((10, 11)), "shrinking works too");
+        // A plain arrow collapses the selection instead of extending it.
+        press(&mut app, KeyCode::Left, KeyModifiers::NONE).await;
+        assert_eq!(app.input_selection(), None);
+        assert_eq!(app.cursor, 9);
+    }
+
+    #[tokio::test]
+    async fn ctrl_shift_arrows_select_a_whole_word() {
+        let mut app = app_with("alpha beta");
+        press(
+            &mut app,
+            KeyCode::Left,
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        )
+        .await;
+        assert_eq!(app.input_selection(), Some((6, 10)), "selects 'beta'");
+    }
+
+    #[tokio::test]
+    async fn typing_and_backspace_replace_the_selection() {
+        // "alpha beta" with the caret at 10; two Shift+Lefts select "ta" (8..10).
+        let mut app = app_with("alpha beta");
+        press(&mut app, KeyCode::Left, KeyModifiers::SHIFT).await;
+        press(&mut app, KeyCode::Left, KeyModifiers::SHIFT).await;
+        assert_eq!(app.input_selection(), Some((8, 10)));
+        press(&mut app, KeyCode::Char('X'), KeyModifiers::NONE).await;
+        assert_eq!(app.input, "alpha beX", "the selection was replaced");
+        assert_eq!(app.cursor, 9);
+
+        let mut app = app_with("alpha beta");
+        press(&mut app, KeyCode::Left, KeyModifiers::SHIFT).await;
+        press(&mut app, KeyCode::Left, KeyModifiers::SHIFT).await;
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE).await;
+        assert_eq!(
+            app.input, "alpha be",
+            "backspace deleted only the selection"
+        );
+        assert_eq!(app.cursor, 8);
+    }
+
+    #[tokio::test]
+    async fn shift_selection_can_be_copied() {
+        let mut app = app_with("alpha beta");
+        press(
+            &mut app,
+            KeyCode::Left,
+            KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        )
+        .await;
+        press(&mut app, KeyCode::Char('c'), KeyModifiers::CONTROL).await;
+        assert_eq!(app.pending_copy.as_deref(), Some("beta"));
+        assert_eq!(app.input_selection(), None, "copy clears the highlight");
+        assert_eq!(app.input, "alpha beta", "copy does not modify the input");
+    }
+
+    #[tokio::test]
+    async fn shift_arrows_move_across_lines_in_a_multiline_prompt() {
+        let mut app = app_with("one\ntwo");
+        press(&mut app, KeyCode::Up, KeyModifiers::SHIFT).await;
+        assert_eq!(
+            app.cursor, 3,
+            "Shift+Up moves to the same column on the line above"
+        );
+        assert_eq!(
+            app.input_selection(),
+            Some((3, 7)),
+            "the selection spans the line break"
+        );
+    }
+
+    #[test]
+    fn clicking_any_input_line_places_the_cursor_there() {
+        // Regression: click-to-cursor only worked on the first line because the hit
+        // test compared against the single recorded row.
+        let mut app = super::tests::app_for_test();
+        app.input = "first\nsecond\nthird".into();
+        app.input_rect = Some((0, 10));
+        app.input_rows = 3;
+        app.input_scroll = 0;
+        // Click on the third visible row, two cells past the prompt and its space.
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 2 + 3,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click);
+        assert_eq!(
+            app.cursor,
+            app.offset_at(2, 3),
+            "the caret lands on the third line, third column"
+        );
+    }
+
+    #[test]
+    fn clicking_uses_the_input_scroll_offset() {
+        let mut app = super::tests::app_for_test();
+        app.input = "one\ntwo\nthree\nfour".into();
+        app.input_rect = Some((0, 5));
+        app.input_rows = 2;
+        // The box is scrolled down by two lines, so the top visible row is line 2.
+        app.input_scroll = 2;
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 2,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click);
+        assert_eq!(
+            app.cursor,
+            app.offset_at(2, 0),
+            "maps through the scroll offset"
+        );
+    }
+
+    #[test]
+    fn clicking_below_the_input_leaves_the_cursor_alone() {
+        let mut app = super::tests::app_for_test();
+        app.input = "one\ntwo".into();
+        app.cursor = 2;
+        app.input_rect = Some((0, 5));
+        app.input_rows = 2;
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 3,
+            row: 9,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, click);
+        assert_eq!(app.cursor, 2, "a click outside the box is not a caret move");
     }
 }
