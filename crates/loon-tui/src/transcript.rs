@@ -331,6 +331,12 @@ fn push_tool_excerpt(
             && !in_code
             && diff_style(para).is_none()
             && !metadata_line(trimmed);
+        // Lex the *whole* logical line once, then cut the styled pieces at the same
+        // display columns `wrap` uses. Tokenizing each visual row separately loses the
+        // state that crosses a break: the tail of a long comment was re-lexed as code,
+        // and a string split across rows lost its colour on the continuation.
+        let styled = as_code.then(|| crate::code::highlight(&display(para), lang));
+        let mut pieces = styled.into_iter().flatten().peekable();
         for (i, raw) in wrap(para, avail).into_iter().enumerate() {
             let lead = if first {
                 marker.clone()
@@ -340,12 +346,32 @@ fn push_tool_excerpt(
             first = false;
             let mut spans = vec![Span::styled(lead, style)];
             let text = display(&raw);
-            if as_code {
-                for (piece, piece_style) in crate::code::highlight(&text, lang) {
-                    spans.push(Span::styled(piece, piece_style));
+            match pieces.peek().is_some() {
+                // Take exactly as many cells as this row shows, continuing where the
+                // previous row stopped.
+                true => {
+                    let mut want = text.chars().count();
+                    while want > 0 {
+                        let Some((piece, piece_style)) = pieces.peek_mut() else {
+                            break;
+                        };
+                        let take = piece.chars().count().min(want);
+                        if take == 0 {
+                            pieces.next();
+                            continue;
+                        }
+                        let head: String = piece.chars().take(take).collect();
+                        let tail: String = piece.chars().skip(take).collect();
+                        spans.push(Span::styled(head, *piece_style));
+                        want -= take;
+                        if tail.is_empty() {
+                            pieces.next();
+                        } else {
+                            *piece = tail;
+                        }
+                    }
                 }
-            } else {
-                spans.push(Span::styled(text, body_style));
+                false => spans.push(Span::styled(text, body_style)),
             }
             rows.push(TranscriptRow {
                 line: Line::from(spans),
@@ -1336,5 +1362,69 @@ mod source_highlight_tests {
             styles_for(&rows, "+let a = 2;").contains(&theme::tool_ok_fg()),
             "additions stay green"
         );
+    }
+}
+
+#[cfg(test)]
+mod wrapped_code_tests {
+    use super::*;
+
+    /// Wrapping splits a logical line into visual rows, and each row is tokenized on its
+    /// own. A long comment therefore lost its colour on every continuation row: the tail
+    /// of `// a very long note ...` was re-lexed as code and its words could light up as
+    /// keywords. The whole logical line must be lexed once, then split.
+    #[test]
+    fn a_comment_that_wraps_stays_a_comment_on_every_row() {
+        let long = "// this comment is deliberately long so that it wraps across rows and the continuation mentioning fn must stay a comment";
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        app.show_tool_details = true;
+        app.push_block(crate::Block::Tool {
+            name: "read".into(),
+            ok: true,
+            excerpt: long.into(),
+            pending: false,
+            detail: "src/lib.rs".into(),
+            started: None,
+            elapsed: None,
+        });
+        let rows = app.transcript_rows(40);
+        // The excerpt rows are the ones carrying the six-space indent; the collapsed
+        // summary line above them is a different render and not what this test is about.
+        let comment_rows: Vec<&TranscriptRow> = rows
+            .iter()
+            .filter(|r| {
+                let t: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                t.starts_with("      ") && t.trim_start().starts_with("//")
+                    || (t.starts_with("      ")
+                        && !t.trim_start().is_empty()
+                        && !t.starts_with("      read"))
+            })
+            .filter(|r| {
+                let t: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                !t.contains("read src/lib.rs")
+            })
+            .collect();
+        assert!(
+            comment_rows.len() >= 2,
+            "the comment must actually wrap into excerpt rows, got {comment_rows:?}"
+        );
+        // `system_fg()` and `comment_style()` are both DarkGray, so colour alone cannot
+        // tell a preserved comment from a lost one. Use a keyword-bearing comment: if a
+        // continuation row is re-lexed as code, `fn` inside it turns magenta.
+        for row in comment_rows {
+            let text: String = row.line.spans.iter().map(|s| s.content.as_ref()).collect();
+            let body: Vec<&ratatui::text::Span> = row
+                .line
+                .spans
+                .iter()
+                .filter(|s| !s.content.trim().is_empty())
+                .collect();
+            assert!(
+                !body.iter().any(|s| s.style == crate::code::keyword_style()),
+                "a wrapped comment must not be re-lexed as code, row: {text:?} styles: {:?}",
+                body.iter().map(|s| s.style).collect::<Vec<_>>()
+            );
+        }
     }
 }
