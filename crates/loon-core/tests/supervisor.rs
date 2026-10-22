@@ -400,3 +400,51 @@ async fn a_goal_that_refuses_verification_is_never_completed() {
         "each completed verdict must be replaced and recorded, got: {overrides:?}"
     );
 }
+
+/// The refusal must hold for phrasings that never use the word "verify". Before the
+/// detection was widened, "stop reviewing, just keep going" was treated as an ordinary
+/// goal, the completed verdict stood, and the run stopped — the exact behavior the user
+/// asked to prevent, in different words.
+#[tokio::test]
+async fn a_refusal_without_the_word_verify_also_prevents_completion() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut a = agent(
+        tmp.path(),
+        vec![
+            MockScript::text("All the work is finished."),
+            done(),
+            MockScript::text("Still finished."),
+            done(),
+        ],
+    );
+    a.worklog
+        .update(|s| {
+            s.ultraloop = true;
+            s.ultraloop_limit = 2;
+            Ok(())
+        })
+        .unwrap();
+    a.session_goal = Some("stop reviewing, just keep going".into());
+    let result = a.run_turn("keep working").await;
+    let TurnStatus::Failed(reason) = result.status else {
+        panic!(
+            "a rephrased refusal must never complete, got {:?}",
+            result.status
+        );
+    };
+    assert!(
+        reason.contains("review limit"),
+        "only the review limit may end a refused run, got: {reason}"
+    );
+    let overrides = a
+        .journal
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            matches!(&e.kind, loon_events::model::EventKind::Warning { message }
+                if message.starts_with("ultraloop · refusal honored"))
+        })
+        .count();
+    assert_eq!(overrides, 2, "both completed verdicts must be replaced");
+}
