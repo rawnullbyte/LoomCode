@@ -335,7 +335,21 @@ fn push_tool_excerpt(
         // display columns `wrap` uses. Tokenizing each visual row separately loses the
         // state that crosses a break: the tail of a long comment was re-lexed as code,
         // and a string split across rows lost its colour on the continuation.
-        let styled = as_code.then(|| crate::code::highlight(&display(para), lang));
+        // The line-number gutter is metadata: highlight only the code after it, so a
+        // file of prose does not read as a column of yellow numbers.
+        let shown = display(para);
+        let (gutter, code_part) = match crate::code::split_gutter(&shown) {
+            Some((g, c)) => (g.to_string(), c.to_string()),
+            None => (String::new(), shown.clone()),
+        };
+        let styled = as_code.then(|| {
+            let mut pieces: Vec<crate::code::Piece> = Vec::new();
+            if !gutter.is_empty() {
+                pieces.push((gutter.clone(), body_style));
+            }
+            pieces.extend(crate::code::highlight(&code_part, lang));
+            pieces
+        });
         let mut pieces = styled.into_iter().flatten().peekable();
         for (i, raw) in wrap(para, avail).into_iter().enumerate() {
             let lead = if first {
@@ -1426,5 +1440,69 @@ mod wrapped_code_tests {
                 body.iter().map(|s| s.style).collect::<Vec<_>>()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod gutter_tests {
+
+    /// `read` prefixes each line with a right-aligned line number. Highlighting the
+    /// whole line styles those digits as numeric literals, so a file of prose looks
+    /// like it is full of yellow numbers — the gutter is metadata, not source.
+    #[test]
+    fn line_number_gutters_are_not_highlighted_as_numbers() {
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        app.show_tool_details = true;
+        app.push_block(crate::Block::Tool {
+            name: "read".into(),
+            ok: true,
+            excerpt: "     1\tpub fn answer() -> u32 {\n     2\t    42\n     3\t}".into(),
+            pending: false,
+            detail: "src/lib.rs".into(),
+            started: None,
+            elapsed: None,
+        });
+        let rows = app.transcript_rows(90);
+        let gutter_row = rows
+            .iter()
+            .find(|r| {
+                let t: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                t.contains("pub fn")
+            })
+            .expect("the code line must render");
+        let gutter_text: String = gutter_row
+            .line
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        // The leading line number must not be yellow.
+        let gutter_number_styled = gutter_row
+            .line
+            .spans
+            .iter()
+            .take_while(|s| !s.content.contains("pub"))
+            .any(|s| s.style == crate::code::number_style());
+        assert!(
+            !gutter_number_styled,
+            "the line-number gutter must not be styled as a numeric literal: {gutter_text:?}"
+        );
+        // ...but the real literal on the next line still is.
+        let literal_row = rows
+            .iter()
+            .find(|r| {
+                let t: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                t.contains("42")
+            })
+            .expect("the literal line must render");
+        assert!(
+            literal_row
+                .line
+                .spans
+                .iter()
+                .any(|s| s.style == crate::code::number_style()),
+            "a real numeric literal keeps its styling"
+        );
     }
 }

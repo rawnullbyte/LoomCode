@@ -160,6 +160,36 @@ pub fn plain_style() -> Style {
 /// One highlighted span: text plus its style.
 pub type Piece = (String, Style);
 
+/// Split a `read` result line into its line-number gutter and the code after it.
+///
+/// The tool emits `{:>6}\t{line}`, and `display` turns the tab into spaces, so a
+/// gutter looks like a run of spaces, a number, then spaces. Returning the two halves
+/// lets the caller highlight only the code: styling the gutter would paint every line
+/// number as a numeric literal.
+pub fn split_gutter(line: &str) -> Option<(&str, &str)> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    let digits_start = i;
+    while i < bytes.len() && bytes[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == digits_start {
+        return None;
+    }
+    // The number must be followed by whitespace, not by more code.
+    let mut gap = i;
+    while gap < bytes.len() && bytes[gap] == b' ' {
+        gap += 1;
+    }
+    if gap == i {
+        return None;
+    }
+    Some(line.split_at(gap))
+}
+
 /// Highlight a single line. Never fails, never panics, and always returns pieces whose
 /// concatenation equals `line` exactly — the transcript's copy/selection logic depends
 /// on that, so dropping or reordering characters would corrupt copied text.
@@ -362,6 +392,20 @@ mod tests {
         );
         let pieces = highlight("let n = 42;", Lang::Rust);
         assert!(pieces.iter().any(|(_, s)| *s == number_style()));
+    }
+
+    #[test]
+    fn a_read_gutter_is_separated_from_the_code() {
+        assert_eq!(
+            split_gutter("     1    pub fn answer()"),
+            Some(("     1    ", "pub fn answer()"))
+        );
+        // No gutter: a plain code line stays whole.
+        assert_eq!(split_gutter("pub fn answer()"), None);
+        // A number that is part of the code is not a gutter.
+        assert_eq!(split_gutter("42"), None);
+        // Digits followed immediately by code are not a gutter either.
+        assert_eq!(split_gutter("1foo"), None);
     }
 
     #[test]
