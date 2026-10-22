@@ -1843,6 +1843,29 @@ mod copy_alignment_tests {
         );
     }
 
+    /// A tab followed by a wide glyph is the worst case for cell math: the tab's
+    /// width depends on the running column, and the wide glyph occupies two cells
+    /// for one char. Copying must still return the painted characters exactly.
+    #[test]
+    fn copying_a_selection_over_a_tab_and_a_wide_glyph_is_exact() {
+        // "a" + tab(at col 1 → 3 spaces) + "日" (2 cells) + "z"
+        let raw = "a\t日z";
+        let painted = format!("a{}日z", " ".repeat(3));
+        let r = row(raw, Line::styled(painted.clone(), theme::system_fg()), 0);
+        // Cells: a=0, spaces=1..3, 日=4..5, z=6
+        let sel = crate::SelRange {
+            start_line: 0,
+            start_col: 4,
+            end_line: 0,
+            end_col: 7,
+        };
+        let copied = copy(&[r], sel);
+        assert_eq!(
+            copied, "日z",
+            "copying cells 4..7 of {painted:?} must yield the painted characters"
+        );
+    }
+
     /// A prefix (the `❯ ` marker or an indent) is not part of the selectable text.
     #[test]
     fn the_row_prefix_is_excluded_from_the_copy() {
