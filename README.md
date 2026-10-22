@@ -334,6 +334,10 @@ loom sessions delete ID --force        # no prompt (scripts)
 loom resume ID "next task"             # continue a saved session headlessly
 ```
 
+Every command that takes an `ID` accepts either the full id or any unique prefix of it, so
+the short ids printed by `sessions list` are directly usable. An ambiguous prefix lists the
+candidates instead of guessing, and an empty one is refused.
+
 Sessions are ordered by **last activity**, not by creation: the session you messaged five
 minutes ago is at the top, even if others were created after it. `sessions list` shows both
 `LAST USED` and `CREATED` so the order is self-explanatory. `/resume` in the TUI uses the

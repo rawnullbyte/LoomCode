@@ -634,9 +634,12 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
             0
         }
         SessionsCmd::Export { id } => {
-            let Ok(sid) = id.parse() else {
-                eprintln!("loon: `{id}` is not a session id (uuid)");
-                return 64;
+            // Accept a unique prefix here too: `resume` does, and a user who just
+            // copied an 8-char id out of `sessions list` should not be told it is
+            // not a session id.
+            let sid = match resolve_prefix(id) {
+                Ok(s) => s,
+                Err(code) => return code,
             };
             let store = match loon_core::open_store(&paths) {
                 Ok(s) => s,
@@ -647,7 +650,7 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
             };
             match loon_events::Journal::open_default(&store, &paths.sessions_dir(), sid) {
                 Ok((_, events)) => {
-                    println!("# Loon session {id}");
+                    println!("# Loon session {sid}");
                     println!();
                     for ev in &events {
                         println!("- `seq {}` {}", ev.seq, ev.summary().replace('\n', " "));
@@ -661,9 +664,9 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
             }
         }
         SessionsCmd::Delete { id, force } => {
-            let Ok(sid) = id.parse() else {
-                eprintln!("loon: `{id}` is not a session id (uuid)");
-                return 64;
+            let sid = match resolve_prefix(id) {
+                Ok(s) => s,
+                Err(code) => return code,
             };
             let store = match loon_core::open_store(&paths) {
                 Ok(s) => s,
@@ -706,7 +709,7 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
             }
             match store.delete_session(sid) {
                 Ok(()) => {
-                    println!("deleted session {}", id);
+                    println!("deleted session {sid}");
                     0
                 }
                 Err(e) => {

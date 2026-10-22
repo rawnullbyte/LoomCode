@@ -329,3 +329,65 @@ fn resume_usage_errors_name_resume_not_run() {
         "and run still names itself"
     );
 }
+
+/// Every session selector accepts a unique prefix: `resume` did, but `export` and
+/// `delete` used to reject a prefix with "is not a session id (uuid)", even though
+/// `sessions list` shows short ids. One resolver, one behaviour.
+#[test]
+fn export_and_delete_accept_a_unique_prefix() {
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    assert!(loom()
+        .args(["run", "seed"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let list = loom().args(["sessions", "list"]).output().unwrap();
+    let full = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().next().map(str::to_string))
+        .expect("one session exists");
+    let prefix = &full[..12];
+
+    let export = loom()
+        .args(["sessions", "export", prefix])
+        .output()
+        .unwrap();
+    assert_eq!(
+        export.status.code(),
+        Some(0),
+        "a unique prefix must resolve"
+    );
+    let out = String::from_utf8_lossy(&export.stdout);
+    assert!(
+        out.contains(&full),
+        "the export header should name the resolved session, got: {out}"
+    );
+
+    let delete = loom()
+        .args(["sessions", "delete", prefix, "--force"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        delete.status.code(),
+        Some(0),
+        "delete must accept a prefix too"
+    );
+    assert!(
+        String::from_utf8_lossy(&delete.stdout).contains(&full),
+        "and report the resolved session"
+    );
+    assert!(loom()
+        .args(["sessions", "export", prefix])
+        .output()
+        .unwrap()
+        .status
+        .code()
+        .is_some_and(|c| c != 0));
+}
