@@ -33,7 +33,7 @@ jobs:
       - name: Smoke test (offline, mock provider)
         run: |
           export LOON_HOME=$(mktemp -d)
-          ./target/release/loon doctor
-          ./target/release/loon run "smoke" --output jsonl | grep -q '"type":"turn"'
-          ./target/release/loon sessions list
-          ./target/release/loon config validate
+          ./target/release/loom doctor
+          ./target/release/loom run "smoke" --output jsonl | grep -q '"type":"turn"'
+          ./target/release/loom sessions list
+          ./target/release/loom config validate
