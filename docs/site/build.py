@@ -36,7 +36,7 @@ def project_version() -> str:
     return match.group(1) if match else "0.0.0"
 
 
-REPO_URL = "https://github.com/loomcode/loom"
+REPO_URL = "https://github.com/rawnullbyte/LoomCode"
 
 
 # ── Markdown ─────────────────────────────────────────────────────────────────
@@ -376,9 +376,6 @@ PAGES = [
     ("index.html", "Overview", None),
     ("guide.html", "Guide", "README.md"),
     ("harness.html", "Harness", "docs/HARNESS.md"),
-    ("architecture.html", "Architecture", "ARCHITECTURE.md"),
-    ("changelog.html", "Changelog", "CHANGELOG.md"),
-    ("validation.html", "Validation", "VALIDATION.md"),
 ]
 
 # Repository path -> generated page. Both directions are needed: documents link
@@ -386,9 +383,6 @@ PAGES = [
 LINK_MAP = {
     "README.md": "guide.html",
     "docs/HARNESS.md": "harness.html",
-    "ARCHITECTURE.md": "architecture.html",
-    "CHANGELOG.md": "changelog.html",
-    "VALIDATION.md": "validation.html",
     "LICENSE": f"{REPO_URL}/blob/main/LICENSE",
     "crates/loon-core/skills/": f"{REPO_URL}/tree/main/crates/loon-core/skills",
     "docs/site/assets/logo.svg": "assets/logo.svg",
@@ -463,7 +457,6 @@ def shell(*, title: str, description: str, current: str, body: str,
     <nav aria-label="Footer">
       <a href="guide.html">Guide</a>
       <a href="harness.html">Harness</a>
-      <a href="architecture.html">Architecture</a>
       <a href="{REPO_URL}" rel="noopener">GitHub</a>
     </nav>
   </div>

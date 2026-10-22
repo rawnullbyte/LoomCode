@@ -9,18 +9,12 @@ on:
     branches: [main]
     paths:
       - "README.md"
-      - "ARCHITECTURE.md"
-      - "CHANGELOG.md"
-      - "VALIDATION.md"
       - "docs/**"
       - "Cargo.toml"
       - ".github/workflows/docs.yml"
   pull_request:
     paths:
       - "README.md"
-      - "ARCHITECTURE.md"
-      - "CHANGELOG.md"
-      - "VALIDATION.md"
       - "docs/**"
       - "Cargo.toml"
       - ".github/workflows/docs.yml"

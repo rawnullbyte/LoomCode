@@ -1,0 +1,100 @@
+name: Release
+
+# Linux-only release build. Produces a stripped `loom` binary plus a tarball
+# with checksums, uploads them as workflow artifacts, and attaches the same
+# files to the GitHub Release when the run was triggered by a `v*` tag.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      upload_release:
+        description: "Attach the built artifacts to a release (requires a tag ref)"
+        type: boolean
+        default: false
+
+env:
+  CARGO_TERM_COLOR: never
+  TARGET: x86_64-unknown-linux-gnu
+  BINARY: loom
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    name: linux / x86_64
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ env.TARGET }}
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; pkgs=json.load(sys.stdin)["packages"]; print(next(p["version"] for p in pkgs if p["name"]=="loon-cli"))')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Building ${{ env.BINARY }} $version for ${{ env.TARGET }}"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ env.TARGET }}" -p loon-cli
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version='${{ steps.version.outputs.version }}'
+          name="${BINARY}-${version}-${{ env.TARGET }}"
+          stage="dist/${name}"
+          mkdir -p "$stage"
+          install -m 0755 "target/${{ env.TARGET }}/release/${BINARY}" "$stage/${BINARY}"
+          strip "$stage/${BINARY}"
+          cp LICENSE README.md "$stage/"
+          tar -C dist -czf "dist/${name}.tar.gz" "$name"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -lh dist
+
+      - name: Verify packaged binary
+        run: |
+          set -euo pipefail
+          work="$(mktemp -d)"
+          tar -xzf "dist/${{ steps.package.outputs.name }}.tar.gz" -C "$work"
+          bin="$work/${{ steps.package.outputs.name }}/${BINARY}"
+          export LOON_HOME="$(mktemp -d)"
+          "$bin" --version
+          "$bin" doctor
+          (cd dist && sha256sum --check --strict *.sha256)
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.upload_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "Loom $tag" --generate-notes
+          gh release upload "$tag" dist/*.tar.gz dist/*.sha256 --clobber

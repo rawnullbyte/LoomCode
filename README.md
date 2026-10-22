@@ -9,16 +9,14 @@
 Any [OI]-compatible endpoint · durable plans · an independent completion supervisor ·
 an append-only journal you can replay
 
-[![CI](https://github.com/loomcode/loom/actions/workflows/ci.yml/badge.svg)](https://github.com/loomcode/loom/actions/workflows/ci.yml)
-[![docs](https://img.shields.io/badge/docs-loomcode.github.io-5bdac8)](https://loomcode.github.io/loom/)
+[![CI](https://github.com/rawnullbyte/LoomCode/actions/workflows/ci.yml/badge.svg)](https://github.com/rawnullbyte/LoomCode/actions/workflows/ci.yml)
+[![docs](https://img.shields.io/badge/docs-rawnullbyte.github.io-5bdac8)](https://rawnullbyte.github.io/LoomCode/)
 [![license](https://img.shields.io/badge/license-MIT-78bce1)](LICENSE)
 [![rust](https://img.shields.io/badge/rust-1.75%2B-bc9bf6)](Cargo.toml)
 
-[Documentation](https://loomcode.github.io/loom/) ·
+[Documentation](https://rawnullbyte.github.io/LoomCode/) ·
 [Guide](#quickstart) ·
-[Harness reference](docs/HARNESS.md) ·
-[Architecture](ARCHITECTURE.md) ·
-[Changelog](CHANGELOG.md)
+[Harness reference](docs/HARNESS.md)
 
 </div>
 
@@ -382,18 +380,15 @@ reasoning wire formats, live combo switching and rotation, plan/note resume, fai
 compaction, concurrent tool replay, streamed-text backpressure, immediate follow-up prompts,
 cancellation after resume, small-terminal modals, secret masking and
 Unicode/indentation-preserving copying. They do not use live paid-provider credentials.
-See [VALIDATION.md](VALIDATION.md) for the current evidence and explicit boundaries.
 
 `LOON_HOME=/path` keeps config/data/state isolated. Existing config and session paths are
-retained. See [ARCHITECTURE.md](ARCHITECTURE.md) for the underlying crates and journal
-design.
+retained.
 
 ## Documentation site
 
 The documentation in this repository *is* the website. `docs/site/build.py` renders the
-Markdown you are reading, plus [ARCHITECTURE.md](ARCHITECTURE.md),
-[docs/HARNESS.md](docs/HARNESS.md), [CHANGELOG.md](CHANGELOG.md) and
-[VALIDATION.md](VALIDATION.md), into a static site with no third-party dependencies. The
+Markdown you are reading, plus [docs/HARNESS.md](docs/HARNESS.md), into a static site with
+no third-party dependencies. The
 GitHub Actions workflow deploys it to Pages on every push to `main`.
 
 ```sh
