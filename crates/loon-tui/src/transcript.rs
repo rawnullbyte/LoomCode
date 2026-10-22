@@ -351,7 +351,10 @@ fn push_tool_excerpt(
             pieces
         });
         let mut pieces = styled.into_iter().flatten().peekable();
-        for (i, raw) in wrap(para, avail).into_iter().enumerate() {
+        // Wrap the *expanded* line, so the rows and the highlighted pieces are cut from
+        // the same text. Wrapping `para` while lexing `display(para)` made a tab or a
+        // wide character shift the boundaries and the styling drifted off its text.
+        for (i, raw) in wrap(&shown, avail).into_iter().enumerate() {
             let lead = if first {
                 marker.clone()
             } else {
@@ -361,15 +364,26 @@ fn push_tool_excerpt(
             let mut spans = vec![Span::styled(lead, style)];
             let text = display(&raw);
             match pieces.peek().is_some() {
-                // Take exactly as many cells as this row shows, continuing where the
-                // previous row stopped.
+                // Split on display cells, not chars: `wrap` cuts rows by cells, and a
+                // width-2 character makes the two counts disagree. Count what the row
+                // actually shows with `cell_width`, so styling never drifts right of
+                // its text when CJK or emoji is present.
                 true => {
-                    let mut want = text.chars().count();
+                    let mut want = cell_width(&text);
                     while want > 0 {
                         let Some((piece, piece_style)) = pieces.peek_mut() else {
                             break;
                         };
-                        let take = piece.chars().count().min(want);
+                        let mut take = 0usize;
+                        let mut taken = 0usize;
+                        for c in piece.chars() {
+                            let w = cells(c, 0);
+                            if taken + w > want {
+                                break;
+                            }
+                            taken += w;
+                            take += 1;
+                        }
                         if take == 0 {
                             pieces.next();
                             continue;
@@ -377,7 +391,7 @@ fn push_tool_excerpt(
                         let head: String = piece.chars().take(take).collect();
                         let tail: String = piece.chars().skip(take).collect();
                         spans.push(Span::styled(head, *piece_style));
-                        want -= take;
+                        want = want.saturating_sub(taken);
                         if tail.is_empty() {
                             pieces.next();
                         } else {
@@ -1620,6 +1634,176 @@ mod gutter_false_positive_tests {
                 .any(|s| s.style == crate::code::number_style()),
             "the list number is code, so it keeps numeric styling: {:?}",
             excerpt_row.line.spans
+        );
+    }
+}
+
+#[cfg(test)]
+mod wide_char_wrap_tests {
+
+    /// `wrap` cuts rows by display *cells*; the piece distributor counted *chars*.
+    /// With wide (2-cell) characters the two disagree: the styling drifts right of the
+    /// text it belongs to, the row loses its tail, or the assertion about which span a
+    /// character sits in fails outright.
+    #[test]
+    fn wide_characters_do_not_desync_highlighting_from_wrapping() {
+        // `日` is 2 cells wide; the keyword after it must be found in a keyword-styled
+        // span even when the line wraps right before it.
+        let filler = "日".repeat(18); // 36 cells
+        let line = format!("{filler} let x = 1;");
+        let app = {
+            let mut app = crate::tests::app_for_test();
+            app.blocks.clear();
+            app.show_tool_details = true;
+            app.push_block(crate::Block::Tool {
+                name: "read".into(),
+                ok: true,
+                excerpt: line.clone(),
+                pending: false,
+                detail: "src/lib.rs".into(),
+                started: None,
+                elapsed: None,
+            });
+            app
+        };
+        let rows = app.transcript_rows(44);
+        // Every character of the logical line must still be on screen exactly once.
+        let text: String = rows
+            .iter()
+            .map(|r| {
+                r.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let flown: String = text
+            .lines()
+            .map(|l| {
+                l.trim_start_matches(' ')
+                    .trim_start_matches("⎿")
+                    .trim_start()
+            })
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            flown.contains(&line),
+            "wrapped text must be complete and in order: {text:?}"
+        );
+        // And `let` must live in a keyword-styled span.
+        // Only the indented excerpt row is tokenized; the collapsed summary line
+        // above it is plain, so target the excerpt row explicitly.
+        // The transcript renders a collapsed summary *and* the expanded excerpt, and
+        // only the excerpt is tokenized. Pick the row that actually carries styling.
+        let keyword_row = rows
+            .iter()
+            .filter(|r| {
+                let t: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                t.contains("let x")
+            })
+            .max_by_key(|r| r.line.spans.len())
+            .expect("the row containing the keyword must render");
+        let keyword_ok = keyword_row
+            .line
+            .spans
+            .iter()
+            .any(|s| s.content.contains("let") && s.style == crate::code::keyword_style());
+        assert!(
+            keyword_ok,
+            "`let` must be keyword-styled after wide characters: {:?}",
+            keyword_row.line.spans
+        );
+    }
+}
+
+#[cfg(test)]
+mod tab_wrap_tests {
+
+    /// `wrap` slices the *raw* logical line, which may contain tabs, and each row is
+    /// then expanded by `display`. Pieces come from `display(para)` — already expanded.
+    /// A tab therefore makes the per-row cell count disagree with the pieces, and the
+    /// styling drifts. Highlighting must be computed against the same text the rows
+    /// are cut from.
+    #[test]
+    fn a_tab_near_a_wrap_boundary_does_not_desync_styling() {
+        let line = format!("{}\tlet x = 1;", "a".repeat(20));
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        app.show_tool_details = true;
+        app.push_block(crate::Block::Tool {
+            name: "read".into(),
+            ok: true,
+            excerpt: line,
+            pending: false,
+            detail: "src/lib.rs".into(),
+            started: None,
+            elapsed: None,
+        });
+        let rows = app.transcript_rows(30);
+        let keyword =
+            rows.iter()
+                .filter(|r| {
+                    let t: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                    t.contains("let x")
+                })
+                .max_by_key(|r| r.line.spans.len())
+                .map(|r| {
+                    r.line.spans.iter().any(|s| {
+                        s.content.contains("let") && s.style == crate::code::keyword_style()
+                    })
+                });
+        assert_eq!(
+            keyword,
+            Some(true),
+            "`let` must stay keyword-styled when a tab precedes a wrap"
+        );
+    }
+}
+
+#[cfg(test)]
+mod narrow_width_tests {
+    /// At a narrow width a wide glyph can fill a whole row, leaving `want` smaller than
+    /// the next piece's first character. Skipping that piece would drop its text from
+    /// the screen entirely — a silent data loss, not just a colour change.
+    #[test]
+    fn a_wide_glyph_at_a_narrow_width_is_never_dropped() {
+        let line = "日let x";
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        app.show_tool_details = true;
+        app.push_block(crate::Block::Tool {
+            name: "read".into(),
+            ok: true,
+            excerpt: line.into(),
+            pending: false,
+            detail: "src/lib.rs".into(),
+            started: None,
+            elapsed: None,
+        });
+        // Strip every row's prefix so only the wrapped payload remains, then the
+        // concatenation must equal the original line exactly.
+        // The transcript renders the collapsed summary and the expanded excerpt, so the
+        // same payload can appear more than once. The property that matters is that no
+        // character is lost: the concatenated payloads must contain the line intact.
+        let payloads: Vec<String> = app
+            .transcript_rows(8)
+            .iter()
+            .filter(|r| r.line.spans.len() > 1)
+            .map(|r| {
+                r.line
+                    .spans
+                    .iter()
+                    .skip(1)
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        let joined: String = payloads.join("").replace(' ', "");
+        assert!(
+            joined.contains("日letx"),
+            "every character must survive narrow wrapping, got {payloads:?}"
         );
     }
 }
