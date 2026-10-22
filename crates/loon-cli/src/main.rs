@@ -689,7 +689,11 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
                 return 1;
             };
             if !force {
-                let short = id.chars().take(8).collect::<String>();
+                // The prefix comes from the RESOLVED id, not the raw argument: the
+                // user may have typed anything that uniquely selects the session
+                // ("01a"), but the confirmation key is always the documented 8
+                // chars of the real id.
+                let short = sid.to_string().chars().take(8).collect::<String>();
                 eprintln!(
                     "delete session {short} ({} events) titled `{}`?",
                     store.events(sid).map(|e| e.len()).unwrap_or(0),

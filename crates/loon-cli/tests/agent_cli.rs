@@ -391,3 +391,57 @@ fn export_and_delete_accept_a_unique_prefix() {
         .code()
         .is_some_and(|c| c != 0));
 }
+
+/// The delete confirmation must ask for the documented 8-char prefix of the
+/// RESOLVED session — not echo the raw selector back. A 3-char prefix resolves
+/// fine, but the old code demanded `01a` and rejected the real prefix.
+#[test]
+fn delete_confirm_uses_the_resolved_ids_prefix_not_the_raw_argument() {
+    use std::io::Write as _;
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    assert!(loom()
+        .args(["run", "seed"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let list = loom().args(["sessions", "list"]).output().unwrap();
+    let full = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().next().map(str::to_string))
+        .expect("one session exists");
+    let tiny = full[..3].to_string();
+    let expected = full[..8].to_string();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["sessions", "delete", &tiny])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(format!("{expected}\n").as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "answering the documented 8-char prefix {expected} must confirm, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = loom().args(["sessions", "list"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains("no sessions yet"),
+        "the session must actually be gone"
+    );
+}
