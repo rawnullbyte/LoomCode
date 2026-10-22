@@ -127,6 +127,13 @@ Reviews are unlimited by default (`limit 0`). Set a positive review limit to bou
 **Esc cancels the current turn**; `/ultraloop off` disables further reviews, including while
 a turn runs. `on` enables review for the next/current task. `model default` returns to the
 main model with a separate context. State survives `/resume`; `/new` starts fresh.
+
+A review that does not come back as a valid verdict is repaired rather than thrown away: a
+reply cut short by the output limit is re-asked with a larger budget, and a reply the parser
+rejects is re-asked with the rejected text and the reason it failed, up to three requests.
+If no usable verdict arrives, the turn fails with the reason and the goal is recorded as
+unverified on the plan, so it stays visible instead of quietly dropping out of review. The
+same policy covers context compaction, which asks the model through the same path.
 `/ultracode` sets maximum coding effort, and an optional task starts immediately. The
 supervisor never overrides cancellation or permission rules. Provider/network failures and
 unusable reviewer responses are reported as failures, never successful completion.
