@@ -66,6 +66,9 @@ impl MockScript {
 struct Inner {
     queue: VecDeque<MockScript>,
     fallback: Option<MockScript>,
+    /// Every request received, in order, so tests can assert what was actually sent
+    /// (a repair round must quote the rejected answer, for example).
+    received: Vec<crate::ChatRequest>,
 }
 
 #[derive(Default)]
@@ -97,6 +100,11 @@ impl MockProvider {
         self.inner.lock().expect("mock lock").fallback = Some(s);
     }
 
+    /// Requests this provider has received, oldest first.
+    pub fn requests(&self) -> Vec<crate::ChatRequest> {
+        self.inner.lock().expect("mock lock").received.clone()
+    }
+
     fn take_script(&self) -> MockScript {
         let mut inner = self.inner.lock().expect("mock lock");
         inner.queue.pop_front().unwrap_or_else(|| {
@@ -110,9 +118,15 @@ impl MockProvider {
     /// Stream the next scripted response as real provider events.
     pub async fn stream(
         &self,
-        _req: &crate::ChatRequest,
+        req: &crate::ChatRequest,
         tx: &mpsc::Sender<ProviderEvent>,
     ) -> Result<(), ProviderError> {
+        self.inner
+            .lock()
+            .expect("mock lock")
+            .received
+            .push(req.clone());
+        // Lock released before `take_script` takes it again (Mutex is not reentrant).
         let script = self.take_script();
         for step in script.steps {
             match step {

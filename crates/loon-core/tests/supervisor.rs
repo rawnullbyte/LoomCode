@@ -245,3 +245,101 @@ async fn supervisor_redirects_after_repeated_failed_tool_calls() {
         "fixed"
     );
 }
+
+/// Regression: a reviewer that answers in prose used to abort the turn with
+/// "supervisor returned no JSON object; the review is unusable" and leave the goal
+/// silently unverified. The review is now repaired by re-asking, so the goal is
+/// verified by the follow-up verdict instead of surfacing as an unusable review.
+#[tokio::test]
+async fn a_prose_review_is_repaired_instead_of_failing_the_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut a = agent(
+        tmp.path(),
+        vec![
+            MockScript::text("I created result.txt."),
+            // The reviewer answers in prose first (the reported failure)…
+            MockScript::text("Looks good to me, ship it."),
+            // …then complies after being shown the requirement.
+            done(),
+        ],
+    );
+    a.worklog
+        .update(|s| {
+            s.ultraloop = true;
+            Ok(())
+        })
+        .unwrap();
+    std::fs::write(tmp.path().join("result.txt"), "working").unwrap();
+    let result = a.run_turn("Create result.txt containing working").await;
+    assert_eq!(
+        result.status,
+        TurnStatus::Completed,
+        "a repairable review must not fail the turn"
+    );
+    // The repair is journaled, so the user can see the review needed a second ask.
+    let recorded: Vec<String> = a
+        .journal
+        .events()
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event.kind {
+            loon_events::model::EventKind::Warning { message }
+                if message.starts_with("ultraloop supervisor response (repaired") =>
+            {
+                Some(message)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "exactly one repaired review should be journaled, got: {recorded:?}"
+    );
+}
+
+/// A review that never becomes valid JSON still must not leave the goal silently
+/// unverified: the turn fails with a reason, and the durable plan carries the hold.
+#[tokio::test]
+async fn an_unrepairable_review_fails_loudly_and_holds_the_goal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut a = agent(
+        tmp.path(),
+        vec![
+            MockScript::text("I created result.txt."),
+            MockScript::text("prose one"),
+            MockScript::text("prose two"),
+            MockScript::text("prose three"),
+        ],
+    );
+    a.worklog
+        .update(|s| {
+            s.ultraloop = true;
+            Ok(())
+        })
+        .unwrap();
+    let result = a.run_turn("Create result.txt containing working").await;
+    let TurnStatus::Failed(reason) = result.status else {
+        panic!(
+            "an unusable review must fail the turn, got {:?}",
+            result.status
+        );
+    };
+    assert!(
+        reason.contains("supervisor review"),
+        "the failure must name the review, got: {reason}"
+    );
+    assert!(
+        reason.contains("no usable answer"),
+        "the failure must say the answer was never usable, got: {reason}"
+    );
+    let state = a.worklog.read().unwrap();
+    assert!(
+        state
+            .tasks
+            .iter()
+            .any(|t| t.subject.contains("stop review failed")),
+        "the goal must stay on the plan as unverified, got: {:?}",
+        state.tasks
+    );
+}

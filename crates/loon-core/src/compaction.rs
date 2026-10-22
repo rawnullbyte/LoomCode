@@ -12,11 +12,10 @@
 
 use crate::permissions::futures_future::BoxFuture;
 use crate::Agent;
-use loon_events::model::{EventKind, JournalMessage, JournalToolCall, RequestOutcome};
+use loon_events::model::{EventKind, JournalMessage, JournalToolCall};
 use loon_events::EvId;
-use loon_providers::{AttemptEvent, ChatMessage, ProviderEvent, ProviderRegistry, Role};
+use loon_providers::{ChatMessage, ProviderRegistry, Role};
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
 /// Compaction starts at this fraction of the context window.
 pub const COMPACT_THRESHOLD: f64 = 0.8;
@@ -217,92 +216,28 @@ pub fn chunk_transcript(transcript: &str, budget_chars: usize) -> Vec<String> {
     chunks
 }
 
-/// One no-tools request. Returns the answer, or a human-readable reason why there is
-/// none — the reason is what the user sees, so it names the actual failure instead of
-/// blaming an "empty summary".
+/// One no-tools request through the shared one-shot factory. Returns the answer, or a
+/// human-readable reason why there is none — the reason is what the user sees, so it
+/// names the actual failure instead of blaming an "empty summary".
 async fn ask_model(
     registry: Arc<ProviderRegistry>,
     model_ref: &str,
     instruction: &str,
     transcript: &str,
 ) -> Result<String, String> {
-    let req = loon_providers::ChatRequest {
-        model: model_ref.to_string(),
-        messages: vec![
-            ChatMessage::user(instruction),
-            ChatMessage::user(transcript),
-        ],
-        tools: vec![],
-        max_output_tokens: Some(8192),
-        temperature: None,
-        reasoning_effort: None,
-    };
-    let (tx, mut rx) = mpsc::channel::<AttemptEvent>(256);
-    let mut runner = loon_providers::ComboRunner::new(registry);
-    runner.max_retries = 1;
-    let mut handle = crate::supervisor::AbortTask(tokio::spawn(async move {
-        runner.run(&req.model, &req, tx).await
-    }));
-    let mut answer = String::new();
-    let mut reasoning_chars = 0usize;
-    while let Some(ev) = rx.recv().await {
-        match ev.event {
-            ProviderEvent::TextDelta { text } => answer.push_str(&text),
-            ProviderEvent::ReasoningDelta { text } => {
-                reasoning_chars += text.chars().count();
-            }
-            // A retried attempt restarts the answer: keep the last attempt only.
-            ProviderEvent::Retrying { .. } => {
-                answer.clear();
-                reasoning_chars = 0;
-            }
-            _ => {}
-        }
-    }
-    let outcome = match (&mut handle.0).await {
-        Ok(Ok(outcome)) => outcome,
-        Ok(Err(error)) => return Err(format!("request could not run: {error}")),
-        Err(error) => return Err(format!("request task failed: {error}")),
-    };
-    let served = outcome
-        .served
-        .as_ref()
-        .map(|m| format!("{}/{}", m.provider_id, m.model_id))
-        .unwrap_or_else(|| model_ref.to_string());
-    let trail = if outcome.trail.is_empty() {
-        String::new()
-    } else {
-        let reasons = outcome
-            .trail
-            .iter()
-            .map(|(member, reason)| format!("{member}: {reason}"))
-            .collect::<Vec<_>>()
-            .join("; ");
-        format!(" [skipped: {reasons}]")
-    };
-    match &outcome.outcome {
-        RequestOutcome::Completed { finish } => {
-            if answer.trim().is_empty() {
-                // Reasoning-only and truly-empty answers look alike on the wire but
-                // mean different things, so the message distinguishes them.
-                let reason = if reasoning_chars > 0 {
-                    format!(
-                        "{served} spent {reasoning_chars} chars on reasoning and returned \
-                         no answer text (finish: {finish})"
-                    )
-                } else {
-                    format!("{served} returned no answer text (finish: {finish})")
-                };
-                return Err(format!("{reason}{trail}"));
-            }
-            Ok(answer)
-        }
-        RequestOutcome::Errored { error, .. } => Err(format!("{served}: {error}{trail}")),
-        RequestOutcome::Cancelled => Err(format!("{served}: the request was cancelled")),
-        RequestOutcome::Unknown { reason } => Err(format!(
-            "{served}: the request ended without a result ({reason}){trail}"
-        )),
-    }
+    let answer = crate::oneshot::OneShot::new(registry)
+        .label("summarizer")
+        .retries(1)
+        .max_output_tokens(8192)
+        .request(
+            model_ref,
+            vec![
+                ChatMessage::user(instruction),
+                ChatMessage::user(transcript),
+            ],
+        )
+        .await?;
+    Ok(answer.text)
 }
 
 /// Default summarizer: no-tools model calls over the transcript, chunked to the serving

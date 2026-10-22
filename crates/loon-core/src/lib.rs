@@ -17,6 +17,7 @@ pub mod loops;
 pub mod mcp;
 mod mcp_http;
 pub mod memory;
+pub mod oneshot;
 pub mod output;
 pub mod permissions;
 pub mod prompt;
@@ -1320,6 +1321,10 @@ impl Agent {
                 match self.supervise_stop(supervisor_rounds, turn_id).await {
                     Ok(true) => continue,
                     Err(e) => {
+                        // The turn ends, but the goal is not silently dropped: a review
+                        // that could not run leaves the goal explicitly unverified, and
+                        // the next turn is told to resume it rather than start over.
+                        self.hold_unverified_goal(&e).await;
                         status = TurnStatus::Failed(e);
                     }
                     Ok(false) => {}
@@ -1425,7 +1430,10 @@ impl Agent {
                             status = TurnStatus::Completed;
                             continue;
                         }
-                        Err(e) => status = TurnStatus::Failed(e),
+                        Err(e) => {
+                            self.hold_unverified_goal(&e).await;
+                            status = TurnStatus::Failed(e);
+                        }
                         Ok(false) => {}
                     }
                 }
