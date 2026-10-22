@@ -228,3 +228,59 @@ async fn context7_configuration_reports_presence_without_exposing_the_secret() {
     );
     assert_eq!(a.setting_value("context7_key_env"), "LOOM_DOCS_TOKEN");
 }
+
+/// `/sessions search` prints one hit per line. Titles stored before the one-line
+/// rule can contain newlines, so the listing must flatten them rather than let a
+/// single title forge extra hits.
+#[tokio::test]
+async fn sessions_search_flattens_a_stored_multiline_title() {
+    let d = tempfile::tempdir().unwrap();
+    let (paths, mut a) = agent(d.path(), vec![MockScript::text("done")]);
+    a.run_turn("find the parser bug").await;
+
+    // A legacy-style title, written straight into the journal.
+    let store = loon_core::open_store(&paths).unwrap();
+    let journal = loon_events::Journal::open_default(&store, &paths.sessions_dir(), a.session_id())
+        .unwrap()
+        .0;
+    journal.rename_session("legacy\nsecond line").unwrap();
+
+    let out = a
+        .run_slash(
+            loon_core::commands::parse("/sessions search parser")
+                .unwrap()
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !out.contains("second line\n"),
+        "a stored newline must not become its own line, got: {out:?}"
+    );
+    assert!(
+        out.contains("legacy second line"),
+        "the title should appear flattened, got: {out:?}"
+    );
+}
+
+/// `/find` prints one hit per line, so a multi-line message must be flattened
+/// into its hit rather than continuing onto the following lines.
+#[tokio::test]
+async fn search_flattens_a_multiline_message() {
+    let d = tempfile::tempdir().unwrap();
+    let (_, mut a) = agent(d.path(), vec![MockScript::text("done")]);
+    a.run_turn("first line\nsecond line parser").await;
+
+    let out = a
+        .run_slash(loon_core::commands::parse("/find parser").unwrap().unwrap())
+        .await
+        .unwrap();
+    assert!(
+        !out.contains("second line parser\n"),
+        "a multi-line message must not break the hit list, got: {out:?}"
+    );
+    assert!(
+        out.contains("first line second line parser"),
+        "the hit should be one flattened line, got: {out:?}"
+    );
+}

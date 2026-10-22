@@ -612,11 +612,15 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+/// One-line, length-bounded excerpt for list output. Flattening comes first: a
+/// multi-line message would otherwise continue onto following lines and forge
+/// extra hits in `/find` and `/sessions search`.
 fn truncate_prompt(p: &str, max: usize) -> String {
-    if p.chars().count() <= max {
-        p.to_string()
+    let flat = p.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
     } else {
-        p.chars().take(max).collect::<String>() + "…"
+        flat.chars().take(max).collect::<String>() + "…"
     }
 }
 
@@ -1292,7 +1296,9 @@ impl Agent {
                                 hits.push(format!(
                                     "  {} · {} · {}",
                                     &meta.id.to_string()[..8],
-                                    meta.title,
+                                    // A hit is one line: legacy titles may still hold
+                                    // newlines, which would forge extra results.
+                                    one_line_title(&meta.title),
                                     truncate_prompt(text.trim(), 60)
                                 ));
                                 break;
