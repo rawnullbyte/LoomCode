@@ -352,10 +352,21 @@ fn total_lines(lines: &[String]) -> Option<usize> {
 /// Counting is done on the raw excerpt (before the `⏎` join is split) so the numbers
 /// match what the tool actually reported.
 fn diff_stat(excerpt: &str) -> Option<String> {
+    let lines: Vec<String> = excerpt
+        .split('\n')
+        .flat_map(|l| l.split(" ⏎ "))
+        .map(|l| l.trim_start().to_string())
+        .collect();
+    // A hunk header is what makes a result a diff. Without one, leading `-`/`+` is
+    // ordinary text — markdown bullets, `git log` decoration, a directory listing —
+    // and reporting "+0 −3" for a file read is worse than reporting nothing.
+    let hunk = lines
+        .iter()
+        .position(|l| l.starts_with("@@") && l.contains("@@"));
+    let start = hunk?;
     let mut added = 0usize;
     let mut removed = 0usize;
-    for line in excerpt.split('\n').flat_map(|l| l.split(" ⏎ ")) {
-        let line = line.trim_start();
+    for line in &lines[start + 1..] {
         if line.starts_with("+++") || line.starts_with("---") {
             continue;
         }
@@ -994,6 +1005,33 @@ mod diff_rendering_tests {
         let excerpt = "edited a.rs\n--- a.rs\n+++ a.rs\n@@ -1,3 +1,3 @@\n-a\n-b\n+c\n";
         assert_eq!(diff_stat(excerpt), Some("+1 −2".into()));
         assert_eq!(diff_stat("read a.rs"), None, "non-diffs have no stat");
+    }
+
+    /// `diff_stat` decides whether a tool result is a diff at all, so a false positive
+    /// mislabels ordinary output: a bullet list or `git log` would show a bogus
+    /// "+0 −3" as the summary of a read.
+    #[test]
+    fn non_diff_output_is_not_mistaken_for_a_diff() {
+        // Markdown bullets from a read of a document.
+        assert_eq!(diff_stat("- one\n- two\n- three"), None);
+        // git log --oneline style output.
+        assert_eq!(diff_stat("+-- a commit subject\n-3 days ago"), None);
+        // A unified-diff header alone is not a change.
+        assert_eq!(diff_stat("--- a.rs\n+++ a.rs"), None);
+        // A directory listing with permissions-looking dashes.
+        assert_eq!(diff_stat("read a.rs\n- rw-r--r-- 1k"), None);
+    }
+
+    /// ...while a real diff (which always carries a hunk header) still counts.
+    #[test]
+    fn a_real_diff_is_still_counted() {
+        assert_eq!(
+            diff_stat("--- a.rs\n+++ a.rs\n@@ -1,1 +1,2 @@\n-a\n+b\n+c"),
+            Some("+2 −1".into())
+        );
+        // A headerless `-`/`+` block is not a diff: there is nothing to anchor it, and
+        // the real tools always emit the `@@` line.
+        assert_eq!(diff_stat("-a\n+b\n+c"), None);
     }
 
     #[test]
