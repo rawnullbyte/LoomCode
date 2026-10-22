@@ -29,6 +29,9 @@ pub enum MockStep {
     FailImmediate(ProviderError),
     /// Terminate without any completion event (dropped connection).
     Drop,
+    /// Pause before the next step, so a test can interrupt a turn deterministically
+    /// instead of racing a fast script to completion.
+    Delay(std::time::Duration),
 }
 
 impl MockStep {
@@ -130,6 +133,9 @@ impl MockProvider {
         let script = self.take_script();
         for step in script.steps {
             match step {
+                MockStep::Delay(d) => {
+                    tokio::time::sleep(d).await;
+                }
                 MockStep::Text(t) => {
                     let _ = tx.send(ProviderEvent::TextDelta { text: t }).await;
                 }

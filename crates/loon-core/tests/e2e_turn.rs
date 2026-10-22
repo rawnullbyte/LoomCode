@@ -601,3 +601,47 @@ async fn an_empty_prompt_creates_no_session() {
         );
     }
 }
+
+/// A cancelled turn reports `Cancelled` deterministically: the mock's `Delay` step
+/// holds the stream open long enough for cancellation to land mid-turn, without
+/// relying on real tool latency. Withholding the cancel makes the same script
+/// finish as `Completed`, so this distinguishes the two outcomes rather than
+/// racing a 20ms script.
+#[tokio::test]
+async fn cancellation_during_a_delayed_stream_is_cancelled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![MockScript::new(vec![
+            MockStep::Delay(std::time::Duration::from_secs(5)),
+            MockStep::Text("never".into()),
+        ])]),
+    ));
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let agent = Arc::new(tokio::sync::Mutex::new(
+        Agent::new_session(
+            &paths,
+            agent_cfg("mock"),
+            registry,
+            ToolRegistry::standard(),
+            ws.clone(),
+            true,
+        )
+        .unwrap(),
+    ));
+    let cancel_handle = agent.lock().await.cancel_handle();
+    let runner = {
+        let agent = agent.clone();
+        tokio::spawn(async move { agent.lock().await.run_turn("go").await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let _ = cancel_handle.send(true);
+    let result = runner.await.unwrap();
+    assert!(
+        matches!(result.status, loon_core::TurnStatus::Cancelled),
+        "cancelling during a delayed stream must be Cancelled, got {:?}",
+        result.status
+    );
+}
