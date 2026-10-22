@@ -961,6 +961,12 @@ impl Agent {
                 )
             }
             SlashCommand::Resume { target } => {
+                // An empty selector matches every id (`starts_with("")` is always true),
+                // so it would "resume" whichever session happens to be open. That is a
+                // usage error, not a selection.
+                if target.as_deref().is_some_and(|t| t.trim().is_empty()) {
+                    return Err("usage: /resume <number|id-prefix> (the selector is empty)".into());
+                }
                 let paths = self.loon_paths();
                 let store = crate::open_store(&paths).map_err(|e| e.to_string())?;
                 // This session may still be pending (nothing sent yet). Asking to resume
@@ -1286,7 +1292,10 @@ impl Agent {
                     Ok(format!("no sessions match `{query}`"))
                 } else {
                     Ok(format!(
-                        "{} session(s) matching `{query}` (newest first, /resume <n> to open):\n{}",
+                        // The hits are shown as id prefixes, not as a numbered list, and
+                        // `/resume <n>` indexes the *unfiltered* session list — pointing
+                        // at `<n>` here would send the user to a different session.
+                        "{} session(s) matching `{query}` (most recently used first, /resume <id-prefix> to open):\n{}",
                         hits.len(),
                         hits.join("\n")
                     ))

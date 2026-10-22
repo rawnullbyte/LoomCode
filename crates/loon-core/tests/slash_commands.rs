@@ -430,3 +430,40 @@ async fn delete_removes_saved_sessions_but_not_the_current_one() {
         .unwrap_err();
     assert!(err.contains("unknown or ambiguous"), "{err}");
 }
+
+/// `/resume ` with a blank argument parsed to `Some("")`, and every id starts with "",
+/// so it always matched the session already open — reporting "resumed" while ignoring
+/// what the user meant to select. A blank selector is a usage error.
+#[tokio::test]
+async fn resume_refuses_a_blank_selector_instead_of_matching_everything() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut a = agent(tmp.path(), &ws);
+
+    // A real second session exists, so "no sessions yet" cannot mask the bug.
+    let other = {
+        let mut b = agent(tmp.path(), &ws);
+        b.run_turn("second session").await;
+        b.session_id()
+    };
+    a.run_turn("first session").await;
+    let mine = a.session_id();
+
+    let out = a
+        .run_slash(SlashCommand::Resume {
+            target: Some(String::new()),
+        })
+        .await;
+    let err = out.expect_err("a blank selector must be refused");
+    assert!(
+        err.to_lowercase().contains("empty") || err.contains("usage"),
+        "the error must name the problem, got: {err}"
+    );
+    // It must not have switched to the other session.
+    assert_eq!(
+        a.session_id(),
+        mine,
+        "a blank selector must not resume {other}"
+    );
+}

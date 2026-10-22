@@ -479,6 +479,12 @@ async fn run_resume(cli: Cli) -> i32 {
 /// `/resume` and `/delete` pickers: an unknown id names itself, and an ambiguous
 /// prefix lists the candidates instead of guessing.
 fn resolve_prefix(want: &str) -> Result<loon_events::EvId, i32> {
+    // Every id starts with "", so an empty selector would "match" whichever session is
+    // first — or the only one. That is a guess, not a resolution.
+    if want.trim().is_empty() {
+        eprintln!("loon: the session id is empty; pass an id or a unique prefix");
+        return Err(64);
+    }
     let paths = LoonPaths::resolve();
     let store = match loon_core::open_store(&paths) {
         Ok(s) => s,

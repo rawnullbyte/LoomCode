@@ -214,7 +214,7 @@ impl Journal {
     }
 }
 
-/// List sessions across both backends, newest first, deduplicated by id.
+/// List sessions across both backends, most recently active first, deduplicated by id.
 pub fn list_all_sessions(store: &Arc<Store>, sessions_root: &Path) -> Result<Vec<SessionMeta>> {
     let mut out = store.list_sessions()?;
     for m in crate::journal::list_legacy_sessions(sessions_root)? {

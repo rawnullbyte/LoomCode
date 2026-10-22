@@ -243,3 +243,46 @@ fn resume_refuses_unknown_and_ambiguous_ids() {
         assert!(err.contains(ids[0]), "candidates are listed: {err}");
     }
 }
+
+/// An empty (or whitespace-only) prefix matches every session id, because every string
+/// starts with "". With exactly one session that silently resumed it — a wrong guess
+/// dressed up as a match. An empty selector must be refused, never resolved.
+#[test]
+fn resume_refuses_an_empty_selector() {
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    // Exactly one session: the dangerous case, where "" has a single "match".
+    assert!(loom()
+        .args(["run", "only session"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    for selector in ["", "   "] {
+        let out = loom().args(["resume", selector, "x"]).output().unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(64),
+            "an empty selector is a usage error, not a resume (selector {selector:?})"
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.contains("empty"),
+            "the error must name the problem, got: {err}"
+        );
+    }
+
+    // The session must be untouched: no phantom turn was run against it.
+    let list = loom().args(["sessions", "list"]).output().unwrap();
+    let text = String::from_utf8_lossy(&list.stdout);
+    assert_eq!(
+        text.lines().skip(1).count(),
+        1,
+        "still exactly one session: {text}"
+    );
+}

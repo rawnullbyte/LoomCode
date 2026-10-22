@@ -128,13 +128,21 @@ impl Store {
                 format!("session {} already exists", meta.id),
             )));
         }
+        // Write the activity stamp explicitly: a session with no events yet is "as
+        // active as" its creation time, and leaving the column at its default would
+        // make every reader depend on the `updated_ms > 0` fallback to sort it.
         conn.execute(
-            "INSERT INTO sessions(id, title, created_ms, cwd, schema_version, headless)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO sessions(id, title, created_ms, updated_ms, cwd, schema_version, headless)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 meta.id.to_string(),
                 meta.title,
                 meta.created_ms,
+                if meta.updated_ms > 0 {
+                    meta.updated_ms
+                } else {
+                    meta.created_ms
+                },
                 meta.cwd,
                 meta.schema_version,
                 meta.headless as i64
