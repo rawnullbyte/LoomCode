@@ -567,3 +567,33 @@ fn run_does_not_offer_a_palette_flag() {
         String::from_utf8_lossy(&rejected.stderr)
     );
 }
+
+/// `--output json` must be a JSON document a consumer can parse in one call.
+/// It used to emit exactly the same line-delimited stream as `jsonl`, so any
+/// `json.load`/`JSON.parse` on it failed with "extra data".
+#[test]
+fn output_json_is_one_parseable_document() {
+    let home = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "hello", "--output", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        text.trim_start().starts_with('{') && text.trim_end().ends_with('}'),
+        "a json document must be one object, got: {text}"
+    );
+    // The structural check: every line individually parsing is NOT enough — the
+    // whole payload has to parse as a single value.
+    let parsed: Result<serde_json::Value, _> = serde_json::from_str(&text);
+    assert!(
+        parsed.is_ok(),
+        "the whole output must parse as one JSON value, got: {text}"
+    );
+}

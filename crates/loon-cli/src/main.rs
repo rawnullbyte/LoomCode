@@ -370,11 +370,15 @@ async fn run_session(
         }
     }
     let mode = output.clone().unwrap_or_else(|| "text".into());
-    let jsonl = mode == "jsonl" || mode == "json";
-    if !jsonl && mode != "text" {
+    // Three distinct modes: text for humans, jsonl for streaming line by line, and
+    // json for one document a consumer can parse in a single call. `json` used to
+    // alias `jsonl`, so `json.load` on its output failed with "extra data".
+    if !matches!(mode.as_str(), "text" | "jsonl" | "json") {
         eprintln!("loon: --output must be text, jsonl, or json");
         return 64;
     }
+    let jsonl = mode == "jsonl";
+    let json = mode == "json";
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(1024);
     agent.set_event_sink(tx);
@@ -397,25 +401,31 @@ async fn run_session(
     }
     let printer = tokio::spawn(async move {
         let mut stdout = std::io::stdout();
+        let mut collected: Vec<serde_json::Value> = Vec::new();
         while let Some(ev) = rx.recv().await {
-            match (&ev, jsonl) {
-                (AgentEvent::TextDelta(t), false) => {
+            match (&ev, jsonl, json) {
+                (AgentEvent::TextDelta(t), false, false) => {
                     let _ = write!(stdout, "{t}");
                     let _ = stdout.flush();
                 }
-                (ev, true) => {
+                (ev, true, _) => {
                     let line = serde_json::json!({"v": 1, "type": event_type(ev), "data": ev});
                     let _ = writeln!(stdout, "{line}");
                 }
-                (AgentEvent::Warning(w), false) => {
+                // `json` collects: a single document is emitted once the turn ends.
+                (ev, false, true) => {
+                    collected.push(serde_json::json!({"type": event_type(ev), "data": ev}));
+                }
+                (AgentEvent::Warning(w), false, false) => {
                     let _ = writeln!(std::io::stderr(), "warning: {w}");
                 }
-                (AgentEvent::MemberNote(m), false) => {
+                (AgentEvent::MemberNote(m), false, false) => {
                     let _ = writeln!(std::io::stderr(), "{m}");
                 }
                 _ => {}
             }
         }
+        collected
     });
     let outcome = tokio::select! {
         result=&mut turn=>result,
@@ -428,8 +438,22 @@ async fn run_session(
             return 1;
         }
     };
-    let _ = printer.await;
-    if jsonl {
+    let collected = printer.await.unwrap_or_default();
+    if json {
+        // One document: the session header, every event in order, and the outcome.
+        let doc = serde_json::json!({
+            "v": 1,
+            "session": {"session_id": session_id.to_string(), "model": cfg.session.model},
+            "events": collected,
+            "turn": {
+                "status": status_name(&result.status),
+                "steps": result.steps,
+                "usage": result.usage,
+                "assistant_text": result.assistant_text,
+            },
+        });
+        println!("{doc}");
+    } else if jsonl {
         let mut stdout = std::io::stdout();
         let _ = writeln!(
             stdout,

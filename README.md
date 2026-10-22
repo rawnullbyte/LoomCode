@@ -408,6 +408,10 @@ Exit codes: 0 completed, 1 failed, 2 cancelled, 64 invalid usage/config. JSONL i
 thinking activity, tools, plan updates and turn lifecycle events. Token counts shown as
 estimates use a heuristic.
 
+`--output` has three distinct modes: `text` (default, for humans), `jsonl` (one event per
+line, for streaming), and `json` (a single document with `session`, `events` and `turn`, for
+a consumer that parses once). `json` is not line-delimited: `json.load` on it succeeds.
+
 The opening banner is a multi-line loom drawn in the transcript — a frame with warp threads
 and leaves falling through it — so it scrolls away as the conversation grows instead of
 occupying a fixed row. The status bar along the bottom leads with the colour-coded permission
