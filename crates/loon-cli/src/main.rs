@@ -76,6 +76,13 @@ enum SessionsCmd {
     List,
     /// Export a session as markdown.
     Export { id: String },
+    /// Delete a session and its journal. Requires --force or a matching confirmation.
+    Delete {
+        id: String,
+        /// Skip the confirmation prompt.
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -500,6 +507,61 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
                 }
                 Err(e) => {
                     eprintln!("loon: cannot open session: {e}");
+                    1
+                }
+            }
+        }
+        SessionsCmd::Delete { id, force } => {
+            let Ok(sid) = id.parse() else {
+                eprintln!("loon: `{id}` is not a session id (uuid)");
+                return 64;
+            };
+            let store = match loon_core::open_store(&paths) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("loon: store: {e}");
+                    return 1;
+                }
+            };
+            let Some(meta) = (match store.session_meta(sid) {
+                Ok(m) => m,
+                Err(e) => {
+                    eprintln!("loon: store: {e}");
+                    return 1;
+                }
+            }) else {
+                eprintln!(
+                    "loon: no session {} (it may have been deleted, or never had a message)",
+                    id
+                );
+                return 1;
+            };
+            if !force {
+                let short = id.chars().take(8).collect::<String>();
+                eprintln!(
+                    "delete session {short} ({} events) titled `{}`?",
+                    store.events(sid).map(|e| e.len()).unwrap_or(0),
+                    meta.title
+                );
+                eprint!("type the session id prefix to confirm: ");
+                use std::io::Write as _;
+                let _ = std::io::stderr().flush();
+                let mut answer = String::new();
+                if std::io::stdin().read_line(&mut answer).is_err() {
+                    return 1;
+                }
+                if answer.trim() != short {
+                    eprintln!("aborted");
+                    return 1;
+                }
+            }
+            match store.delete_session(sid) {
+                Ok(()) => {
+                    println!("deleted session {}", id);
+                    0
+                }
+                Err(e) => {
+                    eprintln!("loon: cannot delete session: {e}");
                     1
                 }
             }

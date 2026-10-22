@@ -86,7 +86,8 @@ impl Journal {
         )?)))
     }
 
-    /// Open a session from the store, falling back to the legacy layout.
+    /// Open a session from the store, falling back to the legacy layout. An id that
+    /// exists in neither backend is an error naming the id, not a file-system detail.
     pub fn open_default(
         store: &Arc<Store>,
         sessions_root: &Path,
@@ -101,6 +102,10 @@ impl Journal {
                 },
                 events,
             ));
+        }
+        let legacy = crate::journal::session_dir(sessions_root, id).join("session.json");
+        if !legacy.exists() {
+            return Err(crate::EventsError::SessionNotFound { id: id.to_string() });
         }
         let (fj, events) = FileJournal::open(sessions_root, id)?;
         Ok((Journal::Files(Arc::new(fj)), events))

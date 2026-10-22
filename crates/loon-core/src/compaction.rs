@@ -461,6 +461,7 @@ impl Agent {
             self.emit(crate::AgentEvent::Warning(reason.clone()));
             return CompactOutcome::Failed(reason);
         }
+        self.flush_worklog_if_durable();
         self.history = vec![ChatMessage::user(format!(
             "[Earlier conversation summary]\n{summary}"
         ))];

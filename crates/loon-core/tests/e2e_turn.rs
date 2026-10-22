@@ -432,3 +432,131 @@ async fn first_message_materializes_the_session_with_a_started_header() {
         "the message must be journaled"
     );
 }
+
+/// Regression: an unknown session id must be reported as such, not as a file-system
+/// error from the legacy-layout fallback (`io error: No such file or directory`).
+#[test]
+fn opening_an_unknown_session_reports_the_id_not_an_io_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let store = loon_core::open_store(&paths).unwrap();
+    let missing = loon_events::EvId::now_v7();
+    let err = match loon_events::Journal::open_default(&store, &paths.sessions_dir(), missing) {
+        Ok(_) => panic!("an unknown session must not open"),
+        Err(e) => e,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains(&missing.to_string()),
+        "the error must name the missing id, got: {message}"
+    );
+    assert!(
+        !message.contains("os error"),
+        "the error must not leak a raw file-system error, got: {message}"
+    );
+}
+
+/// Regression: a session that only ever had settings applied (never a message) must not
+/// leave a worklog file behind. Worklogs are keyed by session id, so a pending session
+/// would otherwise leave an orphan on disk that no session ever reads.
+#[tokio::test]
+async fn settings_on_a_message_less_session_leave_no_worklog_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::new().into(),
+    ));
+    let mut agent = Agent::new_session(
+        &paths,
+        agent_cfg("mock"),
+        registry,
+        ToolRegistry::standard(),
+        ws,
+        false,
+    )
+    .unwrap();
+    let id = agent.session_id();
+    agent.config_apply("plan_mode", "true").unwrap();
+
+    let worklog = paths.data_dir.join("worklogs").join(format!("{id}.json"));
+    assert!(
+        !worklog.exists(),
+        "a message-less session must not write a worklog ({})",
+        worklog.display()
+    );
+    assert!(
+        agent.journal.is_pending(),
+        "settings alone must not materialize the session"
+    );
+
+    // A real message still materializes the session, and the setting survives it.
+    let r = agent.run_turn("now it is real").await;
+    assert!(matches!(r.status, loon_core::TurnStatus::Completed));
+    assert!(!agent.journal.is_pending());
+    assert!(
+        agent.worklog.read().unwrap().plan_mode,
+        "the earlier setting must still apply to the materialized session"
+    );
+}
+
+/// Regression: a journal write failure must end the turn with a reason instead of
+/// aborting the process. `run_turn` previously used `.expect("journal append")`, so any
+/// write error (full disk, read-only home, violated constraint) panicked the whole TUI.
+///
+/// The failure is forced deterministically: the session row is removed behind the
+/// agent's back, so the next append violates the store's foreign key.
+#[tokio::test]
+async fn a_failed_journal_write_ends_the_turn_instead_of_panicking() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![MockScript::text("never reached")]),
+    ));
+    let mut agent = Agent::new_session(
+        &paths,
+        agent_cfg("mock"),
+        registry,
+        ToolRegistry::standard(),
+        ws,
+        false,
+    )
+    .unwrap();
+    let id = agent.session_id();
+
+    // Materialize the session through a real user action, then remove its rows.
+    agent
+        .run_slash(loon_core::commands::SlashCommand::Btw {
+            text: "materialize".into(),
+        })
+        .await
+        .unwrap();
+    assert!(!agent.journal.is_pending());
+    {
+        let store = loon_core::open_store(&paths).unwrap();
+        store.delete_session(id).unwrap();
+        assert!(store.session_meta(id).unwrap().is_none());
+    }
+
+    // Appending now fails (no session row); the turn must report it, not panic.
+    let result = agent.run_turn("this must not panic").await;
+    match result.status {
+        loon_core::TurnStatus::Failed(reason) => {
+            let lower = reason.to_lowercase();
+            assert!(
+                lower.contains("journal")
+                    || lower.contains("database")
+                    || lower.contains("constraint")
+                    || lower.contains("io"),
+                "the failure must name the write problem, got: {reason}"
+            );
+        }
+        other => panic!("expected a failed turn, got {other:?}"),
+    }
+}

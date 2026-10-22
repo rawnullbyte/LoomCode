@@ -306,6 +306,23 @@ impl Store {
         Ok(out)
     }
 
+    /// Delete a session and all of its events (used by tooling and tests; the journal
+    /// is otherwise append-only).
+    pub fn delete_session(&self, id: EvId) -> Result<()> {
+        let mut conn = self.conn.lock().expect("store lock");
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM events WHERE session = ?1",
+            params![id.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM sessions WHERE id = ?1",
+            params![id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Rename a session (shows up in listings / /resume).
     pub fn rename_session(&self, id: EvId, title: &str) -> Result<()> {
         let conn = self.conn.lock().expect("store lock");

@@ -60,6 +60,10 @@ pub enum SlashCommand {
     Rename {
         title: String,
     },
+    /// /delete <id|n> — delete a saved session and its journal.
+    Delete {
+        target: String,
+    },
     /// /theme — cycle transparent/opaque.
     Theme,
     ThemeSet {
@@ -236,6 +240,9 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         "new" | "clear" => SlashCommand::New,
         "resume" => SlashCommand::Resume {
             target: (!args.is_empty()).then(|| args.join(" ")),
+        },
+        "delete" => SlashCommand::Delete {
+            target: args.join(" "),
         },
         "rename" => SlashCommand::Rename {
             title: args.join(" "),
@@ -579,6 +586,7 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
         ("sessions", "search and resume saved sessions"),
         ("resume [ID|n]", "open session browser or resume a session"),
         ("new", "start a new session; keep this one saved"),
+        ("delete <id|n>", "delete a saved session and its journal"),
         ("clear", "start a new session (alias for /new)"),
         ("rename TITLE", "rename the current session"),
         ("skills", "list/reload bundled and custom skills"),
@@ -1037,6 +1045,43 @@ impl Agent {
                     .map_err(|e| e.to_string())?;
                 Ok(format!("renamed to `{}`", title.trim()))
             }
+            SlashCommand::Delete { target } => {
+                let target = target.trim().to_string();
+                if target.is_empty() {
+                    return Err("usage: /delete <session-id|n> (see /resume)".into());
+                }
+                // Check this first: the current session may still be pending, so it is
+                // not in the store and the lookup below would call it "unknown".
+                // Only a real prefix counts — short prefixes are ambiguous between
+                // sessions created moments apart (UUIDv7 shares a timestamp prefix).
+                let current = self.session_id().to_string();
+                if current == target || (target.len() >= 12 && current.starts_with(&target)) {
+                    return Err(
+                        "cannot delete the session you are in — /new first, then delete it".into(),
+                    );
+                }
+                let paths = self.loon_paths();
+                let store = crate::open_store(&paths).map_err(|e| e.to_string())?;
+                let sessions = store.list_sessions().map_err(|e| e.to_string())?;
+                // Accept an index from the /resume listing or an id/prefix.
+                let picked = match target.parse::<usize>() {
+                    Ok(n) if n >= 1 && n <= sessions.len() => sessions[n - 1].id,
+                    _ => {
+                        let found: Vec<_> = sessions
+                            .iter()
+                            .filter(|s| s.id.to_string().starts_with(&target))
+                            .collect();
+                        if found.len() != 1 {
+                            return Err(format!(
+                                "session {target} is unknown or ambiguous — /resume lists them"
+                            ));
+                        }
+                        found[0].id
+                    }
+                };
+                store.delete_session(picked).map_err(|e| e.to_string())?;
+                Ok(format!("deleted session {picked}"))
+            }
             SlashCommand::Theme => {
                 let items = [
                     "terminal", "dark", "light", "ocean", "violet", "ember", "graphite",
@@ -1463,6 +1508,7 @@ impl Agent {
                         text: format!("[btw] {text}"),
                     },
                 );
+                self.flush_worklog_if_durable();
                 self.history
                     .push(loon_providers::ChatMessage::user(format!("[btw] {text}")));
                 Ok(format!("noted (will be part of context): {text}"))

@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkState {
     #[serde(default)]
     pub model: Option<String>,
@@ -32,24 +32,85 @@ pub struct WorkState {
     #[serde(default)]
     pub plan_mode: bool,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanStep {
     pub step: String,
     pub status: String,
 }
+/// Whether this session has been written to the store yet. `WorkLog::new` starts
+/// always-durable (standalone tools and tests); agents tie it to their journal via
+/// [`WorkLog::follow_session`].
+pub type Durability = Arc<dyn Fn() -> bool + Send + Sync>;
+
 #[derive(Clone)]
 pub struct WorkLog {
     path: PathBuf,
     lock: Arc<Mutex<()>>,
+    /// While the session exists only in memory, writes are held in memory too, so a
+    /// session that never receives a message cannot leave an orphaned worklog behind.
+    /// The state is flushed the first time it is read or written after materialization.
+    durable: Durability,
+    /// Work state for a not-yet-durable session.
+    staged: Arc<Mutex<Option<WorkState>>>,
 }
 impl WorkLog {
     pub fn new(data: &Path, session: loon_events::EvId) -> Self {
         Self {
             path: data.join("worklogs").join(format!("{session}.json")),
             lock: Arc::new(Mutex::new(())),
+            durable: Arc::new(|| true),
+            staged: Arc::new(Mutex::new(None)),
         }
     }
+
+    /// Tie this worklog's durability to the session's: it persists only once `durable`
+    /// reports true (i.e. the journal has materialized).
+    pub fn follow_session(&mut self, durable: Durability) {
+        self.durable = durable;
+    }
+
+    fn write(&self, state: &WorkState) -> Result<(), ToolError> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let bytes =
+            serde_json::to_vec_pretty(state).map_err(|e| ToolError::Other(e.to_string()))?;
+        loon_workspace::write_atomic(&self.path, &bytes)?;
+        Ok(())
+    }
+
+    pub fn is_durable(&self) -> bool {
+        (self.durable)()
+    }
+
+    /// Write through staged state the moment the session becomes durable, so a
+    /// different agent (e.g. a fresh `resume`) that reads straight from disk sees it.
+    pub fn flush_staged(&self) -> Result<(), ToolError> {
+        if !self.is_durable() {
+            return Ok(());
+        }
+        let staged = self
+            .staged
+            .lock()
+            .map_err(|_| ToolError::Other("worklog lock poisoned".into()))?
+            .take();
+        if let Some(state) = staged {
+            self.write(&state)?;
+        }
+        Ok(())
+    }
+
+    /// Read the current state, flushing anything staged if the session became durable.
     pub fn read(&self) -> Result<WorkState, ToolError> {
+        self.flush_staged()?;
+        if !self.is_durable() {
+            return Ok(self
+                .staged
+                .lock()
+                .map_err(|_| ToolError::Other("worklog lock poisoned".into()))?
+                .clone()
+                .unwrap_or_default());
+        }
         match std::fs::read(&self.path) {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .map_err(|e| ToolError::Other(format!("worklog: {e}"))),
@@ -65,14 +126,23 @@ impl WorkLog {
             .lock
             .lock()
             .map_err(|_| ToolError::Other("worklog lock poisoned".into()))?;
+        self.flush_staged()?;
         let mut state = self.read()?;
+        let before = state.clone();
         change(&mut state)?;
-        if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+        if state == before {
+            return Ok(state);
         }
-        let bytes =
-            serde_json::to_vec_pretty(&state).map_err(|e| ToolError::Other(e.to_string()))?;
-        loon_workspace::write_atomic(&self.path, &bytes)?;
+        if !self.is_durable() {
+            // Held in memory until the session is materialized by a real message.
+            *self
+                .staged
+                .lock()
+                .map_err(|_| ToolError::Other("worklog lock poisoned".into()))? =
+                Some(state.clone());
+            return Ok(state);
+        }
+        self.write(&state)?;
         Ok(state)
     }
     pub fn prompt(&self) -> String {

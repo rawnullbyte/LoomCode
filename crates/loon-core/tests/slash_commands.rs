@@ -370,3 +370,63 @@ async fn new_and_clear_do_not_persist_an_empty_session() {
         "a new empty session must not be persisted"
     );
 }
+
+/// /delete removes a saved session by index or id, refuses the current session, and
+/// never resurrects a deleted one.
+#[tokio::test]
+async fn delete_removes_saved_sessions_but_not_the_current_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut a = agent(tmp.path(), &ws);
+
+    // Create a real session (a message materializes it), then move on so it is
+    // deletable: /new keeps it in the journal and switches to a fresh session.
+    let first = a.session_id();
+    let r = a.run_turn("first session body").await;
+    assert!(matches!(r.status, loon_core::TurnStatus::Completed));
+    a.run_slash(SlashCommand::New).await.unwrap();
+    assert_ne!(
+        a.session_id(),
+        first,
+        "/new must switch to a new session id"
+    );
+
+    // Deleting the session you are in is refused.
+    let err = a
+        .run_slash(SlashCommand::Delete {
+            target: a.session_id().to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("cannot delete the session you are in"),
+        "{err}"
+    );
+
+    // Deleting a saved session by prefix works and removes it from the listing.
+    let out = a
+        .run_slash(SlashCommand::Delete {
+            target: first.to_string()[..8].to_string(),
+        })
+        .await
+        .unwrap();
+    assert!(out.contains("deleted session"), "{out}");
+    let listing = a
+        .run_slash(SlashCommand::Resume { target: None })
+        .await
+        .unwrap();
+    assert!(
+        !listing.contains(&first.to_string()[..8]),
+        "deleted session must not be listed: {listing}"
+    );
+
+    // Deleting it again reports it as unknown rather than silently succeeding.
+    let err = a
+        .run_slash(SlashCommand::Delete {
+            target: first.to_string()[..8].to_string(),
+        })
+        .await
+        .unwrap_err();
+    assert!(err.contains("unknown or ambiguous"), "{err}");
+}

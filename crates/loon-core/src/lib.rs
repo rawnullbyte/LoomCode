@@ -376,7 +376,13 @@ impl Agent {
         let (steering_tx, steering_rx) = mpsc::channel(64);
         let (live_cmds_tx, live_cmds_rx) = mpsc::channel(32);
         let ctx = Agent::build_ctx(&cfg, &cwd, cancel_rx.clone(), &journal)?;
-        let worklog = worklog::WorkLog::new(&paths.data_dir, session_id);
+        let mut worklog = worklog::WorkLog::new(&paths.data_dir, session_id);
+        // Work state stays in memory until the session itself is written, so a session
+        // that never receives a message cannot leave an orphaned worklog on disk.
+        {
+            let journal = journal.clone();
+            worklog.follow_session(Arc::new(move || journal.is_materialized()));
+        }
         let mut cfg = cfg;
         if let Ok(state) = worklog.read() {
             if let Some(model) = state.model {
@@ -577,6 +583,15 @@ impl Agent {
     /// materializes it into the store.
     pub fn is_pending(&self) -> bool {
         self.journal.is_pending()
+    }
+
+    /// Called after a journal write that may have materialized the session: work state
+    /// staged while the session was in memory is written through now, so a later
+    /// `resume` (a different process even) reads it from disk.
+    pub(crate) fn flush_worklog_if_durable(&self) {
+        if self.journal.is_materialized() {
+            let _ = self.worklog.flush_staged();
+        }
     }
 
     pub fn cancel(&self) {
@@ -954,14 +969,29 @@ impl Agent {
             self.titled
                 .store(true, std::sync::atomic::Ordering::Relaxed);
         }
-        self.journal
-            .append(
-                None,
-                EventKind::UserMessage {
-                    text: user_text.to_string(),
-                },
-            )
-            .expect("journal append");
+        // A failed write (full or read-only disk) must end the turn with a reason, not
+        // abort the process: the caller's UI stays alive and the user can act on it.
+        if let Err(e) = self.journal.append(
+            None,
+            EventKind::UserMessage {
+                text: user_text.to_string(),
+            },
+        ) {
+            let reason = format!("cannot journal the message: {e}");
+            self.emit_async(AgentEvent::Warning(reason.clone())).await;
+            let status = TurnStatus::Failed(reason);
+            self.emit_async(AgentEvent::TurnFinished {
+                status: status.clone(),
+            })
+            .await;
+            return TurnResult {
+                status,
+                assistant_text: String::new(),
+                steps: 0,
+                usage: Usage::default(),
+            };
+        }
+        self.flush_worklog_if_durable();
         self.history
             .push(loon_providers::ChatMessage::user(user_text));
         self.execute_turn().await
@@ -978,6 +1008,7 @@ impl Agent {
         let _ = self
             .journal
             .append(None, EventKind::TurnStarted { turn: turn_id });
+        self.flush_worklog_if_durable();
         let mut steps: u32 = 0;
         let mut ultra_rounds: u32 = 0;
         let mut supervisor_rounds: u32 = 0;

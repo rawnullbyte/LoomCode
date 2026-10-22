@@ -3,7 +3,7 @@ use crate::worklog::WorkLog;
 use loon_tools::{Effects, Tool, ToolCtx, ToolError, ToolOutput, ToolSpec};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Task {
     pub id: u64,
     pub subject: String,

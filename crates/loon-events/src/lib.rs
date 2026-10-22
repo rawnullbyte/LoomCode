@@ -27,6 +27,10 @@ pub enum EventsError {
     SchemaTooNew { found: u32, supported: u32 },
     #[error("malformed journal line {line}: {reason}")]
     MalformedLine { line: usize, reason: String },
+    #[error("no session {id} (it may have been deleted, or never had a message)")]
+    SessionNotFound { id: String },
+    #[error("no session with id {id}")]
+    UnknownSession { id: String },
     #[error("database error: {0}")]
     Db(#[from] rusqlite::Error),
 }
