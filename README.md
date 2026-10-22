@@ -215,8 +215,9 @@ original lines and the input viewport follows the caret.
 File mutations show **what changed**, not just that something happened: `edit`, `fuzzy_edit`,
 `multi_edit` and `write` append a bounded unified diff to their result, and the transcript
 colours it — removals red, additions green, hunk headers yellow, with `+N −M` as the summary
-for a collapsed run. The diff is clipped after 120 changed lines and says so rather than
-truncating silently; a rewrite that changes nothing produces no diff at all. Every stored
+for a collapsed run. The diff is clipped after 60 changed lines per side (120 for a full
+rewrite) and says so rather than truncating silently; a rewrite that changes nothing
+produces no diff at all. Every stored
 diff line keeps its own row, so colouring stays per-line no matter how large the edit is.
 The same colouring applies to a diff pasted into an assistant answer, and fenced code blocks
 render as code. One request-level `t/s` counter

@@ -377,8 +377,8 @@ async fn run_edit(args: Value, ctx: &ToolCtx, multi: bool) -> Result<ToolOutput,
 /// The change, rendered as a bounded unified diff for the transcript.
 ///
 /// A mutation that only reports "edited <path>" makes the user open the file to learn
-/// what happened. The diff is clipped by [`crate::diff::MAX_DIFF_LINES`], so a large
-/// rewrite cannot flood the chat; the clip is stated rather than silently truncated.
+/// what happened. The diff is clipped by [`crate::diff::MAX_DIFF_LINES`] per side, so a
+/// large rewrite cannot flood the chat; the clip is stated rather than silently truncated.
 /// Short name used as the diff label (the full path is already in the message).
 fn file_label(p: &std::path::Path) -> String {
     p.file_name()
