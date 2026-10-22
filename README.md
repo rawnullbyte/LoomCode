@@ -449,6 +449,16 @@ Unicode/indentation-preserving copying. They do not use live paid-provider crede
 `LOON_HOME=/path` keeps config/data/state isolated. Existing config and session paths are
 retained.
 
+Two commands keep setup honest. `loom doctor` prints environment and tool diagnostics
+entirely offline unless you pass `--connect`, and exits non-zero when something is wrong:
+
+```sh
+loom doctor                # paths, terminal, tools, providers, config — all offline
+loom config path           # where the config file lives
+loom config validate       # parse the config and show every finding
+loom config init            # write the commented example config (never overwrites)
+```
+
 ## Documentation site
 
 The documentation in this repository *is* the website. `docs/site/build.py` renders the

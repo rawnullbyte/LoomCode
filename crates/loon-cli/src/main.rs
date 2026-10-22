@@ -51,9 +51,6 @@ enum Command {
         /// Supervisor review budget; 0 means unlimited until complete/cancelled.
         #[arg(long, default_value_t = 0, requires = "ultraloop")]
         ultraloop_limit: u32,
-        /// Run the opaque TUI palette instead of transparent mode (interactive only).
-        #[arg(long)]
-        opaque: bool,
     },
     Sessions {
         #[command(subcommand)]
@@ -194,7 +191,6 @@ async fn run_headless(cli: Cli) -> i32 {
         ultraloop,
         supervisor_model,
         ultraloop_limit,
-        opaque: _,
     }) = &cli.cmd
     else {
         return 64;

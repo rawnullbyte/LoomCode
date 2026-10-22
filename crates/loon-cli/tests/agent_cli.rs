@@ -539,3 +539,31 @@ fn resume_names_the_sessions_missing_directory_not_a_cwd_flag() {
     assert_eq!(explicit.status.code(), Some(64));
     assert!(String::from_utf8_lossy(&explicit.stderr).contains("--cwd"));
 }
+
+/// `run` is headless, so a palette flag has no meaning there. Accepting `--opaque`
+/// and then ignoring it is worse than refusing it: the user thinks they changed
+/// something. The flag must not exist on `run`.
+#[test]
+fn run_does_not_offer_a_palette_flag() {
+    let home = tempfile::tempdir().unwrap();
+    let help = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "--help"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&help.stdout).contains("--opaque"),
+        "a headless command must not advertise a palette flag"
+    );
+    let rejected = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "--opaque", "hello"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        rejected.status.code(),
+        Some(2),
+        "an unknown flag must be rejected by the parser, got: {}",
+        String::from_utf8_lossy(&rejected.stderr)
+    );
+}
