@@ -1589,11 +1589,37 @@ mod gutter_false_positive_tests {
     /// 6-wide field, and the list number inside the content is content.
     #[test]
     fn a_numbered_list_inside_a_read_file_keeps_its_own_number() {
-        let app = excerpt_app("read", "notes.md", "     5\t  1  first item");
+        // A .rs path so highlighting (and therefore split_gutter) actually runs; with a
+        // plain-text path the excerpt is not tokenized at all and this asserts nothing.
+        let app = excerpt_app("read", "src/list.rs", "     5\t  1  first item");
         let row = row_for(&app, "first item").expect("row must render");
         assert!(
-            row.contains("5") && row.contains("1"),
-            "both the gutter and the list number must be visible: {row:?}"
+            row.contains("5"),
+            "the tool gutter number stays visible: {row:?}"
+        );
+        assert!(
+            row.contains("1"),
+            "the list number in the file's own content stays visible: {row:?}"
+        );
+        // ...and the content's own number keeps numeric styling. Only the expanded
+        // excerpt row is tokenized; the collapsed summary line above it is not, so
+        // search for the indented row rather than the first row mentioning the text.
+        let excerpt_row = app
+            .transcript_rows(90)
+            .into_iter()
+            .find(|r| {
+                let t: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                t.contains("first item") && t.starts_with("      ")
+            })
+            .expect("the expanded excerpt row must render");
+        assert!(
+            excerpt_row
+                .line
+                .spans
+                .iter()
+                .any(|s| s.style == crate::code::number_style()),
+            "the list number is code, so it keeps numeric styling: {:?}",
+            excerpt_row.line.spans
         );
     }
 }
