@@ -226,7 +226,9 @@ JavaScript/TypeScript/Go/Java, shell, JSON and TOML — with keywords, strings, 
 comments styled separately. The highlighter is a tolerant lexer rather than a parser: an
 excerpt cut mid-string still renders, and highlighting never changes the underlying text,
 so copying a command out of the transcript yields exactly what was shown. An unknown fence
-tag falls back to plain code. One request-level `t/s` counter
+tag falls back to plain code. File reads get the same treatment from their path, so a
+`read` of `lib.rs` renders with Rust highlighting and a `.txt` file is left alone; a diff
+always keeps its red/green rather than being re-tokenized as source. One request-level `t/s` counter
 covers thinking, writing and tool arguments together. `~` marks a character-based estimate
 until the provider reports total output/completion tokens. Reasoning tokens are not added
 again. The timer includes request latency, resets on each request/retry and freezes during

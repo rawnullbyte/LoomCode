@@ -279,6 +279,26 @@ fn push_colored_excerpt(
     style: Style,
     width: usize,
 ) {
+    push_tool_excerpt(
+        rows,
+        marker,
+        excerpt,
+        style,
+        width,
+        crate::code::Lang::Plain,
+    )
+}
+
+/// An excerpt that may be source code: `lang` comes from the tool's path argument, so a
+/// `read` of `lib.rs` renders with Rust highlighting instead of flat grey.
+fn push_tool_excerpt(
+    rows: &mut Vec<TranscriptRow>,
+    marker: &str,
+    excerpt: &str,
+    style: Style,
+    width: usize,
+    lang: crate::code::Lang,
+) {
     let prefix_cells = cell_width(marker).min(width.saturating_sub(1));
     let marker = take_cells(marker, prefix_cells);
     let indent = " ".repeat(prefix_cells);
@@ -303,6 +323,14 @@ fn push_colored_excerpt(
         } else {
             diff_style(para).unwrap_or(style)
         };
+        // A source file read is code even without a fence: the tool's path says what
+        // language it is. Only plain (non-diff, non-fenced) lines are highlighted, so a
+        // diff hunk keeps its red/green rather than being tokenized as source.
+        let as_code = lang != crate::code::Lang::Plain
+            && !fence
+            && !in_code
+            && diff_style(para).is_none()
+            && !metadata_line(trimmed);
         for (i, raw) in wrap(para, avail).into_iter().enumerate() {
             let lead = if first {
                 marker.clone()
@@ -310,11 +338,17 @@ fn push_colored_excerpt(
                 indent.clone()
             };
             first = false;
+            let mut spans = vec![Span::styled(lead, style)];
+            let text = display(&raw);
+            if as_code {
+                for (piece, piece_style) in crate::code::highlight(&text, lang) {
+                    spans.push(Span::styled(piece, piece_style));
+                }
+            } else {
+                spans.push(Span::styled(text, body_style));
+            }
             rows.push(TranscriptRow {
-                line: Line::from(vec![
-                    Span::styled(lead, style),
-                    Span::styled(display(&raw), body_style),
-                ]),
+                line: Line::from(spans),
                 raw,
                 prefix_cells,
                 soft: i > 0,
@@ -762,12 +796,15 @@ impl App {
                                 theme::accent_fg(),
                                 width,
                             );
-                            push_colored_excerpt(
+                            // `detail` is the tool's path argument for file tools, so
+                            // a read of `lib.rs` highlights as Rust.
+                            push_tool_excerpt(
                                 &mut rows,
                                 "      ",
                                 &call.excerpt,
                                 theme::system_fg(),
                                 width,
+                                crate::code::Lang::from_path(&call.detail),
                             );
                         }
                     }
@@ -1215,5 +1252,89 @@ mod code_highlight_tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("+++[>+<-]"), "code text must survive: {text}");
+    }
+}
+
+#[cfg(test)]
+mod source_highlight_tests {
+    use super::*;
+
+    fn styles_for(rows: &[TranscriptRow], needle: &str) -> Vec<Style> {
+        rows.iter()
+            .filter(|r| {
+                let t: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+                t.contains(needle)
+            })
+            .flat_map(|r| {
+                r.line
+                    .spans
+                    .iter()
+                    .filter(|s| !s.content.trim().is_empty())
+                    .map(|s| s.style)
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    fn read_block(path: &str, excerpt: &str) -> crate::App {
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        app.show_tool_details = true;
+        app.push_block(crate::Block::Tool {
+            name: "read".into(),
+            ok: true,
+            excerpt: excerpt.into(),
+            pending: false,
+            detail: path.into(),
+            started: None,
+            elapsed: None,
+        });
+        app
+    }
+
+    #[test]
+    fn reading_a_rust_file_highlights_it_as_rust() {
+        let app = read_block(
+            "src/lib.rs",
+            "   1\tpub fn answer() -> u32 {\n   2\t    // forty two\n   3\t    42\n   4\t}",
+        );
+        let rows = app.transcript_rows(90);
+        assert!(
+            styles_for(&rows, "pub fn").contains(&crate::code::keyword_style()),
+            "a Rust keyword must be styled in a .rs read"
+        );
+        assert!(
+            styles_for(&rows, "forty two").contains(&crate::code::comment_style()),
+            "the comment must be styled in a .rs read"
+        );
+    }
+
+    #[test]
+    fn reading_a_plain_text_file_is_not_highlighted() {
+        // No language for .txt: keywords must not be invented.
+        let app = read_block("notes.txt", "pub fn answer() is just prose here");
+        let rows = app.transcript_rows(90);
+        assert!(
+            !styles_for(&rows, "pub fn").contains(&crate::code::keyword_style()),
+            "plain text must not be highlighted as code"
+        );
+    }
+
+    #[test]
+    fn a_diff_keeps_its_colours_instead_of_being_tokenized() {
+        // An edit of a .rs file shows a diff: red/green must win over keyword styling.
+        let app = read_block(
+            "src/lib.rs",
+            "edited src/lib.rs\n--- lib.rs\n+++ lib.rs\n@@ -1,1 +1,1 @@\n-let a = 1;\n+let a = 2;",
+        );
+        let rows = app.transcript_rows(90);
+        assert!(
+            styles_for(&rows, "-let a = 1;").contains(&theme::tool_err_fg()),
+            "removals stay red"
+        );
+        assert!(
+            styles_for(&rows, "+let a = 2;").contains(&theme::tool_ok_fg()),
+            "additions stay green"
+        );
     }
 }

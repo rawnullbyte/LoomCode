@@ -36,6 +36,26 @@ impl Lang {
         }
     }
 
+    /// Infer the family from a file path's extension. Used for tool excerpts, which
+    /// carry a path but no fence tag.
+    pub fn from_path(path: &str) -> Lang {
+        let ext = path
+            .rsplit_once('.')
+            .map(|(_, e)| e)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match ext.as_str() {
+            "rs" => Lang::Rust,
+            "py" | "pyi" => Lang::Python,
+            "js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "go" | "java" | "kt" | "swift" | "c"
+            | "h" | "cc" | "cpp" | "hpp" | "cs" | "scala" => Lang::JavaScript,
+            "sh" | "bash" | "zsh" | "fish" => Lang::Shell,
+            "json" | "jsonc" => Lang::Json,
+            "toml" => Lang::Toml,
+            _ => Lang::Plain,
+        }
+    }
+
     /// Keywords worth standing out, per family. Short and high-signal on purpose.
     fn keywords(self) -> &'static [&'static str] {
         match self {
@@ -342,6 +362,18 @@ mod tests {
         );
         let pieces = highlight("let n = 42;", Lang::Rust);
         assert!(pieces.iter().any(|(_, s)| *s == number_style()));
+    }
+
+    #[test]
+    fn paths_infer_families() {
+        assert_eq!(Lang::from_path("src/lib.rs"), Lang::Rust);
+        assert_eq!(Lang::from_path("a/b/tool.py"), Lang::Python);
+        assert_eq!(Lang::from_path("x.tsx"), Lang::JavaScript);
+        assert_eq!(Lang::from_path("run.sh"), Lang::Shell);
+        assert_eq!(Lang::from_path("Cargo.toml"), Lang::Toml);
+        assert_eq!(Lang::from_path("data.json"), Lang::Json);
+        assert_eq!(Lang::from_path("README.md"), Lang::Plain);
+        assert_eq!(Lang::from_path("Makefile"), Lang::Plain);
     }
 
     #[test]
