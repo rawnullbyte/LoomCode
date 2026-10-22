@@ -12,7 +12,6 @@
 use crate::http::{Endpoint, HttpTransport};
 use crate::sse::SseFrame;
 use crate::{ChatMessage, ChatRequest, FinishReason, ProviderError, ProviderEvent, Role};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -57,6 +56,13 @@ impl ChatCompletionsAdapter {
         if let Some(m) = req.max_output_tokens {
             body["max_tokens"] = serde_json::json!(m);
         }
+        if let Some(effort) = &req.reasoning_effort {
+            body["reasoning_effort"] = serde_json::json!(effort);
+            if let Some(m) = req.max_output_tokens {
+                body.as_object_mut().unwrap().remove("max_tokens");
+                body["max_completion_tokens"] = serde_json::json!(m);
+            }
+        }
         body
     }
 
@@ -76,8 +82,13 @@ impl ChatCompletionsAdapter {
             return emit_non_streamed(&v, tx).await;
         }
 
-        // Accumulated tool calls by index (protocol reconstructs calls across chunks).
-        let mut calls: BTreeMap<i64, PartialToolCall> = BTreeMap::new();
+        // Accumulated tool calls in first-appearance order. `by_index` maps the wire
+        // index to a position; a fragment that starts a *new* call (fresh id, or a
+        // different name once arguments have begun) takes a new position and repoints
+        // the index, because several compatible gateways reuse `index: 0` for parallel
+        // calls. Concatenating those would produce `{...}{...}` — invalid JSON.
+        let mut calls: Vec<PartialToolCall> = Vec::new();
+        let mut by_index: std::collections::HashMap<i64, usize> = std::collections::HashMap::new();
         let mut finish: Option<FinishReason> = None;
         let mut usage = loon_events::Usage::default();
         let mut saw_done = false;
@@ -86,6 +97,11 @@ impl ChatCompletionsAdapter {
             let Some(frame) = stream.next_frame(self.idle_timeout).await? else {
                 break;
             };
+            // Empty SSE frames are keepalives (some gateways send `data:` with no payload
+            // or bare blank lines); skipping beats killing the turn over heartbeat noise.
+            if frame.data.trim().is_empty() {
+                continue;
+            }
             if frame.data.trim() == "[DONE]" {
                 saw_done = true;
                 break;
@@ -94,16 +110,8 @@ impl ChatCompletionsAdapter {
                 Ok(v) => v,
                 Err(e) => return Err(ProviderError::Malformed(format!("chunk is not JSON: {e}"))),
             };
-            if let Some(err) = v.get("error") {
-                let msg = err
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .unwrap_or("provider error");
-                let code = err.get("code").and_then(|c| c.as_i64());
-                let pe = match code {
-                    Some(429) => ProviderError::RateLimited(msg.to_string()),
-                    _ => ProviderError::Rejected(msg.to_string()),
-                };
+            if v.get("error").is_some() {
+                let pe = ProviderError::from_error_value(&v);
                 let _ = tx.send(ProviderEvent::Failure { error: pe }).await;
                 return Ok(());
             }
@@ -114,39 +122,80 @@ impl ChatCompletionsAdapter {
                 continue; // keepalive/comment frames, usage-only frames
             };
             for choice in choices {
-                let idx = choice.get("index").and_then(|i| i.as_i64()).unwrap_or(0);
                 if let Some(delta) = choice.get("delta") {
-                    if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                    if let Some(text) = delta
+                        .get("reasoning_content")
+                        .or_else(|| delta.get("reasoning"))
+                        .and_then(|v| v.as_str())
+                    {
                         if !text.is_empty() {
                             let _ = tx
-                                .send(ProviderEvent::TextDelta {
-                                    text: text.to_string(),
-                                })
+                                .send(ProviderEvent::ReasoningDelta { text: text.into() })
                                 .await;
+                        }
+                    }
+                    if let Some(text) = delta.get("content").and_then(content_text) {
+                        if !text.is_empty() {
+                            let _ = tx.send(ProviderEvent::TextDelta { text }).await;
                         }
                     }
                     if let Some(tc) = delta.get("tool_calls").and_then(|t| t.as_array()) {
                         for frag in tc {
-                            let i = frag.get("index").and_then(|x| x.as_i64()).unwrap_or(idx);
-                            let entry = calls.entry(i).or_default();
-                            if let Some(id) = frag.get("id").and_then(|x| x.as_str()) {
-                                if !id.is_empty() {
+                            let frag_id = frag
+                                .get("id")
+                                .and_then(|x| x.as_str())
+                                .filter(|s| !s.is_empty());
+                            let frag_name = frag
+                                .get("function")
+                                .and_then(|f| f.get("name"))
+                                .and_then(|x| x.as_str())
+                                .filter(|s| !s.is_empty());
+                            let frag_args = frag
+                                .get("function")
+                                .and_then(|f| f.get("arguments"))
+                                .and_then(crate::args::arguments_to_string);
+                            // Missing `index` continues the most recent call; index 0 is
+                            // the common fallback only when nothing has arrived yet.
+                            let i = frag
+                                .get("index")
+                                .and_then(|x| x.as_i64())
+                                .unwrap_or_else(|| calls.len().saturating_sub(1) as i64);
+                            let pos = match by_index.get(&i) {
+                                Some(&p) if starts_new_call(&calls[p], frag_id, frag_name) => {
+                                    calls.push(PartialToolCall::default());
+                                    let p = calls.len() - 1;
+                                    by_index.insert(i, p);
+                                    p
+                                }
+                                Some(&p) => p,
+                                None => {
+                                    calls.push(PartialToolCall::default());
+                                    let p = calls.len() - 1;
+                                    by_index.insert(i, p);
+                                    p
+                                }
+                            };
+                            let entry = &mut calls[pos];
+                            if let Some(id) = frag_id {
+                                if entry.id.is_empty() {
                                     entry.id = id.to_string();
                                 }
                             }
-                            if let Some(f) = frag.get("function") {
-                                if let Some(n) = f.get("name").and_then(|x| x.as_str()) {
-                                    if !n.is_empty() {
-                                        entry.name.push_str(n);
-                                    }
+                            if let Some(n) = frag_name {
+                                // A repeated name is the same call re-announced; a split
+                                // name is still streaming (nothing to append to yet).
+                                if entry.name.is_empty()
+                                    || (entry.args.is_empty() && n != entry.name)
+                                {
+                                    entry.name.push_str(n);
                                 }
-                                if let Some(a) = f.get("arguments").and_then(|x| x.as_str()) {
-                                    entry.args.push_str(a);
-                                }
+                            }
+                            if let Some(a) = frag_args {
+                                entry.args.push_str(&a);
                             }
                             let _ = tx
                                 .send(ProviderEvent::ToolCallDelta {
-                                    index: i.max(0) as usize,
+                                    index: pos,
                                     name: if entry.name.is_empty() {
                                         None
                                     } else {
@@ -180,53 +229,42 @@ impl ChatCompletionsAdapter {
             let _ = tx.send(ProviderEvent::Usage(usage)).await;
         }
 
-        // Finalize tool calls only when the protocol says the response ends in tool calls.
-        if finish == Some(FinishReason::ToolCalls) {
-            for (_, c) in calls {
-                if c.id.is_empty() || c.name.is_empty() {
-                    let _ = tx
-                        .send(ProviderEvent::Failure {
-                            error: ProviderError::Malformed(format!(
-                                "incomplete tool call (id={:?}, name={:?})",
-                                c.id, c.name
-                            )),
-                        })
-                        .await;
+        // Finalize tool calls when the stream ends in calls. `finish_reason: "stop"`
+        // alongside calls is common on compatible gateways, so it is accepted too; a
+        // truncated answer (`length`) is not, because its arguments are incomplete.
+        let truncated = matches!(
+            finish,
+            Some(FinishReason::Length) | Some(FinishReason::ContentFilter)
+        );
+        if !calls.is_empty() && !truncated {
+            for (n, c) in calls.into_iter().enumerate() {
+                // Placeholder fragments (no name, no arguments) and calls the model
+                // never named carry nothing executable. Dropping them lets the turn
+                // continue; failing here would kill it over protocol noise.
+                if c.name.is_empty() {
                     continue;
                 }
-                match serde_json::from_str::<serde_json::Value>(&c.args) {
-                    Ok(v) if v.is_object() => {
-                        let _ = tx
-                            .send(ProviderEvent::ToolCallComplete {
-                                call: crate::ToolCallReq {
-                                    id: c.id,
-                                    name: c.name,
-                                    arguments_json: c.args,
-                                },
-                            })
-                            .await;
-                    }
-                    Ok(_) => {
-                        let _ = tx
-                            .send(ProviderEvent::Failure {
-                                error: ProviderError::Malformed(format!(
-                                    "tool call `{}` arguments are not a JSON object",
-                                    c.name
-                                )),
-                            })
-                            .await;
-                    }
-                    Err(e) => {
-                        let _ = tx
-                            .send(ProviderEvent::Failure {
-                                error: ProviderError::Malformed(format!(
-                                    "tool call `{}` arguments are not valid JSON: {e}",
-                                    c.name
-                                )),
-                            })
-                            .await;
-                    }
-                }
+                // Some gateways omit the id; the transcript still needs one to pair the
+                // result with its call, so synthesize a stable per-response id.
+                let id = if c.id.is_empty() {
+                    format!("call_{n}")
+                } else {
+                    c.id
+                };
+                // Unrecoverable arguments become `{}`: the tool then reports its
+                // validation error to the model, which can correct and retry. Killing
+                // the whole turn over one malformed call is worse.
+                let arguments_json =
+                    crate::args::normalize_tool_arguments(&c.args).unwrap_or_else(|| "{}".into());
+                let _ = tx
+                    .send(ProviderEvent::ToolCallComplete {
+                        call: crate::ToolCallReq {
+                            id,
+                            name: c.name,
+                            arguments_json,
+                        },
+                    })
+                    .await;
             }
         }
 
@@ -244,6 +282,34 @@ struct PartialToolCall {
     id: String,
     name: String,
     args: String,
+}
+
+/// A fragment reusing an index starts a new call when it carries a different id, or a
+/// different name after arguments have already begun (split names stream in before the
+/// first argument byte).
+fn starts_new_call(cur: &PartialToolCall, id: Option<&str>, name: Option<&str>) -> bool {
+    let new_id = id.is_some_and(|id| !cur.id.is_empty() && id != cur.id);
+    let new_name =
+        name.is_some_and(|n| !cur.name.is_empty() && !cur.args.is_empty() && n != cur.name);
+    new_id || new_name
+}
+
+/// `content` is a string in the spec, but some compatible servers send an array of
+/// parts (`[{"type":"text","text":"..."}]`).
+fn content_text(v: &serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(parts) => {
+            let mut out = String::new();
+            for p in parts {
+                if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(t);
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        }
+        _ => None,
+    }
 }
 
 fn parse_usage(u: &serde_json::Value) -> loon_events::Usage {
@@ -322,14 +388,10 @@ async fn emit_non_streamed(
     if let Some(text) = choice
         .get("message")
         .and_then(|m| m.get("content"))
-        .and_then(|c| c.as_str())
+        .and_then(content_text)
     {
         if !text.is_empty() {
-            let _ = tx
-                .send(ProviderEvent::TextDelta {
-                    text: text.to_string(),
-                })
-                .await;
+            let _ = tx.send(ProviderEvent::TextDelta { text }).await;
         }
     }
     if let Some(tcs) = choice
@@ -352,31 +414,19 @@ async fn emit_non_streamed(
             let args = tc
                 .get("function")
                 .and_then(|f| f.get("arguments"))
-                .and_then(|x| x.as_str())
-                .unwrap_or("{}")
-                .to_string();
-            match serde_json::from_str::<serde_json::Value>(&args) {
-                Ok(o) if o.is_object() => {
-                    let _ = tx
-                        .send(ProviderEvent::ToolCallComplete {
-                            call: crate::ToolCallReq {
-                                id,
-                                name,
-                                arguments_json: args,
-                            },
-                        })
-                        .await;
-                }
-                _ => {
-                    let _ = tx
-                        .send(ProviderEvent::Failure {
-                            error: ProviderError::Malformed(format!(
-                                "tool call `{name}` has invalid arguments"
-                            )),
-                        })
-                        .await;
-                }
-            }
+                .and_then(crate::args::arguments_to_string)
+                .unwrap_or_else(|| "{}".into());
+            let arguments_json =
+                crate::args::normalize_tool_arguments(&args).unwrap_or_else(|| "{}".into());
+            let _ = tx
+                .send(ProviderEvent::ToolCallComplete {
+                    call: crate::ToolCallReq {
+                        id,
+                        name,
+                        arguments_json,
+                    },
+                })
+                .await;
         }
     }
     let finish = match choice.get("finish_reason").and_then(|f| f.as_str()) {
@@ -403,3 +453,45 @@ pub fn finish_reason_from_str(s: &str) -> FinishReason {
 }
 
 pub type Frame = SseFrame;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn call(id: &str, name: &str, args: &str) -> PartialToolCall {
+        PartialToolCall {
+            id: id.into(),
+            name: name.into(),
+            args: args.into(),
+        }
+    }
+
+    #[test]
+    fn a_new_id_on_the_same_index_starts_a_new_call() {
+        // Gateways that reuse index 0 for parallel calls must not merge them.
+        let first = call("call_a", "read", r#"{"path":"a"}"#);
+        assert!(starts_new_call(&first, Some("call_b"), None));
+        assert!(!starts_new_call(&first, Some("call_a"), None));
+        assert!(!starts_new_call(&first, None, None));
+    }
+
+    #[test]
+    fn a_different_name_after_arguments_starts_a_new_call() {
+        let first = call("call_a", "read", r#"{"path":"a"}"#);
+        assert!(starts_new_call(&first, None, Some("bash")));
+        // While the name is still streaming in there is nothing to split yet.
+        let partial = call("", "re", "");
+        assert!(!starts_new_call(&partial, None, Some("read")));
+    }
+
+    #[test]
+    fn content_arrays_from_compatible_servers_are_flattened() {
+        let v = serde_json::json!([{"type":"text","text":"hello "},{"type":"text","text":"world"}]);
+        assert_eq!(content_text(&v).as_deref(), Some("hello world"));
+        assert_eq!(
+            content_text(&serde_json::json!("plain")).as_deref(),
+            Some("plain")
+        );
+        assert_eq!(content_text(&serde_json::Value::Null), None);
+    }
+}

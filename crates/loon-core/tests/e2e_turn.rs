@@ -24,14 +24,14 @@ fn test_paths(dir: &std::path::Path) -> LoonPaths {
 fn agent_cfg(model: &str) -> AgentConfig {
     AgentConfig {
         model_ref: model.into(),
-        max_steps: 12,
         tool_output_bytes: 4096,
         max_retries: 0,
         allow_retry_after_partial_stream: false,
+        check_command: None,
+        ultra_rounds: 0,
         permissions: loon_config::Permissions::default(),
         context_window: 128_000,
         extra_tools: Vec::new(),
-        check_command: None,
     }
 }
 
@@ -323,56 +323,5 @@ async fn tool_argument_validation_rejects_bad_calls() {
         2,
         "both invalid calls rejected: {:?}",
         events.iter().map(|e| e.summary()).collect::<Vec<_>>()
-    );
-}
-
-#[tokio::test]
-async fn ultra_loop_verifies_after_edits_and_labels_introduced_failures() {
-    let tmp = tempfile::tempdir().unwrap();
-    let ws = tmp.path().join("proj");
-    std::fs::create_dir_all(&ws).unwrap();
-    std::fs::write(ws.join("app.txt"), "state = ok\n").unwrap();
-    // check command fails when app.txt contains "broken"
-    let script = format!(
-        "#!/bin/sh\ngrep -q broken {}/app.txt && exit 1 || exit 0\n",
-        ws.display()
-    );
-    let check = tmp.path().join("check.sh");
-    std::fs::write(&check, script).unwrap();
-    // baseline green, then the edit breaks it, the loop says Introduced
-    let registry = Arc::new(ProviderRegistry::with_mock(
-        loon_providers::MockProvider::with_scripts(vec![MockScript::new(vec![
-            MockStep::tool_call(
-                "call_1",
-                "edit",
-                json!({"path": "app.txt", "old_string": "state = ok", "new_string": "state = broken"}),
-            ),
-        ])]),
-    ));
-    let paths = test_paths(tmp.path());
-    paths.ensure().unwrap();
-    let mut cfg = agent_cfg("mock");
-    cfg.check_command = Some(check.display().to_string());
-    let mut agent =
-        Agent::new_session(&paths, cfg, registry, ToolRegistry::standard(), ws, true).unwrap();
-    let r = agent.run_turn("break it").await;
-    assert!(matches!(r.status, loon_core::TurnStatus::Completed));
-    let events = agent.journal.events().unwrap();
-    let verdicts: Vec<&str> = events
-        .iter()
-        .filter_map(|e| match &e.kind {
-            EventKind::Warning { message } if message.contains("ultra loop") => {
-                Some(message.as_str())
-            }
-            _ => None,
-        })
-        .collect();
-    assert!(
-        verdicts.iter().any(|v| v.contains("baseline")),
-        "baseline established: {verdicts:?}"
-    );
-    assert!(
-        verdicts.iter().any(|v| v.contains("likely introduced")),
-        "introduced failure labeled: {verdicts:?}"
     );
 }

@@ -4,20 +4,31 @@
 //! journals every state change. The TUI and headless clients are consumers of
 //! [`AgentEvent`]s; they hold no business logic.
 
+mod builtin_skills;
+pub mod catalog;
 pub mod commands;
 pub mod compaction;
+pub mod config_ui;
 pub mod est;
+pub mod guidance;
+pub mod hooks;
 pub mod index;
 pub mod loops;
 pub mod mcp;
+mod mcp_http;
 pub mod memory;
+pub mod output;
 pub mod permissions;
 pub mod prompt;
 pub mod replay;
 pub mod rewind;
 pub mod skills;
 pub mod subagent;
+pub mod supervisor;
+pub mod tasks;
+pub mod tool_search;
 pub mod verify;
+pub mod worklog;
 
 use loon_config::LoonPaths;
 use loon_events::model::{EventKind, MemberAttempt, RequestOutcome, Usage};
@@ -32,11 +43,30 @@ use tokio::sync::{mpsc, watch};
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "event", content = "data", rename_all = "snake_case")]
 pub enum AgentEvent {
+    TurnStarted,
     TextDelta(String),
+    /// Discard the text streamed so far for this turn: the attempt is being retried.
+    StreamReset {
+        note: String,
+    },
     ReasoningDelta(String),
+    RequestStarted,
+    RequestFinished,
+    RequestUsage {
+        output_tokens: u64,
+    },
+    OutputProgress {
+        chars: u64,
+    },
+    ReasoningUsage {
+        tokens: u64,
+    },
     ToolStarted {
         name: String,
         args_excerpt: String,
+        /// The human-facing command/path being run (e.g. `$ cargo test`), already
+        /// formatted for display. Multi-line for shell heredocs.
+        detail: String,
     },
     ToolFinished {
         name: String,
@@ -56,6 +86,44 @@ pub enum AgentEvent {
     },
     /// /theme cycled — the UI flips its own transparent flag.
     ToggleTheme,
+    CatalogUpdated {
+        catalog: catalog::Catalog,
+    },
+    OpenCatalog {
+        view: String,
+        catalog: catalog::Catalog,
+    },
+    OpenEditor(catalog::Editor),
+    OpenMenu {
+        title: String,
+        items: Vec<catalog::MenuItem>,
+    },
+    ContextUpdated {
+        tokens: u64,
+    },
+    UiPreference {
+        key: String,
+        value: String,
+    },
+    ModelChanged {
+        model: String,
+    },
+    EffortChanged {
+        level: String,
+    },
+    SessionLoaded {
+        blocks: Vec<(String, String)>,
+    },
+    ConversationRewound {
+        blocks: Vec<(String, String)>,
+        prompt: String,
+    },
+    WorkStateChanged {
+        state: worklog::WorkState,
+    },
+    SetPalette {
+        name: String,
+    },
     /// `/config theme <mode>` — the UI sets its transparency explicitly.
     SetTransparent {
         transparent: bool,
@@ -70,7 +138,7 @@ pub enum AgentEvent {
     OpenEffortPicker,
     /// bare /provider — the UI opens the add-provider form.
     OpenProviderForm,
-    /// /clear — the UI wipes its visible transcript (journal untouched).
+    /// Legacy event kept for UI compatibility; `/clear` now starts a new session.
     ClearTranscript,
     Warning(String),
     TurnFinished {
@@ -84,17 +152,12 @@ pub enum TurnStatus {
     Completed,
     Cancelled,
     Failed(String),
-    /// Step/tool budget exhausted; state is consistent and resumable.
-    BudgetPaused {
-        steps_used: u32,
-    },
 }
 
 impl std::fmt::Debug for AgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentConfig")
             .field("model_ref", &self.model_ref)
-            .field("max_steps", &self.max_steps)
             .field("context_window", &self.context_window)
             .field("extra_tools", &self.extra_tools.len())
             .finish()
@@ -108,7 +171,6 @@ impl TurnStatus {
             TurnStatus::Completed => "completed",
             TurnStatus::Cancelled => "cancelled",
             TurnStatus::Failed(_) => "failed",
-            TurnStatus::BudgetPaused { .. } => "budget paused",
         }
     }
 }
@@ -125,10 +187,13 @@ pub struct TurnResult {
 #[derive(Clone)]
 pub struct AgentConfig {
     pub model_ref: String,
-    pub max_steps: u32,
     pub tool_output_bytes: usize,
     pub max_retries: u32,
     pub allow_retry_after_partial_stream: bool,
+    /// Ultra Loop: verification command run when the agent stops, and how many times it
+    /// may be sent back to work before the turn is allowed to end.
+    pub check_command: Option<String>,
+    pub ultra_rounds: u32,
     /// Permission policy (mode + allow/deny rules) resolved from config and CLI overrides.
     pub permissions: loon_config::Permissions,
     /// Effective context window in tokens (from the model def / combo minimum). 0
@@ -136,23 +201,20 @@ pub struct AgentConfig {
     pub context_window: u64,
     /// Host-provided extra tools (e.g. MCP), merged into the registry at construction.
     pub extra_tools: Vec<Arc<dyn loon_tools::Tool>>,
-    /// Ultra Loop: the project's check command run automatically after edit batches
-    /// (e.g. "cargo test"). None disables the automatic verification cycle.
-    pub check_command: Option<String>,
 }
 
 impl From<&loon_config::SessionCfg> for AgentConfig {
     fn from(s: &loon_config::SessionCfg) -> AgentConfig {
         AgentConfig {
             model_ref: s.model.clone(),
-            max_steps: s.max_steps,
             tool_output_bytes: s.tool_output_bytes,
             max_retries: s.max_retries,
             allow_retry_after_partial_stream: s.allow_retry_after_partial_stream,
+            check_command: s.check_command.clone(),
+            ultra_rounds: s.ultra_rounds,
             permissions: loon_config::Permissions::default(),
             context_window: 128_000,
             extra_tools: Vec::new(),
-            check_command: None,
         }
     }
 }
@@ -161,6 +223,11 @@ pub struct Agent {
     pub journal: Arc<Journal>,
     pub registry: Arc<ProviderRegistry>,
     pub tools: ToolRegistry,
+    /// Ultra Loop baseline: the check result before this session made changes.
+    pub baseline: Option<crate::verify::CheckResult>,
+    /// Identical rejected tool calls within the current turn. A model that repeats the
+    /// same invalid call is stuck, and the turn must end instead of spinning.
+    rejected_calls: std::sync::Mutex<std::collections::HashMap<String, u32>>,
     pub ctx: ToolCtx,
     pub cfg: AgentConfig,
     pub history: Vec<loon_providers::ChatMessage>,
@@ -177,17 +244,37 @@ pub struct Agent {
     pub approval_hook: Option<permissions::ApprovalHook>,
     /// Context summarizer; defaults to a model-backed summarizer (compaction.rs).
     pub summarizer: Option<compaction::Summarizer>,
+    /// Injectable independent stop reviewer; production uses a no-tools model call.
+    pub stop_reviewer: Option<compaction::Summarizer>,
     /// Loon data dir (for memory and friends). Set at construction.
     pub data_dir: PathBuf,
     /// Loon config dir (for /config persistence).
     pub config_dir: PathBuf,
     /// User-defined skills (custom slash commands), loaded at construction.
     pub skills: Vec<skills::Skill>,
+    pub(crate) loaded_mcp: tool_search::Loaded,
+    pub max_turn_steps: Option<u32>,
+    pub(crate) mcp_errors: std::collections::BTreeMap<String, String>,
+    pub(crate) session_hook_started: bool,
+    pub(crate) settings_draft: Option<config_ui::Draft>,
     /// Loop tasks (recurring prompts). The host scheduler polls `take_due`; the agent
     /// cancels through the same registry via the loop_cancel tool.
     pub loops: Arc<loops::LoopRegistry>,
     /// /effort: requested output budget per request (max_output_tokens).
     pub effort: Option<String>,
+    pub autocompact_tokens: Option<u64>,
+    /// Compact at this percentage of the window; follows the window when the model changes.
+    pub autocompact_percent: Option<u8>,
+    /// Set after a failed compaction: (when to retry, why it failed). Automatic
+    /// compaction honours it; `/compact` ignores it.
+    pub compaction_backoff: Option<(Instant, String)>,
+    /// Settings commands sent while a turn is running. Drained at the next request
+    /// boundary so a live `/effort`, `/context 1m` or `/config …` applies to the very
+    /// next request instead of waiting for the turn to end.
+    live_cmds_tx: mpsc::Sender<commands::SlashCommand>,
+    live_cmds_rx: mpsc::Receiver<commands::SlashCommand>,
+    pub worklog: worklog::WorkLog,
+    pub rotation: Arc<loon_providers::RotationState>,
     /// /goal: session goal, injected into every request as a leading system message.
     pub session_goal: Option<String>,
     /// `tips = true|false`: show the input placeholder hint (Claude-Code style).
@@ -195,8 +282,6 @@ pub struct Agent {
     /// Whether this session renders transparently (mirrors the appearance config;
     /// `/config theme` flips it and emits SetTransparent for the UI).
     pub transparent_request: bool,
-    /// Ultra Loop baseline check result (established on the first verify).
-    baseline: Option<crate::verify::CheckResult>,
     /// Whether the session has been auto-titled from its first prompt.
     titled: std::sync::atomic::AtomicBool,
     system_prompt: String,
@@ -207,6 +292,12 @@ impl Agent {
     /// Attach a live event sink (TUI or headless JSONL writer).
     pub fn set_event_sink(&mut self, tx: mpsc::Sender<AgentEvent>) {
         self.events = Some(tx);
+    }
+
+    async fn emit_async(&self, ev: AgentEvent) {
+        if let Some(tx) = &self.events {
+            let _ = tx.send(ev).await;
+        }
     }
 
     fn emit(&self, ev: AgentEvent) {
@@ -224,9 +315,15 @@ pub fn open_store(paths: &LoonPaths) -> loon_events::Result<Arc<Store>> {
 
 /// The default toolset plus the memory tool (scoped to this Loon home + workspace).
 pub fn standard_tools(paths: &LoonPaths, cwd: &Path) -> ToolRegistry {
-    ToolRegistry::standard().with_extra(vec![Arc::new(memory::MemoryTool {
-        paths: Arc::new(memory::MemoryPaths::resolve(&paths.data_dir, cwd)),
-    })])
+    ToolRegistry::standard().with_extra(vec![
+        Arc::new(memory::MemoryTool {
+            paths: Arc::new(memory::MemoryPaths::resolve(&paths.data_dir, cwd)),
+        }),
+        Arc::new(skills::LoadSkillTool {
+            data_dir: paths.data_dir.clone(),
+            cwd: cwd.to_path_buf(),
+        }),
+    ])
 }
 
 impl Agent {
@@ -277,19 +374,114 @@ impl Agent {
     ) -> loon_events::Result<Agent> {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         let (steering_tx, steering_rx) = mpsc::channel(64);
+        let (live_cmds_tx, live_cmds_rx) = mpsc::channel(32);
         let ctx = Agent::build_ctx(&cfg, &cwd, cancel_rx.clone(), &journal)?;
+        let worklog = worklog::WorkLog::new(&paths.data_dir, session_id);
+        let mut cfg = cfg;
+        if let Ok(state) = worklog.read() {
+            if let Some(model) = state.model {
+                if registry.resolve(&model).is_ok() {
+                    cfg.model_ref = model;
+                }
+            }
+        }
+        let tools = tools
+            .without(&[
+                "update_plan",
+                "note",
+                "load_skill",
+                "memory",
+                "read_output",
+                "task",
+                "todo_write",
+                "todo_read",
+            ])
+            .with_extra(vec![
+                Arc::new(skills::LoadSkillTool {
+                    data_dir: paths.data_dir.clone(),
+                    cwd: cwd.clone(),
+                }),
+                Arc::new(memory::MemoryTool {
+                    paths: Arc::new(memory::MemoryPaths::resolve(&paths.data_dir, &cwd)),
+                }),
+                Arc::new(output::OutputTool {
+                    journal: journal.clone(),
+                }),
+                Arc::new(worklog::TodoTool {
+                    log: worklog.clone(),
+                    read_only: false,
+                }),
+                Arc::new(worklog::TodoTool {
+                    log: worklog.clone(),
+                    read_only: true,
+                }),
+                Arc::new(tasks::TaskTool {
+                    log: worklog.clone(),
+                }),
+                Arc::new(worklog::PlanTool {
+                    log: worklog.clone(),
+                }),
+                Arc::new(worklog::NoteTool {
+                    log: worklog.clone(),
+                }),
+            ]);
+        let saved = loon_config::Config::load_effective(paths, &cwd)
+            .ok()
+            .map(|(c, _)| c);
+        let tools = if tools.get("context7_search").is_some() {
+            let options = saved
+                .as_ref()
+                .map(|c| loon_tools::context7::Options {
+                    enabled: c.context7.enabled,
+                    api_key: c.context7.api_key.clone(),
+                    api_key_env: c.context7.api_key_env.clone(),
+                    timeout_secs: c.context7.timeout_secs,
+                    ..Default::default()
+                })
+                .unwrap_or_default();
+            tools
+                .without(&[
+                    "context7_search",
+                    "context7_resolve_library",
+                    "context7_query_docs",
+                ])
+                .with_extra(
+                    [
+                        loon_tools::context7::Operation::Search,
+                        loon_tools::context7::Operation::Resolve,
+                        loon_tools::context7::Operation::Query,
+                    ]
+                    .into_iter()
+                    .map(|operation| {
+                        Arc::new(loon_tools::context7::Context7Tool {
+                            operation,
+                            options: options.clone(),
+                        }) as Arc<dyn loon_tools::Tool>
+                    })
+                    .collect(),
+                )
+        } else {
+            tools
+        };
         let audit_path = paths.state_dir.join("audit.jsonl");
-        Ok(Agent {
+        let mut agent = Agent {
             permissions: Arc::new(permissions::PermissionEngine::new(
                 &cfg.permissions,
                 Some(audit_path),
             )),
-            skills: skills::load(&paths.data_dir, &cwd),
+            skills: skills::load_with_builtins(&paths.data_dir, &cwd),
+            loaded_mcp: Default::default(),
+            max_turn_steps: None,
+            mcp_errors: Default::default(),
+            session_hook_started: false,
+            settings_draft: None,
             data_dir: paths.data_dir.clone(),
             config_dir: paths.config_dir.clone(),
             journal,
             registry,
             tools,
+            baseline: None,
+            rejected_calls: std::sync::Mutex::new(std::collections::HashMap::new()),
             ctx,
             history,
             cancel_tx,
@@ -299,17 +491,33 @@ impl Agent {
             events: None,
             approval_hook: None,
             summarizer: None,
+            stop_reviewer: None,
             loops: Arc::new(loops::LoopRegistry::new()),
-            effort: None,
-            session_goal: None,
-            tips: true,
-            transparent_request: true,
-            baseline: None,
+            effort: worklog
+                .read()
+                .ok()
+                .and_then(|s| s.effort)
+                .or_else(|| saved.as_ref().and_then(|c| c.session.effort.clone())),
+            session_goal: worklog.read().ok().and_then(|s| s.goal),
+            autocompact_tokens: saved.as_ref().and_then(|c| c.session.autocompact_tokens),
+            autocompact_percent: saved.as_ref().and_then(|c| c.session.autocompact_percent),
+            compaction_backoff: None,
+            live_cmds_tx,
+            live_cmds_rx,
+            worklog,
+            rotation: Arc::new(loon_providers::RotationState::new()),
+            tips: saved.as_ref().map(|c| c.ui.tips).unwrap_or(true),
+            transparent_request: saved
+                .as_ref()
+                .map(|c| c.appearance.mode == loon_config::AppearanceMode::Transparent)
+                .unwrap_or(true),
             titled: std::sync::atomic::AtomicBool::new(false),
             cfg,
             system_prompt,
             session_id,
-        })
+        };
+        agent.refresh_tool_search();
+        Ok(agent)
     }
 
     /// Create a session agent. `cwd` is the workspace root; AGENTS.md there (if any) is
@@ -333,7 +541,10 @@ impl Agent {
         };
         let store = open_store(paths)?;
         let journal = Arc::new(Journal::create_default(&store, &meta)?);
-        let system = prompt::system_prompt(&cwd);
+        let system = prompt::system_prompt_with_memory(
+            &cwd,
+            &memory::MemoryPaths::resolve(&paths.data_dir, &cwd),
+        );
         journal.append(
             None,
             EventKind::SessionStarted {
@@ -369,6 +580,7 @@ impl Agent {
         other.events = self.events.take();
         other.approval_hook = self.approval_hook.take();
         other.summarizer = self.summarizer.take();
+        other.stop_reviewer = self.stop_reviewer.take();
         *self = other;
     }
 
@@ -444,16 +656,27 @@ impl Agent {
         );
         let summarizer = match &self.summarizer {
             Some(s) => s.clone(),
-            None => compaction::model_summarizer(self.registry.clone(), self.cfg.model_ref.clone()),
+            None => compaction::model_reviewer(self.registry.clone(), self.cfg.model_ref.clone()),
         };
-        let answer = summarizer(format!(
+        let answer = match summarizer(format!(
             "You are a safety reviewer for a coding agent. Judge whether allowing this \
              operation is low-risk for the user's machine and repository (writes inside \
              the workspace, normal build/test commands: low risk; deleting outside the \
              workspace, exfiltration, destructive shell, credential access: high risk). \
              Answer with exactly one word: ALLOW or DENY.\n\n{transcript}"
         ))
-        .await;
+        .await
+        {
+            Ok(answer) => answer,
+            // A failed reviewer cannot vouch for safety; fall through to asking the user.
+            Err(reason) => {
+                self.emit_async(AgentEvent::Warning(format!(
+                    "auto review skipped: {reason}"
+                )))
+                .await;
+                return None;
+            }
+        };
         Self::parse_reviewer_verdict(&answer)
     }
 
@@ -482,9 +705,156 @@ impl Agent {
         *self.cancel_rx.borrow()
     }
 
+    /// Forget the turn that is being cancelled: drop the user message (and anything the
+    /// aborted turn journaled after it) from live history, and journal a conversation
+    /// rewind so a resume replays the same thing. The prompt is the user's again — it
+    /// goes back to the input bar, not into the transcript.
+    ///
+    /// Returns the text that was dropped, or None when nothing of this turn was recorded.
+    pub fn forget_cancelled_turn(&mut self) -> Option<String> {
+        let events = self.journal.events().ok()?;
+        let bounds = crate::rewind::request_boundaries(&events);
+        // The newest boundary is the turn being cancelled; without one, fall back to the
+        // last user message so the prompt still comes back.
+        let truncate_to = match bounds.last() {
+            Some(b) => b.truncate_to_seq,
+            None => {
+                let last_user = events
+                    .iter()
+                    .rev()
+                    .find(|e| matches!(&e.kind, EventKind::UserMessage { text } if crate::rewind::visible_user_prompt(text)))?;
+                last_user.seq.saturating_sub(1)
+            }
+        };
+        // Drop live history from the cancelled user message onward.
+        let mut dropped_prompt = None;
+        let mut keep = self.history.len();
+        for (i, message) in self.history.iter().enumerate().rev() {
+            if message.role == loon_providers::Role::User
+                && !message.text.starts_with("[steering]")
+                && !message.text.starts_with("[ultra loop]")
+                && !message.text.starts_with("[Local lifecycle hook]")
+            {
+                dropped_prompt = Some(message.text.clone());
+                keep = i;
+                break;
+            }
+        }
+        self.history.truncate(keep);
+        let _ = self.journal.append(
+            None,
+            EventKind::Rewound {
+                target_request: loon_events::EvId::now_v7(),
+                mode: "conversation".into(),
+                truncate_to_seq: truncate_to,
+                files_restored: 0,
+                files_conflicted: 0,
+            },
+        );
+        dropped_prompt
+    }
+
     /// Queue a steering message; consumed at the next safe boundary.
     pub fn steer(&self, text: String) {
         let _ = self.steering_tx.try_send(text);
+    }
+
+    /// Lock-free handle for settings commands that must apply to the next request even
+    /// while this agent is busy running a turn.
+    pub fn live_command_sender(&self) -> mpsc::Sender<commands::SlashCommand> {
+        self.live_cmds_tx.clone()
+    }
+
+    /// Apply settings commands queued while the turn was running. Called at the request
+    /// boundary; only session-live settings are honoured, everything else is reported.
+    fn apply_live_commands(&mut self) {
+        while let Ok(cmd) = self.live_cmds_rx.try_recv() {
+            let (key, value) = match &cmd {
+                commands::SlashCommand::Effort { level } if !level.is_empty() => {
+                    ("effort".to_string(), level.clone())
+                }
+                commands::SlashCommand::AutoCompact { setting } if setting != "toggle" => {
+                    match loon_config::tokens::parse_token_spec(setting) {
+                        Some(loon_config::tokens::TokenSpec::Percent(p)) => {
+                            ("autocompact_percent".to_string(), p.to_string())
+                        }
+                        Some(loon_config::tokens::TokenSpec::Tokens(n)) => {
+                            ("autocompact_tokens".to_string(), n.to_string())
+                        }
+                        None if setting == "off" => ("context_window".to_string(), "0".to_string()),
+                        None if setting == "on" => {
+                            ("context_window".to_string(), "128k".to_string())
+                        }
+                        None => continue,
+                    }
+                }
+                commands::SlashCommand::Context { size: Some(size) } => {
+                    match loon_config::tokens::parse_token_spec(size) {
+                        Some(loon_config::tokens::TokenSpec::Percent(p)) => {
+                            ("autocompact_percent".to_string(), p.to_string())
+                        }
+                        Some(loon_config::tokens::TokenSpec::Tokens(n)) => {
+                            ("context_window".to_string(), n.to_string())
+                        }
+                        None => continue,
+                    }
+                }
+                commands::SlashCommand::Config { args } => {
+                    let args: Vec<&str> = args
+                        .iter()
+                        .map(String::as_str)
+                        .filter(|a| !matches!(*a, "set" | "menu-set"))
+                        .collect();
+                    let Some(first) = args.first() else { continue };
+                    let (key, inline) = match first.split_once('=') {
+                        Some((k, v)) => (k, Some(v)),
+                        None => (*first, None),
+                    };
+                    if !matches!(
+                        key,
+                        "effort"
+                            | "context_window"
+                            | "autocompact"
+                            | "autocompact_tokens"
+                            | "autocompact_percent"
+                            | "permission_mode"
+                            | "tool_output_bytes"
+                            | "max_retries"
+                            | "ultra_rounds"
+                            | "plan_mode"
+                            | "session_goal"
+                    ) {
+                        self.emit(crate::AgentEvent::Warning(format!(
+                            "/config {key} needs the idle session; it applies after this turn"
+                        )));
+                        continue;
+                    }
+                    let value = match inline {
+                        Some(v) => v.to_string(),
+                        None => args[1..].join(" "),
+                    };
+                    if value.is_empty() {
+                        continue;
+                    }
+                    (key.to_string(), value)
+                }
+                _ => continue,
+            };
+            match self.config_apply(&key, &value) {
+                Ok(report) => self.emit(crate::AgentEvent::MemberNote(format!(
+                    "applied at this request: {report}"
+                ))),
+                Err(e) => self.emit(crate::AgentEvent::Warning(format!(
+                    "queued setting `{key}` refused: {e}"
+                ))),
+            }
+        }
+    }
+
+    /// Drain settings queued while a turn runs. Public so the TUI driver and tests share
+    /// exactly one implementation; production calls it at each request boundary.
+    pub fn apply_pending_live_commands(&mut self) {
+        self.apply_live_commands();
     }
 
     /// Rebuild an agent over an existing session (resume). Replays journal into history.
@@ -498,21 +868,18 @@ impl Agent {
         let store = open_store(paths)?;
         let (journal, events) = Journal::open_default(&store, &paths.sessions_dir(), session_id)?;
         let mut cwd = String::new();
-        // The newest Rewound mark truncates the replay (see rewind.rs).
-        let mut truncate_at: Option<u64> = None;
         for ev in &events {
-            match &ev.kind {
-                EventKind::SessionStarted { cwd: c, .. } => cwd = c.clone(),
-                EventKind::Rewound {
-                    truncate_to_seq, ..
-                } => truncate_at = Some(*truncate_to_seq),
-                _ => {}
+            if let EventKind::SessionStarted { cwd: c, .. } = &ev.kind {
+                cwd = c.clone();
             }
         }
-        let history = replay::replay_history(&events, truncate_at);
+        let history = replay::replay_history(&events, None);
         let journal = Arc::new(journal);
-        let system = prompt::system_prompt(Path::new(&cwd));
-        Agent::assemble(
+        let system = prompt::system_prompt_with_memory(
+            Path::new(&cwd),
+            &memory::MemoryPaths::resolve(&paths.data_dir, Path::new(&cwd)),
+        );
+        let resumed = Agent::assemble(
             paths,
             cfg,
             registry,
@@ -522,11 +889,50 @@ impl Agent {
             history,
             system,
             session_id,
-        )
+        )?;
+        resumed
+            .titled
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        Ok(resumed)
     }
 
     /// Run one user turn to completion, journaling everything.
     pub async fn run_turn(&mut self, user_text: &str) -> TurnResult {
+        self.system_prompt = prompt::system_prompt_with_memory(
+            self.ctx.ws.root(),
+            &memory::MemoryPaths::resolve(&self.data_dir, self.ctx.ws.root()),
+        );
+        self.repair_interrupted_calls();
+        let _ = self.cancel_tx.send(false);
+        self.emit_async(AgentEvent::TurnStarted).await;
+        if !self.session_hook_started {
+            self.session_hook_started = true;
+            let hook = self.run_hooks("SessionStart", serde_json::json!({})).await;
+            if !hook.context.is_empty() {
+                self.record_hook_context(&hook.context);
+            }
+        }
+        let hook = self
+            .run_hooks("UserPromptSubmit", serde_json::json!({"prompt":user_text}))
+            .await;
+        if hook.blocked {
+            let reason = format!("Prompt blocked by hook: {}", hook.context);
+            self.emit_async(AgentEvent::Warning(reason.clone())).await;
+            let status = TurnStatus::Failed(reason);
+            self.emit_async(AgentEvent::TurnFinished {
+                status: status.clone(),
+            })
+            .await;
+            return TurnResult {
+                status,
+                assistant_text: String::new(),
+                steps: 0,
+                usage: Usage::default(),
+            };
+        }
+        if !hook.context.is_empty() {
+            self.record_hook_context(&hook.context);
+        }
         // Auto-title: the first real prompt names the session (shows in /resume).
         if !self.titled.load(std::sync::atomic::Ordering::Relaxed) && !user_text.trim().is_empty() {
             let title: String = user_text.trim().chars().take(60).collect();
@@ -558,11 +964,14 @@ impl Agent {
         // from an idle Esc/Ctrl+C) must not poison this one. Cancelling DURING the
         // turn still works — the flag is re-set from the UI while this loop runs.
         let _ = self.cancel_tx.send(false);
+        self.rejected_calls.lock().expect("rejection lock").clear();
         let turn_id = loon_events::EvId::now_v7();
         let _ = self
             .journal
             .append(None, EventKind::TurnStarted { turn: turn_id });
         let mut steps: u32 = 0;
+        let mut ultra_rounds: u32 = 0;
+        let mut supervisor_rounds: u32 = 0;
         let mut total_usage = Usage::default();
         let mut assistant_text = String::new();
         let mut status = TurnStatus::Completed;
@@ -572,17 +981,9 @@ impl Agent {
                 status = TurnStatus::Cancelled;
                 break;
             }
-            if steps >= self.cfg.max_steps {
-                status = TurnStatus::BudgetPaused { steps_used: steps };
-                let _ = self.journal.append(
-                    None,
-                    EventKind::Warning {
-                        message: format!(
-                            "step budget ({}) reached; pausing with a resumable checkpoint",
-                            self.cfg.max_steps
-                        ),
-                    },
-                );
+            if self.max_turn_steps.is_some_and(|limit| steps >= limit) {
+                status =
+                    TurnStatus::Failed("subagent maxTurns reached; task remains incomplete".into());
                 break;
             }
             steps += 1;
@@ -600,60 +1001,44 @@ impl Agent {
                     "[steering] {msg}"
                 )));
             }
+            // Settings typed while the turn ran apply to this request, not the next turn.
+            self.apply_live_commands();
 
             // ── one provider request (combo-aware) ────────────────────────────────
             // Context guard first: summarize older exchanges if the next request would
             // cross the compaction threshold.
             self.maybe_compact().await;
             let request_id = loon_events::EvId::now_v7();
-            let max_output_tokens = match self.effort.as_deref() {
-                Some("low") => Some(2_048),
-                Some("high") => Some(32_768),
-                _ => None,
-            };
+            let effort = loon_config::Effort::parse(self.effort.as_deref().unwrap_or("medium"))
+                .unwrap_or_default();
+            let max_output_tokens = Some(effort.output_tokens());
             let req = loon_providers::ChatRequest {
                 model: self.cfg.model_ref.clone(),
                 messages: self.assemble_messages(),
-                tools: self.tools.provider_definitions(),
+                tools: self.provider_tools(),
                 max_output_tokens,
                 temperature: None,
+                reasoning_effort: Some(effort.wire_level().into()),
             };
+            self.emit_async(AgentEvent::RequestStarted).await;
             let est_tokens = est::estimate_messages(&req.messages);
             let (tx, mut rx) = mpsc::channel::<AttemptEvent>(512);
             let registry = self.registry.clone();
             let model_ref = self.cfg.model_ref.clone();
             let allow_partial = self.cfg.allow_retry_after_partial_stream;
             let mut runner = ComboRunner::new(registry);
+            runner.rotation = self.rotation.clone();
             runner.max_retries = self.cfg.max_retries;
             runner.allow_retry_after_partial_stream = allow_partial;
             let req_for_task = req.clone();
-            let handle =
-                tokio::spawn(async move { runner.run(&model_ref, &req_for_task, tx).await });
+            let mut handle = supervisor::AbortTask(tokio::spawn(async move {
+                runner.run(&model_ref, &req_for_task, tx).await
+            }));
 
             let mut step_text = String::new();
-            let mut mutated_this_step = false;
-            // Ultra Loop step 1: the baseline is taken BEFORE any edit of this turn —
-            // a red baseline means pre-existing failures, not the agent's doing.
-            if self.baseline.is_none() {
-                if let Some(cmd) = self.cfg.check_command.clone() {
-                    let runner = crate::verify::shell_runner(
-                        self.ctx.ws.root().to_path_buf(),
-                        std::time::Duration::from_secs(600),
-                    );
-                    let mut verifier = crate::verify::Verifier::new(cmd, runner);
-                    let b = verifier.establish_baseline().await;
-                    self.emit(AgentEvent::MemberNote(format!(
-                        "ultra loop baseline: {}",
-                        if b.ok {
-                            "green".into()
-                        } else {
-                            format!("RED — {} ", b.output_excerpt.lines().last().unwrap_or(""))
-                        }
-                    )));
-                    self.baseline = Some(b);
-                }
-            }
             let mut tool_calls = Vec::new();
+            let mut saw_tool_delta = false;
+            let mut observed_ids = std::collections::HashMap::new();
             let mut member_logged = false;
             let mut member_for_request: Option<MemberAttempt> = None;
 
@@ -678,17 +1063,21 @@ impl Agent {
                             ProviderEvent::TextDelta { text } => {
                                 step_text.push_str(&text);
                                 let _ = self.journal.append(Some(request_id), EventKind::TextDelta { request: request_id, text: text.clone() });
-                                self.emit(AgentEvent::TextDelta(text));
+                                self.emit_async(AgentEvent::TextDelta(text)).await;
                             }
                             ProviderEvent::ReasoningDelta { text } => {
-                                let _ = self.journal.append(Some(request_id), EventKind::ReasoningDelta { request: request_id, text });
+                                let _ = self.journal.append(Some(request_id), EventKind::ReasoningDelta { request: request_id, text: text.clone() });
+                                self.emit_async(AgentEvent::ReasoningDelta(text)).await;
                             }
                             ProviderEvent::ToolCallComplete { call } => {
+                                if !saw_tool_delta {self.emit_async(AgentEvent::OutputProgress {chars:call.arguments_json.chars().count() as u64}).await;}
+                                let observed_id=loon_events::EvId::now_v7();
+                                observed_ids.insert(call.id.clone(),observed_id);
                                 let _ = self.journal.append(
                                     Some(request_id),
                                     EventKind::ToolCallObserved {
                                         request: request_id,
-                                        call: loon_events::EvId::now_v7(),
+                                        call: observed_id,
                                         wire_id: call.id.clone(),
                                         name: call.name.clone(),
                                         arguments_json: call.arguments_json.clone(),
@@ -697,6 +1086,8 @@ impl Agent {
                                 tool_calls.push(call);
                             }
                             ProviderEvent::Usage(u) => {
+                                if let Some(output_tokens)=u.output_tokens {self.emit_async(AgentEvent::RequestUsage {output_tokens}).await;}
+                                if let Some(tokens) = u.reasoning_tokens { self.emit_async(AgentEvent::ReasoningUsage { tokens }).await; }
                                 total_usage = Usage {
                                     input_tokens: total_usage.input_tokens.max(u.input_tokens),
                                     output_tokens: Some(total_usage.output_tokens.unwrap_or(0) + u.output_tokens.unwrap_or(0)),
@@ -707,19 +1098,33 @@ impl Agent {
                             ProviderEvent::Failure { error } => {
                                 let _ = self.journal.append(Some(request_id), EventKind::Warning { message: format!("provider: {error}") });
                             }
-                            ProviderEvent::ToolCallDelta { .. } | ProviderEvent::Finished { .. } => {}
+                            // The attempt is being repeated: drop what it streamed so the
+                            // retried answer is not appended to a half-finished one.
+                            ProviderEvent::Retrying { reason } => {
+                                step_text.clear();
+                                tool_calls.clear();
+                                observed_ids.clear();
+                                saw_tool_delta=false;
+                                let _ = self.journal.append(Some(request_id), EventKind::Warning { message: format!("retrying: {reason}") });
+                                self.emit_async(AgentEvent::StreamReset { note: reason }).await;
+                            }
+                            ProviderEvent::ToolCallDelta {args_delta,..} => {saw_tool_delta=true;self.emit_async(AgentEvent::OutputProgress {chars:args_delta.chars().count() as u64}).await;}
+                            ProviderEvent::Finished { .. } => {}
                         }
                     }
                     _ = cancel_changed(&mut self.cancel_rx) => {
                         self.cancel();
+                        handle.0.abort();
+                        break;
                     }
                 }
             }
-            let combo_outcome: Option<Result<ComboOutcome, String>> = match handle.await {
+            let combo_outcome: Option<Result<ComboOutcome, String>> = match (&mut handle.0).await {
                 Ok(r) => Some(r),
                 Err(e) => Some(Err(format!("request task panicked: {e}"))),
             };
 
+            self.emit_async(AgentEvent::RequestFinished).await;
             // ── journal the request outcome ───────────────────────────────────────
             let (outcome_kind, _served_member) = match &combo_outcome {
                 Some(Ok(outcome)) => {
@@ -730,7 +1135,8 @@ impl Agent {
                                 message: format!("combo: skipped {m}: {reason}"),
                             },
                         );
-                        self.emit(AgentEvent::MemberNote(format!("skipped {m}: {reason}")));
+                        self.emit_async(AgentEvent::MemberNote(format!("skipped {m}: {reason}")))
+                            .await;
                     }
                     let member = outcome.served.clone().or(member_for_request.clone());
                     (
@@ -770,7 +1176,10 @@ impl Agent {
             let _ = self.journal.append(Some(request_id), outcome_kind);
 
             // ── classify and continue or stop ─────────────────────────────────────
-
+            if self.is_cancelled() {
+                status = TurnStatus::Cancelled;
+                break;
+            }
             match &combo_outcome {
                 Some(Ok(o)) => match &o.outcome {
                     RequestOutcome::Completed { .. } => {}
@@ -796,7 +1205,8 @@ impl Agent {
                                 message: format!("request failed (retriable={retriable}): {error}"),
                             },
                         );
-                        self.emit(AgentEvent::Warning(format!("request failed: {error}")));
+                        self.emit_async(AgentEvent::Warning(format!("request failed: {error}")))
+                            .await;
                         break;
                     }
                 },
@@ -814,71 +1224,174 @@ impl Agent {
                 break;
             }
 
-            if !step_text.is_empty() {
-                assistant_text.push_str(&step_text);
-                self.history
-                    .insert_tool_aware(loon_providers::ChatMessage::assistant(std::mem::take(
-                        &mut step_text,
-                    )));
-            }
-
-            // ── tool execution phase ──────────────────────────────────────────────
-            if tool_calls.is_empty() {
-                break; // conversational finish
-            }
-            let assistant_with_calls = loon_providers::ChatMessage {
+            assistant_text.push_str(&step_text);
+            self.history.push(loon_providers::ChatMessage {
                 role: loon_providers::Role::Assistant,
-                text: String::new(),
+                text: step_text,
                 tool_calls: tool_calls.clone(),
                 tool_call_id: None,
-            };
-            self.history.insert_tool_aware(assistant_with_calls);
+            });
+            if tool_calls.is_empty() {
+                let hook = self
+                    .run_hooks(
+                        "Stop",
+                        serde_json::json!({"last_assistant_message":assistant_text,"steps":steps}),
+                    )
+                    .await;
+                if hook.blocked {
+                    self.record_hook_context(&format!(
+                        "Stop hook requires more work: {}",
+                        hook.context
+                    ));
+                    continue;
+                }
+                match self.ultra_loop_verdict(&mut ultra_rounds).await {
+                    Ok(true) => continue,
+                    Err(e) if self.ultraloop_enabled() => {
+                        let prompt=format!("[ultraloop stop reason] Required verification is still failing: {e}. Review must continue with a different repair approach; completion is not supported.");
+                        let _ = self.journal.append(
+                            None,
+                            EventKind::UserMessage {
+                                text: prompt.clone(),
+                            },
+                        );
+                        self.history.push(loon_providers::ChatMessage::user(prompt));
+                        ultra_rounds = 0;
+                    }
+                    Err(e) => {
+                        status = TurnStatus::Failed(e);
+                        break;
+                    }
+                    Ok(false) => {}
+                }
+                supervisor_rounds += 1;
+                match self.supervise_stop(supervisor_rounds, turn_id).await {
+                    Ok(true) => continue,
+                    Err(e) => {
+                        status = TurnStatus::Failed(e);
+                    }
+                    Ok(false) => {}
+                }
+                break;
+            }
 
-            for call in tool_calls {
+            let mut index = 0;
+            while index < tool_calls.len() {
                 if self.is_cancelled() {
                     status = TurnStatus::Cancelled;
                     break;
                 }
-                let call_id = loon_events::EvId::now_v7();
-                let result = self.execute_tool(&call_id, &call).await;
-                if result.mutated {
-                    mutated_this_step = true;
-                }
-                self.history.push(loon_providers::ChatMessage::tool_result(
-                    call.id.clone(),
-                    result.model_text.clone(),
-                ));
-            }
-            // ── Ultra Loop: verify after every edit batch ────────────────────────
-            if mutated_this_step {
-                if let Some(cmd) = self.cfg.check_command.clone() {
-                    let cwd = self.ctx.ws.root().to_path_buf();
-                    let runner =
-                        crate::verify::shell_runner(cwd, std::time::Duration::from_secs(600));
-                    let mut verifier = crate::verify::Verifier::new(cmd, runner);
-                    let (check, class) = verifier.verify().await;
-                    let verdict = format!("ultra loop: {} → {}", check.ok, class.describe());
-                    let _ = self.journal.append(
-                        None,
-                        EventKind::Warning {
-                            message: verdict.clone(),
-                        },
-                    );
-                    self.emit(AgentEvent::MemberNote(verdict));
-                    if class == crate::verify::Classification::Introduced {
-                        self.history.push(loon_providers::ChatMessage::user(format!(
-                            "[ultra loop] your last edit batch broke the check command (`{}`). \
-                             Re-read the failure, fix it, and verify again before continuing.",
-                            self.cfg.check_command.clone().unwrap_or_default()
-                        )));
+                let mut end = index + 1;
+                let readonly = |call: &loon_providers::ToolCallReq| {
+                    self.tools
+                        .get(&call.name)
+                        .map(|t| t.spec().effects == Effects::ReadOnly)
+                        .unwrap_or(false)
+                };
+                if readonly(&tool_calls[index]) {
+                    while end < tool_calls.len() && readonly(&tool_calls[end]) {
+                        end += 1;
                     }
                 }
+                let results = {
+                    use futures::StreamExt;
+                    let agent: &Agent = self;
+                    let ids = &observed_ids;
+                    let jobs = tool_calls[index..end].iter().cloned().enumerate().map(
+                        |(offset, call): (usize, loon_providers::ToolCallReq)| async move {
+                            let id = ids
+                                .get(&call.id)
+                                .copied()
+                                .unwrap_or_else(loon_events::EvId::now_v7);
+                            (offset, agent.execute_tool(&id, &call).await)
+                        },
+                    );
+                    let mut results = futures::stream::iter(jobs)
+                        .buffer_unordered(6)
+                        .collect::<Vec<_>>()
+                        .await;
+                    results.sort_by_key(|(i, _)| *i);
+                    results
+                };
+                let mut stuck = false;
+                for (offset, result) in results {
+                    let call = &tool_calls[index + offset];
+                    if !result.ok {
+                        let count = {
+                            let mut failures = self.rejected_calls.lock().expect("rejection lock");
+                            let key = format!(
+                                "{}\u{1}{}",
+                                call.name,
+                                serde_json::from_str::<serde_json::Value>(&call.arguments_json)
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|_| call.arguments_json.clone())
+                            );
+                            let count = failures.entry(key).or_insert(0);
+                            *count += 1;
+                            *count
+                        };
+                        if count >= MAX_IDENTICAL_REJECTIONS {
+                            stuck = true;
+                        }
+                    }
+                    if call.name == "update_plan" || call.name == "note" {
+                        if let Ok(state) = self.worklog.read() {
+                            self.emit_async(AgentEvent::WorkStateChanged { state })
+                                .await;
+                        }
+                    }
+                    self.history.push(loon_providers::ChatMessage::tool_result(
+                        call.id.clone(),
+                        result.model_text,
+                    ));
+                }
+                if stuck {
+                    status = TurnStatus::Failed(format!(
+                        "the model repeated the same rejected tool call {MAX_IDENTICAL_REJECTIONS} times; stopping instead of looping"
+                    ));
+                    break;
+                }
+                index = end;
             }
-            if status == TurnStatus::Cancelled {
+            // Any non-completed status ends the turn: a failed batch must not start
+            // another provider request.
+            if status != TurnStatus::Completed {
+                if !self.is_cancelled() && self.ultraloop_enabled() {
+                    self.repair_interrupted_calls();
+                    let prompt=format!("[ultraloop stop reason] Main execution stopped: {status:?}. Identify a different valid approach; do not repeat the same failing call unchanged.");
+                    let _ = self.journal.append(
+                        None,
+                        EventKind::UserMessage {
+                            text: prompt.clone(),
+                        },
+                    );
+                    self.history.push(loon_providers::ChatMessage::user(prompt));
+                    supervisor_rounds += 1;
+                    match self.supervise_stop(supervisor_rounds, turn_id).await {
+                        Ok(true) => {
+                            self.rejected_calls.lock().expect("rejection lock").clear();
+                            status = TurnStatus::Completed;
+                            continue;
+                        }
+                        Err(e) => status = TurnStatus::Failed(e),
+                        Ok(false) => {}
+                    }
+                }
                 break;
             }
         }
 
+        if self.is_cancelled() {
+            status = TurnStatus::Cancelled;
+        }
+        if matches!(status, TurnStatus::Failed(_)) {
+            let _ = self
+                .run_hooks(
+                    "StopFailure",
+                    serde_json::json!({"status":format!("{status:?}")}),
+                )
+                .await;
+        }
         let _ = self.journal.append(
             None,
             EventKind::TurnFinished {
@@ -886,9 +1399,14 @@ impl Agent {
                 reason: format!("{status:?}"),
             },
         );
-        self.emit(AgentEvent::TurnFinished {
+        self.emit_async(AgentEvent::ContextUpdated {
+            tokens: self.estimated_context_tokens(),
+        })
+        .await;
+        self.emit_async(AgentEvent::TurnFinished {
             status: status.clone(),
-        });
+        })
+        .await;
         TurnResult {
             status,
             assistant_text,
@@ -898,7 +1416,7 @@ impl Agent {
     }
 
     async fn execute_tool(
-        &mut self,
+        &self,
         call_event_id: &loon_events::EvId,
         call: &loon_providers::ToolCallReq,
     ) -> ToolRunOutcome {
@@ -922,14 +1440,19 @@ impl Agent {
                         reason: msg.clone(),
                     },
                 );
+                self.emit_async(AgentEvent::ToolFinished {
+                    name: call.name.clone(),
+                    ok: false,
+                    excerpt: msg.clone(),
+                })
+                .await;
                 return ToolRunOutcome {
                     model_text: format!("ERROR: {msg}"),
                     ok: false,
-                    mutated: false,
                 };
             }
         };
-        let args: serde_json::Value = match serde_json::from_str(&call.arguments_json) {
+        let args: serde_json::Value = match parse_tool_arguments(&call.arguments_json) {
             Ok(v) => v,
             Err(e) => {
                 let msg = format!("arguments are not valid JSON: {e}");
@@ -941,35 +1464,110 @@ impl Agent {
                         reason: msg.clone(),
                     },
                 );
+                let _ = self
+                    .emit_async(AgentEvent::ToolFinished {
+                        name: call.name.clone(),
+                        ok: false,
+                        excerpt: msg.clone(),
+                    })
+                    .await;
                 return ToolRunOutcome {
-                    model_text: format!("ERROR: {msg}"),
+                    model_text: tool_argument_feedback(
+                        &spec.spec(),
+                        &msg,
+                        Some(&call.arguments_json),
+                    ),
                     ok: false,
-                    mutated: false,
                 };
             }
         };
+        let args = loon_tools::tool::normalize_args(&spec.spec(), args);
         if let Err(e) = validate_args(&spec.spec(), &args) {
+            let reason = e.to_string();
             let _ = self.journal.append(
                 Some(*call_event_id),
                 EventKind::ToolCallRejected {
                     request: *call_event_id,
                     name: call.name.clone(),
-                    reason: e.to_string(),
+                    reason: reason.clone(),
                 },
             );
+            // The transcript shows the same explanation the model receives, so a bad
+            // call is visible instead of only failing somewhere in the journal.
+            let _ = self
+                .emit_async(AgentEvent::ToolFinished {
+                    name: call.name.clone(),
+                    ok: false,
+                    excerpt: reason.clone(),
+                })
+                .await;
+            let raw = serde_json::to_string(&args).unwrap_or_default();
+            let repeats = self
+                .rejected_calls
+                .lock()
+                .expect("rejection lock")
+                .get(&format!("{}\u{1}{}", call.name, args))
+                .copied()
+                .unwrap_or(0)
+                + 1;
+            let mut feedback = tool_argument_feedback(&spec.spec(), &reason, Some(&raw));
+            if repeats >= 2 {
+                feedback.push_str(&format!(
+                    "\n\nThis exact call has now been rejected {repeats} times. \
+                     Do not send it again. Either send a corrected call that satisfies the \
+                     parameters above, or stop and tell the user what you cannot do."
+                ));
+            }
             return ToolRunOutcome {
-                model_text: format!("ERROR: invalid arguments: {e}"),
+                model_text: feedback,
                 ok: false,
-                mutated: false,
+            };
+        }
+
+        if self.worklog.read().map(|s| s.plan_mode).unwrap_or(false)
+            && spec.spec().effects == Effects::Mutating
+            && !["update_plan", "note", "task", "todo_write"].contains(&spec.spec().name.as_str())
+        {
+            let reason="Plan mode blocks workspace mutations. Continue inspection/planning; only the user can leave plan mode with /plan off.".to_string();
+            let _ = self.journal.append(
+                Some(*call_event_id),
+                EventKind::ToolCallRejected {
+                    request: *call_event_id,
+                    name: call.name.clone(),
+                    reason: reason.clone(),
+                },
+            );
+            self.emit_async(AgentEvent::ToolFinished {
+                name: call.name.clone(),
+                ok: false,
+                excerpt: reason.clone(),
+            })
+            .await;
+            return ToolRunOutcome {
+                ok: false,
+                model_text: reason,
             };
         }
 
         // ── Permission gate: policy decides before the tool ever runs. ──────────────
         let args_summary: String = serde_json::to_string(&args).unwrap_or_default();
-        let mut decision = self.permissions.evaluate(
-            &call.name,
-            args.get("path").and_then(serde_json::Value::as_str),
-            spec.spec().effects == Effects::Mutating,
+        // Observation-only actions are not mutations: polling a monitor or listing
+        // sessions/connections must not require approval in ask mode.
+        let observation_only = match spec.spec().name.as_str() {
+            "process" | "monitor" => ["poll", "list", "logs", "wait_for"]
+                .contains(&args["action"].as_str().unwrap_or("")),
+            "shell_session" => ["list", "cwd"].contains(&args["action"].as_str().unwrap_or("")),
+            "ssh" => args["action"].as_str() == Some("list"),
+            _ => false,
+        };
+        let mut decision = self.permissions.evaluate_call(
+            &spec.spec().name,
+            &args,
+            self.ctx.ws.root(),
+            spec.spec().effects == Effects::Mutating
+                && !["todo_write", "update_plan", "note", "task"]
+                    .contains(&spec.spec().name.as_str())
+                && !observation_only,
         );
         if matches!(decision, permissions::Decision::ApprovalRequired) {
             // Interactive UIs answer through the hook; headless runs cannot approve.
@@ -1001,14 +1599,40 @@ impl Agent {
                     reason: reason.clone(),
                 },
             );
-            self.emit(AgentEvent::Warning(reason));
+            self.emit_async(AgentEvent::Warning(reason)).await;
             return ToolRunOutcome {
                 model_text: decision.refusal_text(),
                 ok: false,
-                mutated: false,
             };
         }
 
+        let pre_hook = self
+            .run_hooks(
+                "PreToolUse",
+                serde_json::json!({"tool_name":spec.spec().name,"tool_input":args}),
+            )
+            .await;
+        if pre_hook.blocked {
+            let reason = format!("Tool blocked by PreToolUse hook: {}", pre_hook.context);
+            self.emit_async(AgentEvent::ToolFinished {
+                name: call.name.clone(),
+                ok: false,
+                excerpt: reason.clone(),
+            })
+            .await;
+            let _ = self.journal.append(
+                Some(*call_event_id),
+                EventKind::ToolCallRejected {
+                    request: *call_event_id,
+                    name: call.name.clone(),
+                    reason: reason.clone(),
+                },
+            );
+            return ToolRunOutcome {
+                model_text: reason,
+                ok: false,
+            };
+        }
         let args_excerpt: String = {
             let s = serde_json::to_string(&args).unwrap_or_default();
             s.chars().take(200).collect()
@@ -1020,24 +1644,41 @@ impl Agent {
                 name: call.name.clone(),
             },
         );
-        self.emit(AgentEvent::ToolStarted {
+        self.emit_async(AgentEvent::ToolStarted {
             name: call.name.clone(),
             args_excerpt: args_excerpt.clone(),
-        });
+            detail: tool_detail(&spec.spec().name, &args),
+        })
+        .await;
         let started = Instant::now();
-        let result = spec.run(args, &self.ctx).await;
+        let result = spec.run(args.clone(), &self.ctx).await;
+        let success = result.as_ref().map(|out| out.ok).unwrap_or(false);
+        let output = result
+            .as_ref()
+            .map(|out| out.text.clone())
+            .unwrap_or_else(|e| e.to_string());
+        let post_hook = self.run_hooks(if success {"PostToolUse"} else {"PostToolUseFailure"}, serde_json::json!({"tool_name":spec.spec().name,"tool_input":args,"tool_response":output})).await;
+        let guidance = crate::guidance::for_tool(self.ctx.ws.root(), &args);
+        let extra_context = format!("{}{}{}", pre_hook.context, guidance, post_hook.context);
         let duration_ms = started.elapsed().as_millis() as u64;
         match result {
-            Ok(out) => {
-                self.emit(AgentEvent::ToolFinished {
-                    name: call.name.clone(),
-                    ok: out.ok,
-                    excerpt: out.text.clone(),
-                });
+            Ok(mut out) => {
                 let blob = out
                     .full
                     .as_ref()
-                    .and_then(|b| self.journal.put_blob(b).ok());
+                    .and_then(|bytes| self.journal.put_blob(bytes).ok());
+                if let Some(blob) = &blob {
+                    out.text.push_str(&format!(
+                        "\n[Full output sha256 {}; use read_output to inspect or search it.]",
+                        blob.sha256
+                    ));
+                }
+                self.emit_async(AgentEvent::ToolFinished {
+                    name: call.name.clone(),
+                    ok: out.ok,
+                    excerpt: out.text.clone(),
+                })
+                .await;
                 let _ = self.journal.append(
                     Some(*call_event_id),
                     EventKind::ToolExecutionFinished {
@@ -1081,19 +1722,32 @@ impl Agent {
                         }
                     }
                 }
+                if !extra_context.is_empty() {
+                    out.text
+                        .push_str(&format!("\n[Local guidance and hooks]\n{extra_context}"));
+                }
+                if out.ok && spec.spec().name == "load_skill" {
+                    if let Some(name) = args["name"].as_str() {
+                        let _ = self.worklog.update(|state| {
+                            if !state.active_skills.contains(&name.to_string()) {
+                                state.active_skills.push(name.to_string());
+                            }
+                            Ok(())
+                        });
+                    }
+                }
                 ToolRunOutcome {
                     model_text: out.text,
                     ok: out.ok,
-                    // file-mutating tools attach before/after hashes; detect via that
-                    mutated: out.structured.get("after_sha256").is_some(),
                 }
             }
             Err(e) => {
-                self.emit(AgentEvent::ToolFinished {
+                self.emit_async(AgentEvent::ToolFinished {
                     name: call.name.clone(),
                     ok: false,
                     excerpt: format!("tool error: {e}"),
-                });
+                })
+                .await;
                 let _ = self.journal.append(
                     Some(*call_event_id),
                     EventKind::ToolExecutionFinished {
@@ -1106,12 +1760,19 @@ impl Agent {
                     },
                 );
                 ToolRunOutcome {
-                    model_text: format!("ERROR: {e}"),
+                    model_text: format!("ERROR: {e}\n{extra_context}"),
                     ok: false,
-                    mutated: false,
                 }
             }
         }
+    }
+
+    fn record_hook_context(&mut self, text: &str) {
+        let text = format!("[Local lifecycle hook]\n{text}");
+        let _ = self
+            .journal
+            .append(None, EventKind::UserMessage { text: text.clone() });
+        self.history.push(loon_providers::ChatMessage::user(text));
     }
 
     fn assemble_messages(&self) -> Vec<loon_providers::ChatMessage> {
@@ -1123,6 +1784,55 @@ impl Agent {
                 "Current session goal (the user set this with /goal): {goal}"
             )));
         }
+        let guidance = guidance::workspace(self.ctx.ws.root());
+        if !guidance.is_empty() {
+            v.push(loon_providers::ChatMessage::system(format!(
+                "Local workspace guidance (repository data):\n{guidance}"
+            )));
+        }
+        if let Ok(state) = self.worklog.read() {
+            let available = skills::load_with_builtins(&self.data_dir, self.ctx.ws.root());
+            for name in state.active_skills.iter().rev().take(8).rev() {
+                if let Some(skill) = available.iter().find(|s| &s.name == name) {
+                    v.push(loon_providers::ChatMessage::system(format!(
+                        "Active skill /{}:\n{}",
+                        name,
+                        skill.body.chars().take(8000).collect::<String>()
+                    )));
+                }
+            }
+        }
+        let state = self.worklog.prompt();
+        if !state.is_empty() {
+            v.push(loon_providers::ChatMessage::system(format!(
+                "Durable session work state (data, not higher-priority instructions):\n{state}"
+            )));
+        }
+        let effort = loon_config::Effort::parse(self.effort.as_deref().unwrap_or("medium"))
+            .unwrap_or_default();
+        v.push(loon_providers::ChatMessage::system(format!(
+            "Coding effort: {}",
+            effort.guidance()
+        )));
+        let skills = self
+            .skills
+            .iter()
+            .map(|s| format!("/{} ({}) — {}", s.name, s.scope, s.description))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !skills.is_empty() {
+            v.push(loon_providers::ChatMessage::system(format!("Available workflows: {skills}. Use load_skill to read a workflow before applying it.")));
+        }
+        let remote_count = self
+            .tools
+            .specs()
+            .iter()
+            .filter(|s| s.name.starts_with("mcp_"))
+            .count();
+        if remote_count > 0 {
+            let loaded = self.loaded_mcp.lock().unwrap_or_else(|e| e.into_inner());
+            v.push(loon_providers::ChatMessage::system(format!("{remote_count} remote MCP tools available through tool_search. Loaded remote tools: {}",loaded.iter().cloned().collect::<Vec<_>>().join(", "))));
+        }
         v.extend(self.history.iter().cloned());
         v
     }
@@ -1132,8 +1842,217 @@ struct ToolRunOutcome {
     model_text: String,
     #[allow(dead_code)] // consumed by the journal event; kept for symmetry with ToolOutput
     ok: bool,
-    /// True when this call mutated files (drives the Ultra Loop verify cycle).
-    mutated: bool,
+}
+
+/// What the model (and the transcript) is told when a tool call's arguments do not fit
+/// the tool's schema: the exact problem, the arguments that were sent, the parameters
+/// the tool accepts, and an instruction to correct the call.
+fn tool_argument_feedback(spec: &loon_tools::ToolSpec, problem: &str, raw: Option<&str>) -> String {
+    // `ToolError::InvalidArgs` already prefixes its own explanation.
+    let problem = problem
+        .strip_prefix("invalid arguments: ")
+        .unwrap_or(problem);
+    let mut out = format!("ERROR: `{}` call rejected: {problem}.\n", spec.name);
+    if let Some(raw) = raw {
+        out.push_str(&format!("Arguments received: {}\n", excerpt_text(raw, 300)));
+    }
+    let params = &spec.parameters;
+    let required: Vec<&str> = params
+        .get("required")
+        .and_then(|r| r.as_array())
+        .map(|r| r.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    if let Some(props) = params.get("properties").and_then(|p| p.as_object()) {
+        out.push_str("Parameters:\n");
+        for (name, schema) in props {
+            let ty = schema.get("type").and_then(|t| t.as_str()).unwrap_or("any");
+            let req = if required.contains(&name.as_str()) {
+                "required"
+            } else {
+                "optional"
+            };
+            let desc = schema
+                .get("description")
+                .and_then(|d| d.as_str())
+                .unwrap_or("");
+            out.push_str(&format!("  - {name} ({ty}, {req})"));
+            if !desc.is_empty() {
+                out.push_str(&format!(": {}", excerpt_text(desc, 160)));
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "Call the tool again with every required field present. Do not repeat the same call unchanged.",
+    );
+    out
+}
+
+/// One-line, length-bounded rendering for error text.
+fn excerpt_text(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        flat.chars().take(max).collect::<String>() + "…"
+    }
+}
+
+impl Agent {
+    /// Run configured verification through the normal permission/tool path.
+    /// Repair budget exhaustion is a failure, never a successful completion.
+    async fn ultra_loop_verdict(&mut self, rounds: &mut u32) -> Result<bool, String> {
+        let Some(command) = self
+            .cfg
+            .check_command
+            .clone()
+            .filter(|s| !s.trim().is_empty())
+        else {
+            return Ok(false);
+        };
+        if self.cfg.ultra_rounds == 0 {
+            return Ok(false);
+        }
+        self.emit_async(AgentEvent::MemberNote(format!(
+            "verification · `{command}` (repair {}/{})",
+            *rounds, self.cfg.ultra_rounds
+        )))
+        .await;
+        let observed = loon_events::EvId::now_v7();
+        let call = loon_providers::ToolCallReq {
+            id: format!("verify_{observed}"),
+            name: "bash".into(),
+            arguments_json: serde_json::json!({"command":command,"timeout_secs":600}).to_string(),
+        };
+        let _ = self.journal.append(
+            None,
+            EventKind::ToolCallObserved {
+                request: observed,
+                call: observed,
+                wire_id: call.id.clone(),
+                name: call.name.clone(),
+                arguments_json: call.arguments_json.clone(),
+            },
+        );
+        self.history.push(loon_providers::ChatMessage {
+            role: loon_providers::Role::Assistant,
+            text: String::new(),
+            tool_calls: vec![call.clone()],
+            tool_call_id: None,
+        });
+        let result = self.execute_tool(&observed, &call).await;
+        self.history.push(loon_providers::ChatMessage::tool_result(
+            call.id,
+            result.model_text.clone(),
+        ));
+        if result.ok {
+            self.emit_async(AgentEvent::MemberNote(format!(
+                "verification · `{command}` passed"
+            )))
+            .await;
+            return Ok(false);
+        }
+        if *rounds >= self.cfg.ultra_rounds {
+            return Err(format!(
+                "verification `{command}` still fails after {} repair rounds\n{}",
+                *rounds, result.model_text
+            ));
+        }
+        *rounds += 1;
+        let prompt = format!("[ultra loop] Required verification `{command}` did not pass.\n{}\nRead the error, fix the cause or use a different approach, and verify again. Do not claim completion or bypass permission denials.", result.model_text);
+        let _ = self.journal.append(
+            None,
+            EventKind::UserMessage {
+                text: prompt.clone(),
+            },
+        );
+        self.history.push(loon_providers::ChatMessage::user(prompt));
+        Ok(true)
+    }
+
+    fn repair_interrupted_calls(&mut self) {
+        let mut missing = Vec::new();
+        for (i, message) in self.history.iter().enumerate() {
+            for call in &message.tool_calls {
+                let found = self.history[i + 1..]
+                    .iter()
+                    .take_while(|m| m.role == loon_providers::Role::Tool)
+                    .any(|m| m.tool_call_id.as_deref() == Some(&call.id));
+                if !found {
+                    missing.push((i, call.id.clone()));
+                }
+            }
+        }
+        for (index, id) in missing.into_iter().rev() {
+            self.history.insert(index + 1, loon_providers::ChatMessage::tool_result(id,
+                "[Interrupted before a result was recorded. Execution outcome unknown; inspect workspace state before retrying a mutation.]"));
+        }
+    }
+}
+
+/// How many times one identical invalid call may be rejected before the turn stops.
+const MAX_IDENTICAL_REJECTIONS: u32 = 4;
+
+/// One line describing what a tool call is doing, for the transcript header:
+/// `$ cargo test` for shell, the path for file tools, the pattern for searches.
+fn tool_detail(name: &str, args: &serde_json::Value) -> String {
+    let s = |k: &str| {
+        args.get(k)
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+    };
+    match name {
+        "bash" => format!("$ {}", s("command")),
+        "read" | "write" | "edit" | "fuzzy_edit" | "multi_edit" | "read_json" | "json_edit"
+        | "notebook_read" | "notebook_edit" | "file_info" | "list_directory" | "project_info" => {
+            s("path").to_string()
+        }
+        "grep" => {
+            let pattern = s("pattern");
+            let path = s("path");
+            if path.is_empty() {
+                pattern.to_string()
+            } else {
+                format!("{pattern} in {path}")
+            }
+        }
+        "glob" => s("pattern").to_string(),
+        "tree" => {
+            let path = s("path");
+            if path.is_empty() {
+                ".".into()
+            } else {
+                path.to_string()
+            }
+        }
+        "delegate" => s("task").to_string(),
+        "context7_search" | "context7_resolve_library" | "context7_query_docs" => {
+            format!("Context7 · {}", s("query"))
+        }
+        "find_symbol" => format!("{} in {}", s("symbol"), s("path")),
+        "run_tests" | "run_build" | "run_lint" => format!(
+            "{name} · {}",
+            if s("path").is_empty() { "." } else { s("path") }
+        ),
+        n if n.starts_with("git_") => format!("{} {} {}", n, s("revision"), s("path"))
+            .trim()
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Parse a tool call's arguments, unwrapping the double-encoded form some gateways
+/// produce (`"{\"path\":\"a\"}"` — a JSON string containing the object).
+fn parse_tool_arguments(raw: &str) -> Result<serde_json::Value, serde_json::Error> {
+    let value: serde_json::Value = serde_json::from_str(raw)?;
+    if let serde_json::Value::String(inner) = &value {
+        if let Ok(nested) = serde_json::from_str::<serde_json::Value>(inner) {
+            if nested.is_object() {
+                return Ok(nested);
+            }
+        }
+    }
+    Ok(value)
 }
 
 async fn cancel_changed(rx: &mut watch::Receiver<bool>) {
@@ -1144,27 +2063,6 @@ async fn cancel_changed(rx: &mut watch::Receiver<bool>) {
         if rx.changed().await.is_err() {
             std::future::pending::<()>().await;
         }
-    }
-}
-
-trait InsertToolAware {
-    /// Insert an assistant message *before* any trailing tool results, keeping
-    /// tool-call → result adjacency intact for both wire protocols.
-    fn insert_tool_aware(&mut self, msg: loon_providers::ChatMessage);
-}
-
-impl InsertToolAware for Vec<loon_providers::ChatMessage> {
-    fn insert_tool_aware(&mut self, msg: loon_providers::ChatMessage) {
-        if msg.role == loon_providers::Role::Assistant {
-            if let Some(pos) = self
-                .iter()
-                .rposition(|m| m.role != loon_providers::Role::Tool)
-            {
-                self.insert(pos + 1, msg);
-                return;
-            }
-        }
-        self.push(msg);
     }
 }
 
@@ -1184,19 +2082,21 @@ impl Agent {
     async fn auto_review_then_ask(&self, tool: &str, args: &serde_json::Value) -> bool {
         match self.reviewer_verdict(tool, args).await {
             Some(true) => {
-                self.emit(AgentEvent::MemberNote(format!(
+                self.emit_async(AgentEvent::MemberNote(format!(
                     "auto review: {tool} allowed by reviewer"
-                )));
+                )))
+                .await;
                 true
             }
             verdict => {
-                self.emit(AgentEvent::MemberNote(format!(
+                self.emit_async(AgentEvent::MemberNote(format!(
                     "auto review: {tool} {}— asking you",
                     match verdict {
                         Some(false) => "DENIED ",
                         _ => "unclear ",
                     }
-                )));
+                )))
+                .await;
                 self.request_approval(tool, args).await
             }
         }
@@ -1208,10 +2108,11 @@ impl Agent {
             .chars()
             .take(200)
             .collect();
-        self.emit(AgentEvent::ApprovalRequested {
+        self.emit_async(AgentEvent::ApprovalRequested {
             tool: tool.to_string(),
             args_excerpt: args_excerpt.clone(),
-        });
+        })
+        .await;
         match &self.approval_hook {
             Some(hook) => {
                 let req = permissions::ApprovalRequest {

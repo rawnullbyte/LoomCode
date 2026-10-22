@@ -179,7 +179,7 @@ fn normalize_with_map(s: &str) -> (String, Vec<usize>) {
             }
         } else {
             out.push(ch);
-            map.push(i);
+            map.resize(map.len() + ch.len_utf8(), i);
             in_ws = false;
         }
     }

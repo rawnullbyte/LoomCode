@@ -29,6 +29,9 @@ pub struct ProviderRegistry {
     pub chat: Arc<ChatCompletionsAdapter>,
     pub responses: Arc<ResponsesAdapter>,
     pub mock: Arc<MockProvider>,
+    /// Providers that asked us to back off, and until when. Shared across clones so a
+    /// cooldown earned in one request is honoured by every later one.
+    cooldowns: Arc<std::sync::Mutex<BTreeMap<String, std::time::Instant>>>,
 }
 
 /// What a model reference (`alias`, `provider/model`, or `combo:NAME`) resolved to.
@@ -57,6 +60,7 @@ impl ProviderRegistry {
             chat,
             responses,
             mock,
+            cooldowns: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -73,7 +77,73 @@ impl ProviderRegistry {
             chat,
             responses,
             mock,
+            cooldowns: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
+    }
+
+    /// Reload definitions without replacing pooled transports or the mock script queue.
+    pub fn reconfigure(&mut self, cfg: &loon_config::Config) {
+        self.providers = cfg.providers.clone();
+        self.models = cfg.models.clone();
+        self.combos = cfg.combos.clone();
+        self.cooldowns
+            .lock()
+            .expect("cooldown lock")
+            .retain(|name, _| self.providers.contains_key(name));
+    }
+
+    /// Remember that a provider asked us to wait. `model` scopes the cooldown when the
+    /// failure was model-specific (a rate limit usually is per account, so the provider
+    /// id is the default key).
+    pub fn note_cooldown(&self, provider: &str, wait: std::time::Duration) {
+        let until = std::time::Instant::now() + wait.min(std::time::Duration::from_secs(300));
+        self.cooldowns
+            .lock()
+            .expect("cooldown lock")
+            .insert(provider.to_string(), until);
+    }
+
+    /// Remaining cooldown for a provider, or `None` when it may be used now.
+    pub fn cooldown_remaining(&self, provider: &str) -> Option<std::time::Duration> {
+        let mut guard = self.cooldowns.lock().expect("cooldown lock");
+        let now = std::time::Instant::now();
+        match guard.get(provider) {
+            Some(until) if *until > now => Some(*until - now),
+            Some(_) => {
+                guard.remove(provider);
+                None
+            }
+            None => None,
+        }
+    }
+
+    pub fn provider_names(&self) -> Vec<String> {
+        self.providers.keys().cloned().collect()
+    }
+
+    pub fn model_refs(&self) -> Vec<String> {
+        let mut refs: Vec<String> = self
+            .models
+            .values()
+            .map(|m| format!("{}/{}", m.provider, m.id))
+            .collect();
+        for (name, p) in &self.providers {
+            refs.extend(p.models.iter().map(|id| format!("{name}/{id}")));
+        }
+        refs.sort();
+        refs.dedup();
+        refs
+    }
+
+    pub fn reasoning_level(&self, provider: &str, requested: &str) -> Option<String> {
+        let levels = &self.providers.get(provider)?.reasoning_efforts;
+        let order = ["low", "medium", "high", "xhigh", "max"];
+        let rank = order.iter().position(|s| *s == requested)?;
+        order[..=rank]
+            .iter()
+            .rev()
+            .find(|s| levels.iter().any(|l| l == **s))
+            .map(|s| s.to_string())
     }
 
     pub fn provider(&self, id: &str) -> Option<&Provider> {
@@ -95,9 +165,11 @@ impl ProviderRegistry {
     /// All selectable model references: model names and `combo:NAME` entries.
     pub fn list_refs(&self) -> Vec<String> {
         let mut out: Vec<String> = self.models.keys().cloned().collect();
+        out.extend(self.model_refs());
         let mut combos: Vec<String> = self.combos.keys().map(|c| format!("combo:{c}")).collect();
         out.append(&mut combos);
         out.sort();
+        out.dedup();
         out
     }
 
@@ -121,7 +193,7 @@ impl ProviderRegistry {
         }
         // `provider/model` form
         if let Some((p, m)) = model_ref.split_once('/') {
-            if self.providers.contains_key(p) {
+            if self.providers.contains_key(p) && !m.trim().is_empty() {
                 return Ok(ResolvedModel::Single {
                     provider_id: p.to_string(),
                     model_id: m.to_string(),
@@ -150,8 +222,12 @@ impl ProviderRegistry {
                 std::time::Duration::from_secs(p.timeout_secs),
             ));
         }
-        let api_key = match &p.api_key_env {
-            Some(envv) => match std::env::var(envv) {
+        // Credential precedence: an inline key written by /provider wins; otherwise
+        // the configured env var must actually resolve (empty/unset is an error, not
+        // a silent anonymous request).
+        let api_key = match (&p.api_key, &p.api_key_env) {
+            (Some(k), _) if !k.trim().is_empty() => Some(k.clone()),
+            (_, Some(envv)) => match std::env::var(envv) {
                 Ok(v) if !v.trim().is_empty() => Some(v),
                 _ => {
                     return Err(format!(
@@ -159,7 +235,7 @@ impl ProviderRegistry {
                     ))
                 }
             },
-            None => None,
+            _ => None,
         };
         Ok(Endpoint::from_parts(
             &p.base_url,
@@ -201,6 +277,13 @@ impl ProviderRegistry {
             }
         }
         snap
+    }
+
+    pub fn output_limit(&self, provider: &str, model: &str) -> Option<u64> {
+        self.models
+            .values()
+            .find(|m| m.provider == provider && m.id == model)
+            .and_then(|m| m.max_output_tokens)
     }
 
     pub fn context_window(&self, provider_id: &str, model_ref: &str) -> Option<u64> {

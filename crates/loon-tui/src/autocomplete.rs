@@ -66,7 +66,7 @@ pub fn argument_suggestions(line: &str) -> Vec<Completion> {
                 })
                 .collect()
         }
-        ("effort", 0) => ["low", "medium", "high"]
+        ("effort", 0) => ["low", "medium", "high", "xhigh", "ultra"]
             .into_iter()
             .filter(|v| v.starts_with(partial))
             .map(|v| Completion {
@@ -75,7 +75,30 @@ pub fn argument_suggestions(line: &str) -> Vec<Completion> {
                 description: String::new(),
             })
             .collect(),
-        ("theme", 0) => ["transparent", "opaque"]
+        ("theme", 0) => [
+            "terminal", "dark", "light", "ocean", "violet", "ember", "graphite",
+        ]
+        .into_iter()
+        .filter(|v| v.starts_with(partial))
+        .map(|v| Completion {
+            display: v.to_string(),
+            insert: v.to_string(),
+            description: String::new(),
+        })
+        .collect(),
+        // Token sizes accept shorthand (`1m`, `100k`) and percentages for /autocompact.
+        ("autocompact", 0) => [
+            "50k", "100k", "200k", "1m", "80%", "90%", "on", "off", "auto",
+        ]
+        .into_iter()
+        .filter(|v| v.starts_with(partial))
+        .map(|v| Completion {
+            display: v.to_string(),
+            insert: v.to_string(),
+            description: String::new(),
+        })
+        .collect(),
+        ("context", 0) => ["1m", "200k", "100k", "50k", "90%", "80%", "off", "auto"]
             .into_iter()
             .filter(|v| v.starts_with(partial))
             .map(|v| Completion {
@@ -137,7 +160,7 @@ mod tests {
         let names: Vec<&str> = c.iter().map(|x| x.insert.as_str()).collect();
         assert_eq!(
             names,
-            vec!["redo", "rewind", "recap"],
+            vec!["redo", "rewind", "recap", "resume", "rename"],
             "prefix on the word, args ignored"
         );
         // argument hints still shown
@@ -191,8 +214,8 @@ mod argument_tests {
     fn effort_and_theme_argument_suggestions() {
         let e = completions_for("/effort ");
         let names: Vec<&str> = e.iter().map(|c| c.insert.as_str()).collect();
-        assert_eq!(names, vec!["low", "medium", "high"]);
-        let t = completions_for("/theme op");
-        assert_eq!(t[0].insert, "opaque");
+        assert_eq!(names, vec!["low", "medium", "high", "xhigh", "ultra"]);
+        let t = completions_for("/theme oc");
+        assert_eq!(t[0].insert, "ocean");
     }
 }

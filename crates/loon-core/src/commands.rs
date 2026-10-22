@@ -8,6 +8,15 @@ use crate::Agent;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
+    UltraLoop {
+        args: Vec<String>,
+    },
+    UltraCode {
+        task: String,
+    },
+    Tools {
+        name: Option<String>,
+    },
     Undo,
     Redo,
     /// /rewind [n] [conversation|workspace|both]
@@ -22,7 +31,10 @@ pub enum SlashCommand {
         name: String,
     },
     Compact,
-    Context,
+    /// /context [SIZE|PERCENT%] — usage report, or set the window in one command.
+    Context {
+        size: Option<String>,
+    },
     Diff,
     /// /memory — show; /memory global|workspace — show one scope;
     /// /memory <scope> <text> — save.
@@ -38,7 +50,7 @@ pub enum SlashCommand {
     Config {
         args: Vec<String>,
     },
-    /// /new — abandon this session, start fresh (journal kept).
+    /// /new — abandon this session, start fresh (journal kept). `/clear` is an alias.
     New,
     /// /resume [n|id] — list sessions or switch to one.
     Resume {
@@ -50,6 +62,23 @@ pub enum SlashCommand {
     },
     /// /theme — cycle transparent/opaque.
     Theme,
+    ThemeSet {
+        name: String,
+    },
+    Tasks {
+        args: Vec<String>,
+    },
+    Agents,
+    Context7,
+    PlanMode {
+        setting: String,
+    },
+    Todos {
+        args: Vec<String>,
+    },
+    Notes {
+        args: Vec<String>,
+    },
     /// /usage — per-day token/request totals from the journal.
     Usage,
     /// /init — generate AGENTS.md for this workspace.
@@ -62,8 +91,10 @@ pub enum SlashCommand {
     Combo {
         args: Vec<String>,
     },
-    /// /mcp — list connected MCP tools.
-    Mcp,
+    /// /mcp — browse, add, edit, remove or reconnect MCP servers.
+    Mcp {
+        args: Vec<String>,
+    },
     /// /shadow <path> — the mutation history of one file, restorable via /undo.
     Shadow {
         path: String,
@@ -86,16 +117,6 @@ pub enum SlashCommand {
     /// /export [path] — write the session as Markdown.
     Export {
         path: Option<String>,
-    },
-    /// /clear — wipe the visible transcript (TUI).
-    Clear,
-    /// hidden: settings-menu dispatch for max steps.
-    MaxSteps {
-        value: u32,
-    },
-    /// hidden: settings-menu dispatch for the tool output cap.
-    ToolCap {
-        bytes: usize,
     },
     /// /workflows — list user-defined skills (workflows).
     Workflows,
@@ -148,6 +169,15 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
     let args: Vec<&str> = parts.collect();
     let cmd = match name {
         "help" => SlashCommand::Help,
+        "ultraloop" => SlashCommand::UltraLoop {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
+        "ultracode" => SlashCommand::UltraCode {
+            task: args.join(" "),
+        },
+        "tools" => SlashCommand::Tools {
+            name: args.first().map(|s| s.to_string()),
+        },
         "undo" => SlashCommand::Undo,
         "redo" => SlashCommand::Redo,
         "rewind" => {
@@ -170,7 +200,9 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
             name: args.join(" "),
         },
         "compact" => SlashCommand::Compact,
-        "context" => SlashCommand::Context,
+        "context" => SlashCommand::Context {
+            size: (!args.is_empty()).then(|| args.join(" ")),
+        },
         "diff" => SlashCommand::Diff,
         "memory" => match args.len() {
             0 => SlashCommand::Memory {
@@ -198,41 +230,49 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         "model" => SlashCommand::Model {
             reference: (!args.is_empty()).then(|| args.join(" ")),
         },
-        "config" => SlashCommand::Config {
+        "config" | "settings" => SlashCommand::Config {
             args: args.iter().map(|s| s.to_string()).collect(),
         },
-        "new" => SlashCommand::New,
+        "new" | "clear" => SlashCommand::New,
         "resume" => SlashCommand::Resume {
             target: (!args.is_empty()).then(|| args.join(" ")),
         },
         "rename" => SlashCommand::Rename {
             title: args.join(" "),
         },
-        "theme" => SlashCommand::Theme,
-        "usage" => SlashCommand::Usage,
-        "init" => SlashCommand::Init,
-        "provider" => SlashCommand::Provider {
+        "theme" => {
+            if args.is_empty() {
+                SlashCommand::Theme
+            } else {
+                SlashCommand::ThemeSet {
+                    name: args.join(" "),
+                }
+            }
+        }
+        "todos" | "todo" => SlashCommand::Todos {
             args: args.iter().map(|s| s.to_string()).collect(),
         },
-        "combo" => SlashCommand::Combo {
+        "notes" | "note" => SlashCommand::Notes {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
+        "usage" => SlashCommand::Usage,
+        "init" => SlashCommand::Init,
+        "provider" | "providers" => SlashCommand::Provider {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
+        "combo" | "combos" => SlashCommand::Combo {
             args: args.iter().map(|s| s.to_string()).collect(),
         },
         "export" => SlashCommand::Export {
             path: (!args.is_empty()).then(|| args.join(" ")),
         },
-        "clear" => SlashCommand::Clear,
-        "maxsteps" => SlashCommand::MaxSteps {
-            value: args.first().and_then(|a| a.parse().ok()).unwrap_or(0),
-        },
-        "toolcap" => SlashCommand::ToolCap {
-            bytes: args.first().and_then(|a| a.parse().ok()).unwrap_or(0),
-        },
         "find" => SlashCommand::Find {
             query: args.join(" "),
         },
         "doctor" => SlashCommand::Doctor,
+        "sessions" if args.first() != Some(&"search") => SlashCommand::Resume { target: None },
         "sessions" => SlashCommand::SessionsSearch {
-            query: args.join(" "),
+            query: args[1..].join(" "),
         },
         "shadow-restore" => SlashCommand::ShadowRestore {
             seq: args.first().and_then(|a| a.parse().ok()).unwrap_or(0),
@@ -241,8 +281,10 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         "shadow" => SlashCommand::Shadow {
             path: args.join(" "),
         },
-        "mcp" => SlashCommand::Mcp,
-        "workflows" => SlashCommand::Workflows,
+        "mcp" => SlashCommand::Mcp {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
+        "workflows" | "skills" => SlashCommand::Workflows,
         "autocompact" => SlashCommand::AutoCompact {
             setting: args.first().copied().unwrap_or("toggle").to_string(),
         },
@@ -263,6 +305,14 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         "loops" => SlashCommand::Loops,
         "loopcancel" => SlashCommand::LoopCancel {
             id: args.first().and_then(|a| a.parse().ok()).unwrap_or(0),
+        },
+        "context7" => SlashCommand::Context7,
+        "tasks" => SlashCommand::Tasks {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
+        "agents" => SlashCommand::Agents,
+        "plan" => SlashCommand::PlanMode {
+            setting: args.first().copied().unwrap_or("status").to_string(),
         },
         "quit" | "exit" => SlashCommand::Quit,
         // Anything else may be a user-defined skill: resolved against the agent's
@@ -310,14 +360,77 @@ pub fn settings_registry() -> Vec<SettingDef> {
     use SettingKind::*;
     vec![
         SettingDef {
+            key: "ultraloop",
+            description: "independent completion review for this session",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "ultraloop_limit",
+            description: "supervisor reviews; 0 is unlimited",
+            kind: Int {
+                min: 0,
+                max: 1_000_000,
+            },
+        },
+        SettingDef {
+            key: "supervisor_model",
+            description: "reviewer model reference; empty uses the current model",
+            kind: Text,
+        },
+        SettingDef {
+            key: "plan_mode",
+            description: "inspection and planning only; block workspace mutations",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "session_goal",
+            description: "durable goal for the current session",
+            kind: Text,
+        },
+        SettingDef {
+            key: "check_command",
+            description: "required verification command; empty disables",
+            kind: Text,
+        },
+        SettingDef {
+            key: "ultra_rounds",
+            description: "verification repair attempts; 0 disables",
+            kind: Int { min: 0, max: 1000 },
+        },
+        SettingDef {
+            key: "max_retries",
+            description: "retry budget for transient provider failures",
+            kind: Int { min: 0, max: 10 },
+        },
+        SettingDef {
+            key: "animations",
+            description: "animate activity, progress, modals and tool calls",
+            kind: Bool,
+        },
+        SettingDef {
+            key: "popup_rows",
+            description: "visible slash command suggestions",
+            kind: Int { min: 3, max: 20 },
+        },
+        SettingDef {
             key: "tips",
             description: "show the input placeholder tip",
             kind: Bool,
         },
         SettingDef {
             key: "theme",
-            description: "transparent | opaque",
-            kind: Enum(&["transparent", "opaque"]),
+            description: "terminal | dark | light | ocean | violet | ember | graphite",
+            kind: Enum(&[
+                "terminal",
+                "dark",
+                "light",
+                "ocean",
+                "violet",
+                "ember",
+                "graphite",
+                "transparent",
+                "opaque",
+            ]),
         },
         SettingDef {
             key: "permission_mode",
@@ -326,8 +439,13 @@ pub fn settings_registry() -> Vec<SettingDef> {
         },
         SettingDef {
             key: "effort",
-            description: "low | medium | high output budget",
-            kind: Enum(&["low", "medium", "high"]),
+            description: "coding budget and supported provider reasoning",
+            kind: Enum(&["low", "medium", "high", "xhigh", "ultra"]),
+        },
+        SettingDef {
+            key: "context7_key_env",
+            description: "environment variable holding your Context7 API key",
+            kind: Text,
         },
         SettingDef {
             key: "model",
@@ -336,18 +454,10 @@ pub fn settings_registry() -> Vec<SettingDef> {
         },
         SettingDef {
             key: "context_window",
-            description: "tokens; 0 disables compaction",
+            description: "tokens (1m, 200k) or a number; 0 disables compaction",
             kind: Int {
                 min: 0,
                 max: 10_000_000,
-            },
-        },
-        SettingDef {
-            key: "max_steps",
-            description: "tool/request steps per turn",
-            kind: Int {
-                min: 1,
-                max: 10_000,
             },
         },
         SettingDef {
@@ -359,9 +469,17 @@ pub fn settings_registry() -> Vec<SettingDef> {
             },
         },
         SettingDef {
-            key: "check_command",
-            description: "Ultra Loop verify command (e.g. cargo test)",
-            kind: Text,
+            key: "autocompact_tokens",
+            description: "estimated tokens before compaction (50k, 1m); 0 uses 80% of capacity",
+            kind: Int {
+                min: 0,
+                max: 10_000_000,
+            },
+        },
+        SettingDef {
+            key: "autocompact_percent",
+            description: "compact at this percent of the window (1-99); 0 uses 80%",
+            kind: Int { min: 0, max: 99 },
         },
         SettingDef {
             key: "autocompact",
@@ -381,6 +499,18 @@ pub fn setting_def(key: &str) -> Option<SettingDef> {
 pub fn command_list() -> Vec<(&'static str, &'static str)> {
     vec![
         ("help", "this list"),
+        (
+            "ultraloop [GOAL|on|off|status|limit N|model REF]",
+            "independent supervisor continues unfinished work",
+        ),
+        (
+            "ultracode [TASK]",
+            "maximum coding effort; optionally start a task",
+        ),
+        (
+            "tools",
+            "browse available tools, effects and parameter schemas",
+        ),
         ("undo", "undo the newest file mutation"),
         ("redo", "redo the newest undone mutation"),
         (
@@ -390,14 +520,20 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
         ("checkpoint NAME", "mark a restore point in the journal"),
         ("fork NAME", "fork the current session"),
         ("compact", "summarize older context now"),
-        ("context", "context window usage report"),
+        (
+            "context [1m|200k|90%|off]",
+            "context usage report; an argument sets the window",
+        ),
         ("diff", "files this session changed (from the journal)"),
         (
             "memory [global|workspace] [text]",
             "show or save persistent memory",
         ),
         ("model [REF]", "show or switch model/combos:NAME"),
-        ("config [set K V]", "show or change + persist configuration"),
+        (
+            "config [key[=value]]",
+            "show, change and persist one setting",
+        ),
         (
             "provider add NAME URL [api] [key_env]",
             "add an OpenAI-compatible provider",
@@ -411,13 +547,16 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
             "shadow-restore <seq> <path>",
             "restore a file to its state before seq",
         ),
-        ("mcp", "list connected MCP tools"),
+        ("mcp", "manage MCP servers and their tools"),
         ("workflows", "list user-defined skills (workflows)"),
         (
-            "autocompact on|off|toggle",
-            "enable/disable context compaction",
+            "autocompact [1m|200k|90%|on|off|auto]",
+            "compact at a token count or a % of the window",
         ),
-        ("effort low|medium|high", "output budget per request"),
+        (
+            "effort [low|medium|high|xhigh|ultra]",
+            "coding and reasoning effort",
+        ),
         ("goal <text|clear>", "session goal, kept in context"),
         ("btw <text>", "record context without triggering a turn"),
         ("recap", "summarize the session so far"),
@@ -427,6 +566,40 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
         ),
         ("loops", "list loop tasks"),
         ("loopcancel <id>", "cancel a loop task"),
+        (
+            "providers",
+            "browse, add, edit, refresh or remove providers",
+        ),
+        ("combos", "manage fallback and round-robin combos"),
+        ("settings", "searchable settings with descriptions"),
+        (
+            "theme [NAME]",
+            "choose a terminal, dark, light or ocean palette",
+        ),
+        ("sessions", "search and resume saved sessions"),
+        ("resume [ID|n]", "open session browser or resume a session"),
+        ("new", "start a new session; keep this one saved"),
+        ("clear", "start a new session (alias for /new)"),
+        ("rename TITLE", "rename the current session"),
+        ("skills", "list/reload bundled and custom skills"),
+        (
+            "tasks",
+            "durable tasks: add, get, start, done, block, remove",
+        ),
+        ("agents", "list configured agent profiles"),
+        (
+            "context7",
+            "documentation tools and API-key environment status",
+        ),
+        (
+            "plan",
+            "on/off/status: inspect safely before allowing workspace changes",
+        ),
+        (
+            "todos [add|start|done|block|remove N]",
+            "manage the durable session plan",
+        ),
+        ("notes [add TEXT|remove N]", "manage session working notes"),
         ("quit", "exit"),
     ]
 }
@@ -471,6 +644,44 @@ impl Agent {
                     .map_err(|e| e.to_string())?;
                 Ok(format!("redo: {report}"))
             }
+            // Bare /rewind in an interactive session opens a picker: the raw report is
+            // useless for choosing, the list of turns and what they changed is not.
+            SlashCommand::Rewind { n, mode }
+                if mode.is_none() && n == 1 && self.events.is_some() =>
+            {
+                let events = self.journal.events().map_err(|e| format!("journal: {e}"))?;
+                let entries = crate::rewind::rewind_entries(&self.journal, &events);
+                if entries.is_empty() {
+                    return Ok("nothing to rewind — no request boundaries yet".into());
+                }
+                let items = entries
+                    .iter()
+                    .map(|e| crate::catalog::MenuItem {
+                        label: if e.prompt.is_empty() {
+                            format!("(no prompt) · rewind {}", e.n)
+                        } else {
+                            e.prompt.clone()
+                        },
+                        detail: if e.files_changed == 0 {
+                            "No code changes".into()
+                        } else {
+                            format!(
+                                "{} file{} changed +{} −{}",
+                                e.files_changed,
+                                if e.files_changed == 1 { "" } else { "s" },
+                                e.added,
+                                e.removed
+                            )
+                        },
+                        command: format!("/rewind {} both", e.n),
+                    })
+                    .collect();
+                self.emit(crate::AgentEvent::OpenMenu {
+                    title: "Rewind".into(),
+                    items,
+                });
+                Ok(String::new())
+            }
             SlashCommand::Rewind { n, mode } => {
                 let mode = match mode.as_deref() {
                     None => RewindMode::ConversationAndWorkspace,
@@ -489,16 +700,42 @@ impl Agent {
                     mode,
                 )
                 .map_err(|e| e.to_string())?;
-                Ok(format!(
-                    "rewound {n} boundary(ies) ({}): history now {} message(s){}",
-                    mode_str,
+                let report = format!(
+                    "rewound {n} boundary(ies) ({mode_str}): history now {} message(s){}",
                     outcome.history_len_after,
                     outcome
                         .restore
                         .as_ref()
                         .map(|r| format!(", {r}"))
                         .unwrap_or_default()
-                ))
+                );
+                if outcome.mode != RewindMode::WorkspaceOnly {
+                    let blocks = crate::replay::visible_blocks(
+                        &events,
+                        Some(outcome.boundary.truncate_to_seq),
+                    );
+                    self.emit_async(crate::AgentEvent::ConversationRewound {
+                        blocks,
+                        prompt: outcome.prompt,
+                    })
+                    .await;
+                    self.emit_async(crate::AgentEvent::ContextUpdated {
+                        tokens: self.estimated_context_tokens(),
+                    })
+                    .await;
+                    // Keep file conflicts visible; ordinary rewinds replace the
+                    // transcript atomically without adding another status message.
+                    if self.events.is_some()
+                        && outcome
+                            .restore
+                            .as_ref()
+                            .map(|r| r.conflicts.is_empty())
+                            .unwrap_or(true)
+                    {
+                        return Ok(String::new());
+                    }
+                }
+                Ok(report)
             }
             SlashCommand::Checkpoint { name } => {
                 let seq = crate::rewind::checkpoint(&self.journal, &self.events()?, &name)
@@ -512,14 +749,24 @@ impl Agent {
                     "fork `{name}` created at seq {seq} (new session id journaled)"
                 ))
             }
-            SlashCommand::Compact => {
-                if self.compact_now().await {
-                    Ok("context compacted".into())
-                } else {
+            SlashCommand::Compact => match self.compact_report(true).await {
+                crate::compaction::CompactOutcome::Compacted {
+                    before_tokens,
+                    after_tokens,
+                } => Ok(format!(
+                    "context compacted: ~{before_tokens} → ~{after_tokens} est. tokens (estimate)"
+                )),
+                crate::compaction::CompactOutcome::NothingToDo => {
                     Ok("nothing to compact: only recent exchanges in context".into())
                 }
-            }
-            SlashCommand::Context => Ok(self.context_report()),
+                crate::compaction::CompactOutcome::Failed(reason) => Ok(format!(
+                    "compaction failed: {reason} — history retained (/model REF picks another summarizer)"
+                )),
+            },
+            SlashCommand::Context { size } => match size {
+                None => Ok(self.context_report()),
+                Some(size) => self.set_context_size(&size),
+            },
             SlashCommand::Diff => Ok(self.diff_report()),
             SlashCommand::Memory { scope, text } => {
                 let paths = self.memory_paths()?;
@@ -555,9 +802,17 @@ impl Agent {
             }
             SlashCommand::Model { reference } => match reference {
                 None if self.events.is_some() => {
-                    self.emit(crate::AgentEvent::OpenModelPicker {
-                        refs: self.registry.list_refs(),
-                    });
+                    self.open_catalog("models");
+                    let missing = self
+                        .catalog()
+                        .providers
+                        .into_iter()
+                        .filter(|p| p.count == 0 && !self.registry.is_mock(&p.name))
+                        .map(|p| p.name)
+                        .collect::<Vec<_>>();
+                    if !missing.is_empty() {
+                        self.refresh_catalogs(missing).await;
+                    }
                     Ok(String::new())
                 }
                 None => Ok(format!(
@@ -565,17 +820,101 @@ impl Agent {
                     self.cfg.model_ref, self.cfg.context_window
                 )),
                 Some(r) => {
-                    self.registry.resolve(&r)?;
-                    self.cfg.model_ref = r.clone();
-                    Ok(format!(
-                        "model switched to {r} (takes effect on the next request)"
-                    ))
+                    if r == "refresh" {
+                        return self
+                            .provider_command(vec!["refresh".into(), "all".into()])
+                            .await;
+                    }
+                    if self.events.is_some() && (r == "all" || self.registry.provider(&r).is_some())
+                    {
+                        self.open_catalog(&format!("models:{r}"));
+                        return Ok(String::new());
+                    }
+                    self.choose_model(&r)
                 }
             },
+            SlashCommand::Context7 => {
+                if self.events.is_some() {
+                    self.config_ui_command(vec![
+                        "open".into(),
+                        crate::config_ui::encode("/context7"),
+                    ])
+                    .await
+                } else {
+                    Ok(self.context7_status())
+                }
+            }
+            SlashCommand::Tasks { args } => {
+                let tool = crate::tasks::TaskTool {
+                    log: self.worklog.clone(),
+                };
+                let value = match args.first().map(String::as_str) {
+                    None | Some("list") => serde_json::json!({"action":"list"}),
+                    Some("add" | "create") => {
+                        serde_json::json!({"action":"create","subject":args[1..].join(" ")})
+                    }
+                    Some("get" | "remove") => {
+                        serde_json::json!({"action":args[0],"id":args.get(1).and_then(|s|s.parse::<u64>().ok())})
+                    }
+                    Some("done" | "start" | "block") => {
+                        serde_json::json!({"action":"update","id":args.get(1).and_then(|s|s.parse::<u64>().ok()),"status":match args[0].as_str() {"done"=>"completed","start"=>"in_progress",_=>"blocked"}})
+                    }
+                    _ => {
+                        return Err(
+                            "usage: /tasks [add TEXT|get ID|start ID|done ID|block ID|remove ID]"
+                                .into(),
+                        )
+                    }
+                };
+                tool.apply(value).map_err(|e| e.to_string())
+            }
+            SlashCommand::PlanMode { setting } => {
+                let state = self
+                    .worklog
+                    .update(|state| {
+                        match setting.as_str() {
+                            "on" => state.plan_mode = true,
+                            "off" => state.plan_mode = false,
+                            "status" => {}
+                            _ => {
+                                return Err(loon_tools::ToolError::InvalidArgs(
+                                    "usage: /plan on|off|status".into(),
+                                ))
+                            }
+                        };
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                let text = format!(
+                    "plan mode: {}",
+                    if state.plan_mode {
+                        "on — workspace mutations blocked"
+                    } else {
+                        "off"
+                    }
+                );
+                self.emit(crate::AgentEvent::WorkStateChanged { state });
+                Ok(text)
+            }
+            SlashCommand::Agents => Ok(crate::subagent::profiles(
+                &self.data_dir,
+                self.ctx.ws.root(),
+            )
+            .iter()
+            .map(|p| format!("{} — {}", p.name, p.description))
+            .collect::<Vec<_>>()
+            .join("\n")),
             SlashCommand::Skill { name, args } => {
+                self.skills = crate::skills::load_with_builtins(&self.data_dir, self.ctx.ws.root());
                 let Some(skill) = self.skills.iter().find(|s| s.name == name).cloned() else {
                     return Err(format!("unknown command `/{name}` — try /help"));
                 };
+                let _ = self.worklog.update(|s| {
+                    if !s.active_skills.contains(&name) {
+                        s.active_skills.push(name.clone());
+                    }
+                    Ok(())
+                });
                 let prompt = crate::skills::expand(&skill.body, &args);
                 self.emit(crate::AgentEvent::MemberNote(format!(
                     "running skill /{} ({} scope)",
@@ -606,6 +945,8 @@ impl Agent {
                 fresh.events = self.events.take();
                 fresh.loops = self.loops.clone();
                 *self = fresh;
+                self.refresh_delegate();
+                self.emit_session_loaded();
                 Ok(
                     "new session started (the old one stays in the journal — /resume to return)"
                         .into(),
@@ -619,6 +960,21 @@ impl Agent {
                     return Ok("no sessions yet".into());
                 }
                 let Some(target) = target else {
+                    if self.events.is_some() {
+                        let items = sessions
+                            .iter()
+                            .map(|m| crate::catalog::MenuItem {
+                                label: m.title.clone(),
+                                detail: format!("{} · {}", &m.id.to_string()[..8], m.cwd),
+                                command: format!("/resume {}", m.id),
+                            })
+                            .collect();
+                        self.emit(crate::AgentEvent::OpenMenu {
+                            title: "Sessions".into(),
+                            items,
+                        });
+                        return Ok(String::new());
+                    }
                     let mut out =
                         String::from("sessions (newest first — /resume <n> to switch):\n");
                     for (i, meta) in sessions.iter().take(10).enumerate() {
@@ -634,9 +990,16 @@ impl Agent {
                 };
                 let picked = match target.parse::<usize>() {
                     Ok(n) if n >= 1 && n <= sessions.len() => sessions[n - 1].id,
-                    _ => target
-                        .parse()
-                        .map_err(|_| format!("no session matching `{target}` — /resume lists"))?,
+                    _ => {
+                        let found: Vec<_> = sessions
+                            .iter()
+                            .filter(|s| s.id.to_string().starts_with(&target))
+                            .collect();
+                        if found.len() != 1 {
+                            return Err(format!("session id {target} is unknown or ambiguous"));
+                        }
+                        found[0].id
+                    }
                 };
                 let mut switched = Agent::resume(
                     &paths,
@@ -651,6 +1014,8 @@ impl Agent {
                 switched.events = self.events.take();
                 switched.loops = self.loops.clone();
                 *self = switched;
+                self.refresh_delegate();
+                self.emit_session_loaded();
                 Ok(format!("resumed session {picked}"))
             }
             SlashCommand::Rename { title } => {
@@ -663,9 +1028,31 @@ impl Agent {
                 Ok(format!("renamed to `{}`", title.trim()))
             }
             SlashCommand::Theme => {
-                self.emit(crate::AgentEvent::ToggleTheme);
-                Ok("theme cycled".into())
+                let items = [
+                    "terminal", "dark", "light", "ocean", "violet", "ember", "graphite",
+                ]
+                .into_iter()
+                .map(|n| crate::catalog::MenuItem {
+                    label: n.into(),
+                    detail: match n {
+                        "terminal" => "Transparent · terminal foreground and background",
+                        "dark" => "Graphite · cool blue accents",
+                        "light" => "Paper · dark text on light surface",
+                        _ => "Deep navy · teal accents",
+                    }
+                    .into(),
+                    command: format!("/theme {n}"),
+                })
+                .collect();
+                self.emit(crate::AgentEvent::OpenMenu {
+                    title: "Appearance".into(),
+                    items,
+                });
+                Ok("Choose /theme terminal|dark|light|ocean|violet|ember|graphite".into())
             }
+            SlashCommand::ThemeSet { name } => self.config_apply("theme", &name),
+            SlashCommand::Todos { args } => self.worklog_command(false, args),
+            SlashCommand::Notes { args } => self.worklog_command(true, args),
             SlashCommand::Usage => Ok(self.usage_report()),
             SlashCommand::Init => {
                 let prompt = "Survey this workspace (structure, language, build/test commands, conventions) and write an AGENTS.md at the repository root covering: project overview, build/test/lint commands, code style conventions, and gotchas. Read before you write; keep it under 60 lines.";
@@ -676,89 +1063,14 @@ impl Agent {
                     result.assistant_text
                 ))
             }
-            SlashCommand::Provider { args } => match args.first().map(|s| s.as_str()) {
-                Some("list") => {
-                    let mut out = String::new();
-                    for (name, def) in self.providers_snapshot() {
-                        out.push_str(&format!(
-                            "  {name}: {} ({})\n",
-                            def.base_url,
-                            def.api.as_str()
-                        ));
-                    }
-                    Ok(if out.is_empty() {
-                        "no providers configured".into()
-                    } else {
-                        out
-                    })
-                }
-                Some("add") => {
-                    let name = args
-                        .get(1)
-                        .ok_or("usage: /provider add NAME URL [api] [key_env]")?;
-                    let url = args.get(2).ok_or("missing BASE_URL")?;
-                    let api = args.get(3).map(|s| s.as_str()).unwrap_or("chat");
-                    let key_env = args.get(4).cloned();
-                    self.persist_provider(name, url, api, key_env.as_deref())
-                }
-                None if self.events.is_some() => {
-                    self.emit(crate::AgentEvent::OpenProviderForm);
-                    Ok(String::new())
-                }
-                _ => Err("usage: /provider (opens a form) | /provider list".into()),
-            },
-            SlashCommand::Combo { args } => match args.first().map(|s| s.as_str()) {
-                Some("list") => {
-                    let mut out = String::new();
-                    for (name, members) in self.combos_snapshot() {
-                        out.push_str(&format!("  {name}: {members}\n"));
-                    }
-                    Ok(if out.is_empty() {
-                        "no combos configured".into()
-                    } else {
-                        out
-                    })
-                }
-                Some("add") => {
-                    let name = args
-                        .get(1)
-                        .ok_or("usage: /combo add NAME provider:model ...")?;
-                    let members: Vec<&str> = args
-                        .get(2..)
-                        .map(|a| a.iter().map(|s| s.as_str()).collect())
-                        .unwrap_or_default();
-                    if members.is_empty() {
-                        return Err("at least one provider:model member required".into());
-                    }
-                    self.persist_combo(name, &members)
-                }
-                _ => Err("usage: /combo add NAME provider:model ... | /combo list".into()),
-            },
+            SlashCommand::Provider { args } => self.provider_command(args).await,
+            SlashCommand::Combo { args } => self.combo_command(args),
             SlashCommand::Export { path } => {
                 let path = path.unwrap_or_else(|| {
                     format!("loon-session-{}.md", &self.session_id.to_string()[..8])
                 });
                 let written = self.export_markdown(std::path::Path::new(&path))?;
                 Ok(format!("exported to {written}"))
-            }
-            SlashCommand::Clear => {
-                self.emit(crate::AgentEvent::ClearTranscript);
-                Ok(String::new())
-            }
-            SlashCommand::MaxSteps { value } => {
-                if value == 0 {
-                    return Err("max steps must be > 0".into());
-                }
-                self.cfg.max_steps = value;
-                Ok(format!("max steps set to {value} (session)"))
-            }
-            SlashCommand::ToolCap { bytes } => {
-                if bytes == 0 {
-                    return Err("output cap must be > 0".into());
-                }
-                self.cfg.tool_output_bytes = bytes;
-                self.ctx.output_limit = bytes;
-                Ok(format!("tool output cap set to {bytes} bytes (session)"))
             }
             SlashCommand::Find { query } => {
                 if query.trim().is_empty() {
@@ -800,6 +1112,57 @@ impl Agent {
                         hits.len(),
                         hits.into_iter().take(20).collect::<Vec<_>>().join("\n")
                     ))
+                }
+            }
+            SlashCommand::UltraCode { task } => {
+                self.config_apply("effort", "ultra")?;
+                if task.is_empty() {
+                    return Ok("Ultra Code enabled: maximum coding effort. /ultraloop GOAL adds independent completion review.".into());
+                }
+                let result = self.run_turn(&task).await;
+                Ok(format!("ultracode: {}", result.status.status_text()))
+            }
+            SlashCommand::UltraLoop { args } => self.ultraloop_command(args).await,
+            SlashCommand::Tools { name } => {
+                if let Some(name) = name {
+                    let tool = self
+                        .tools
+                        .get(&name)
+                        .ok_or_else(|| format!("unknown tool {name}"))?;
+                    let spec = tool.spec();
+                    return Ok(format!(
+                        "{} · {:?}\n{}\n\n{}",
+                        spec.name,
+                        spec.effects,
+                        spec.description,
+                        serde_json::to_string_pretty(&spec.parameters).unwrap_or_default()
+                    ));
+                }
+                let specs = self.tools.specs();
+                if self.events.is_some() {
+                    self.emit(crate::AgentEvent::OpenMenu {
+                        title: "Available tools".into(),
+                        items: specs
+                            .iter()
+                            .map(|s| crate::catalog::MenuItem {
+                                label: format!("{} · {:?}", s.name, s.effects),
+                                detail: s.description.clone(),
+                                command: format!("/tools {}", s.name),
+                            })
+                            .collect(),
+                    });
+                    Ok(String::new())
+                } else {
+                    Ok(specs
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{} ({:?}) — {}\n{}",
+                                s.name, s.effects, s.description, s.parameters
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n\n"))
                 }
             }
             SlashCommand::Doctor => {
@@ -949,25 +1312,30 @@ impl Agent {
                     content.len()
                 ))
             }
-            SlashCommand::Mcp => {
-                let mut out = String::new();
-                for spec in self.tools.specs() {
-                    if spec.name.starts_with("mcp_") {
-                        out.push_str(&format!("  {} — {}\n", spec.name, spec.description));
-                    }
-                }
-                if out.is_empty() {
-                    Ok("no MCP tools connected (configure [mcp.servers] and restart)".into())
-                } else {
-                    Ok(format!("connected MCP tools:\n{out}"))
-                }
-            }
+            SlashCommand::Mcp { args } => self.mcp_command(args).await,
             SlashCommand::Workflows => {
+                self.skills = crate::skills::load_with_builtins(&self.data_dir, self.ctx.ws.root());
                 if self.skills.is_empty() {
                     return Ok(
                         "no workflows yet — drop a <name>.md into .loon/skills/ or the global skills dir"
                             .into(),
                     );
+                }
+                if self.events.is_some() {
+                    let items = self
+                        .skills
+                        .iter()
+                        .map(|skill| crate::catalog::MenuItem {
+                            label: format!("/{}", skill.name),
+                            detail: format!("{} · {}", skill.scope, skill.path.display()),
+                            command: format!("/{}", skill.name),
+                        })
+                        .collect();
+                    self.emit(crate::AgentEvent::OpenMenu {
+                        title: "Workflows".into(),
+                        items,
+                    });
+                    return Ok(String::new());
                 }
                 let mut out = String::from("workflows (skills):\n");
                 for skill in &self.skills {
@@ -980,19 +1348,63 @@ impl Agent {
                 }
                 Ok(out)
             }
-            SlashCommand::AutoCompact { setting } => {
-                let enable = match setting.as_str() {
-                    "on" => true,
-                    "off" => false,
-                    "toggle" => self.cfg.context_window == 0,
-                    other => return Err(format!("unknown setting `{other}` — on|off|toggle")),
-                };
-                self.cfg.context_window = if enable { 128_000 } else { 0 };
-                Ok(format!(
-                    "autocompact {} (session only — /config set context_window N to persist)",
-                    if enable { "on" } else { "off" }
-                ))
-            }
+            SlashCommand::AutoCompact { setting } => match setting.as_str() {
+                "on" | "off" => self.config_apply("autocompact", &setting),
+                "toggle" => {
+                    let mode = if self.cfg.context_window == 0 {
+                        "on"
+                    } else {
+                        "off"
+                    };
+                    self.config_apply("autocompact", mode)
+                }
+                "auto" => {
+                    self.autocompact_percent = None;
+                    self.autocompact_tokens = None;
+                    let _ = self.config_apply("autocompact_percent", "0");
+                    let _ = self.config_apply("autocompact_tokens", "0");
+                    Ok(format!(
+                        "autocompact back to the default {}% of the window (~{} tokens)",
+                        (crate::compaction::COMPACT_THRESHOLD * 100.0) as u32,
+                        self.compaction_trigger_tokens()
+                    ))
+                }
+                _ => {
+                    use loon_config::tokens::{format_tokens, parse_token_spec, TokenSpec};
+                    let spec = parse_token_spec(setting.as_str()).ok_or(
+                        "usage: /autocompact 50000|50k|1m|90%|on|off|auto (minimum 1024 tokens)",
+                    )?;
+                    match spec {
+                        TokenSpec::Percent(p) => {
+                            let result = self.config_apply("autocompact_percent", &p.to_string())?;
+                            if self.cfg.context_window == 0 {
+                                self.config_apply("context_window", "128k")?;
+                            }
+                            Ok(format!(
+                                "{result}; effective trigger ~{} tokens",
+                                format_tokens(self.compaction_trigger_tokens())
+                            ))
+                        }
+                        TokenSpec::Tokens(tokens) => {
+                            if tokens < 1024 {
+                                return Err(
+                                    "usage: /autocompact 50000|50k|1m|90%|on|off|auto (minimum 1024 tokens)"
+                                        .into(),
+                                );
+                            }
+                            let result =
+                                self.config_apply("autocompact_tokens", &tokens.to_string())?;
+                            if self.cfg.context_window == 0 {
+                                self.config_apply("autocompact", "on")?;
+                            }
+                            Ok(format!(
+                                "{result}; effective trigger ~{} estimated tokens",
+                                format_tokens(self.compaction_trigger_tokens())
+                            ))
+                        }
+                    }
+                }
+            },
             SlashCommand::Effort { level } => {
                 if level.is_empty() {
                     // bare /effort: interactive hosts open the picker; headless lists
@@ -1000,27 +1412,34 @@ impl Agent {
                         self.emit(crate::AgentEvent::OpenEffortPicker);
                         return Ok(String::new());
                     }
-                    return Ok("usage: /effort low|medium|high (2k/8k/32k output tokens)".into());
+                    return Ok("usage: /effort low|medium|high|xhigh|ultra".into());
                 }
-                let tokens = match level.as_str() {
-                    "low" => 2_048,
-                    "medium" => 8_192,
-                    "high" => 32_768,
-                    other => return Err(format!("unknown effort `{other}` — low|medium|high")),
-                };
-                self.effort = Some(level);
-                Ok(format!(
-                    "effort set — max output {tokens} tokens per request"
-                ))
+                let effort = loon_config::Effort::parse(&level)
+                    .ok_or("effort must be low, medium, high, xhigh or ultra")?;
+                let applied = self.config_apply("effort", &level)?;
+                Ok(format!("{applied}; output budget {} tokens (capped by configured model); provider reasoning only when supported",effort.output_tokens()))
             }
+
             SlashCommand::Goal { text } => {
                 if text.trim().is_empty() || text.trim() == "clear" {
+                    self.worklog
+                        .update(|s| {
+                            s.goal = None;
+                            Ok(())
+                        })
+                        .map_err(|e| e.to_string())?;
                     let had = self.session_goal.take();
                     return Ok(match had {
                         Some(g) => format!("goal cleared (was: {g})"),
                         None => "no goal set".into(),
                     });
                 }
+                self.worklog
+                    .update(|s| {
+                        s.goal = Some(text.clone());
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
                 self.session_goal = Some(text.clone());
                 Ok(format!("goal set: {text}"))
             }
@@ -1050,7 +1469,20 @@ impl Agent {
                         self.cfg.model_ref.clone(),
                     ),
                 };
-                let summary = summarizer(transcript).await;
+                let summary = match summarizer(transcript).await {
+                    Ok(summary) if !summary.trim().is_empty() => summary,
+                    Ok(_) => {
+                        return Ok(
+                            "recap failed: the summarizer returned no text — nothing compacted"
+                                .into(),
+                        );
+                    }
+                    Err(reason) => {
+                        return Ok(format!(
+                            "recap failed: {reason} — nothing compacted (/model REF picks another summarizer)"
+                        ));
+                    }
+                };
                 Ok(format!("session recap (nothing compacted):\n{summary}"))
             }
             SlashCommand::Loop { interval, prompt } => {
@@ -1067,6 +1499,25 @@ impl Agent {
             SlashCommand::Loops => {
                 if self.loops.is_empty() {
                     return Ok("no loop tasks (create with /loop <interval> <prompt>)".into());
+                }
+                if self.events.is_some() {
+                    let items = self
+                        .loops
+                        .list()
+                        .into_iter()
+                        .map(
+                            |(id, interval, remaining, prompt)| crate::catalog::MenuItem {
+                                label: format!("#{id} every {}s", interval.as_secs()),
+                                detail: format!("{remaining}s · {}", truncate_prompt(&prompt, 60)),
+                                command: format!("/loopcancel {id}"),
+                            },
+                        )
+                        .collect();
+                    self.emit(crate::AgentEvent::OpenMenu {
+                        title: "Loop tasks".into(),
+                        items,
+                    });
+                    return Ok(String::new());
                 }
                 let mut out = String::from("loop tasks:\n");
                 for (id, interval, remaining, prompt) in self.loops.list() {
@@ -1089,63 +1540,181 @@ impl Agent {
         }
     }
 
-    /// /config — bare opens the settings menu; `/config <key>` shows one setting;
-    /// `/config <key> <value>` validates against the registry, applies it live and
-    /// persists it. Unknown keys are refused with the list of valid ones.
-    async fn run_config_command(&mut self, args: Vec<String>) -> Result<String, String> {
-        match (args.first().map(|s| s.as_str()), args.get(1)) {
-            (None, _) => {
-                if self.events.is_some() {
-                    self.emit(crate::AgentEvent::OpenConfigMenu);
-                    Ok(String::new())
+    fn open_settings_menu(&self) {
+        let mut items: Vec<_> = settings_registry()
+            .iter()
+            .map(|d| crate::catalog::MenuItem {
+                label: format!("{} = {}", d.key, self.setting_value(d.key)),
+                detail: d.description.into(),
+                command: if d.key == "model" {
+                    "/model".into()
+                } else if d.key == "theme" {
+                    "/theme".into()
                 } else {
-                    Ok(self.config_report())
-                }
+                    format!("/config edit {}", d.key)
+                },
+            })
+            .collect();
+        items.insert(0, crate::catalog::MenuItem { label: "All configuration".into(), detail: "Browse every config field, lists and named entries; stage, validate and save changes".into(), command: "/config ui open".into() });
+        items.insert(
+            1,
+            crate::catalog::MenuItem {
+                label: "Context7".into(),
+                detail: self.context7_status(),
+                command: format!("/config ui open {}", crate::config_ui::encode("/context7")),
+            },
+        );
+        self.emit(crate::AgentEvent::OpenMenu {
+            title: "Settings".into(),
+            items,
+        });
+    }
+
+    /// /config — bare opens the settings menu; `/config <key>` shows one setting;
+    /// `/config <key>=<value>`, `/config <key> <value>` and `/config set <key> <value>`
+    /// validate against the registry, apply live and persist. Unknown keys are refused
+    /// with the list of valid ones.
+    async fn run_config_command(&mut self, args: Vec<String>) -> Result<String, String> {
+        let mut args = args;
+        if args.first().is_some_and(|a| a == "ui") {
+            return self
+                .config_ui_command(args.into_iter().skip(1).collect())
+                .await;
+        }
+        let from_menu = args.first().map(String::as_str) == Some("menu-set");
+        if from_menu {
+            args.remove(0);
+        }
+        if args.first().map(String::as_str) == Some("set") {
+            args.remove(0);
+        }
+        if args.is_empty() {
+            if self.events.is_none() {
+                return Ok(self.config_report());
             }
-            (Some(key), None) => {
-                let def = setting_def(key).ok_or_else(|| {
-                    format!(
-                        "unknown setting `{key}` — try: {}",
-                        settings_registry()
-                            .iter()
-                            .map(|d| d.key)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                })?;
-                Ok(format!(
-                    "{key} = {}  ({})  [{}]",
-                    self.setting_value(key),
-                    def.description,
-                    match def.kind {
-                        SettingKind::Bool => "true|false",
-                        SettingKind::Enum(_) => "one of the listed values",
-                        SettingKind::Int { .. } => "integer",
-                        SettingKind::Text => "text",
-                    }
-                ))
+            self.open_settings_menu();
+            return Ok(String::new());
+        }
+        if args[0] == "edit" {
+            let key = args.get(1).ok_or("missing setting")?;
+            let def = setting_def(key).ok_or("unknown setting")?;
+            let choices = def.kind.suggestions();
+            self.emit(crate::AgentEvent::OpenEditor(crate::catalog::Editor {
+                kind: "setting".into(),
+                values: vec![key.clone(), self.setting_value(key)],
+                editing: true,
+                fields: vec![
+                    crate::catalog::FieldSpec::text(),
+                    if choices.is_empty() {
+                        crate::catalog::FieldSpec::text()
+                    } else {
+                        crate::catalog::FieldSpec::choice(choices)
+                    },
+                ],
+            }));
+            return Ok(String::new());
+        }
+        let (key, inline) = match args[0].split_once('=') {
+            Some((k, v)) => (k.to_string(), Some(v.to_string())),
+            None => (args[0].clone(), None),
+        };
+        let def = setting_def(&key).ok_or_else(|| {
+            format!(
+                "unknown setting `{key}` — valid keys: {}",
+                settings_registry()
+                    .iter()
+                    .map(|d| d.key)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        let rest = &args[1..];
+        if inline.is_none() && rest.is_empty() {
+            return Ok(format!(
+                "{key} = {} ({})",
+                self.setting_value(&key),
+                def.description
+            ));
+        }
+        let value = match inline {
+            Some(v) if rest.is_empty() => v,
+            Some(v) => format!("{v} {}", rest.join(" ")),
+            None => {
+                let joined = rest.join(" ");
+                joined
+                    .strip_prefix('=')
+                    .unwrap_or(&joined)
+                    .trim()
+                    .to_string()
             }
-            (Some(key), Some(value)) => self.config_apply(key, value),
+        };
+        let result = self.config_apply(&key, &value)?;
+        if from_menu {
+            self.open_settings_menu();
+            Ok(String::new())
+        } else {
+            Ok(result)
         }
     }
 
     /// Current value of one setting, as text.
     pub fn setting_value(&self, key: &str) -> String {
         match key {
-            "tips" => self.tips.to_string(),
-            "theme" => if self.transparent_request {
-                "transparent"
-            } else {
-                "opaque"
+            "ultraloop" => self
+                .worklog
+                .read()
+                .map(|s| s.ultraloop)
+                .unwrap_or(false)
+                .to_string(),
+            "ultraloop_limit" => self
+                .worklog
+                .read()
+                .map(|s| s.ultraloop_limit)
+                .unwrap_or(0)
+                .to_string(),
+            "supervisor_model" => self
+                .worklog
+                .read()
+                .ok()
+                .and_then(|s| s.supervisor_model)
+                .unwrap_or_default(),
+            "plan_mode" => self
+                .worklog
+                .read()
+                .map(|s| s.plan_mode)
+                .unwrap_or(false)
+                .to_string(),
+            "session_goal" => self.session_goal.clone().unwrap_or_default(),
+            "context7_key_env" => {
+                loon_config::Config::load_effective(&self.loon_paths(), self.ctx.ws.root())
+                    .map(|(c, _)| c.context7.api_key_env)
+                    .unwrap_or("CONTEXT7_API_KEY".into())
             }
-            .to_string(),
+            "check_command" => self.cfg.check_command.clone().unwrap_or_default(),
+            "ultra_rounds" => self.cfg.ultra_rounds.to_string(),
+            "max_retries" => self.cfg.max_retries.to_string(),
+            "animations" => loon_config::Config::load_or_builtin(&self.loon_paths())
+                .ok()
+                .map(|(c, _)| c.ui.animations)
+                .unwrap_or(true)
+                .to_string(),
+            "popup_rows" => loon_config::Config::load_or_builtin(&self.loon_paths())
+                .ok()
+                .map(|(c, _)| c.ui.popup_rows)
+                .unwrap_or(6)
+                .to_string(),
+            "tips" => self.tips.to_string(),
+            "theme" => loon_config::Config::load_or_builtin(&self.loon_paths())
+                .ok()
+                .map(|(c, _)| c.appearance.palette)
+                .unwrap_or("terminal".into()),
             "permission_mode" => format!("{:?}", self.cfg.permissions.mode).to_lowercase(),
             "effort" => self.effort.clone().unwrap_or_else(|| "medium".into()),
             "model" => self.cfg.model_ref.clone(),
             "context_window" => self.cfg.context_window.to_string(),
-            "max_steps" => self.cfg.max_steps.to_string(),
             "tool_output_bytes" => self.cfg.tool_output_bytes.to_string(),
-            "check_command" => self.cfg.check_command.clone().unwrap_or_default(),
+            "autocompact_tokens" => self.autocompact_tokens.unwrap_or(0).to_string(),
+            "autocompact_percent" => self.autocompact_percent.unwrap_or(0).to_string(),
             "autocompact" => if self.cfg.context_window == 0 {
                 "off"
             } else {
@@ -1161,6 +1730,23 @@ impl Agent {
         let def = setting_def(key)
             .ok_or_else(|| format!("unknown setting `{key}` — /config lists valid keys"))?;
         let value = value.trim();
+        // Token-sized settings accept the same shorthand as the CLI: `1m`, `100k`.
+        let normalized;
+        let value = if matches!(key, "context_window" | "autocompact_tokens") {
+            match loon_config::tokens::parse_tokens(value) {
+                Some(n) => {
+                    normalized = n.to_string();
+                    normalized.as_str()
+                }
+                None => {
+                    return Err(format!(
+                        "{key} expects a token count: 200000, 200k, 1m, or 0 to disable"
+                    ))
+                }
+            }
+        } else {
+            value
+        };
         match &def.kind {
             SettingKind::Bool => {
                 if !["true", "false"].contains(&value) {
@@ -1183,62 +1769,169 @@ impl Agent {
             SettingKind::Text => {}
         }
         let applied = match key {
+            "ultraloop" | "ultraloop_limit" | "supervisor_model" | "plan_mode" | "session_goal" => {
+                if key == "supervisor_model" && !value.is_empty() {
+                    self.registry.resolve(value)?;
+                }
+                let state = self
+                    .worklog
+                    .update(|s| {
+                        match key {
+                            "ultraloop" => s.ultraloop = value == "true",
+                            "ultraloop_limit" => {
+                                s.ultraloop_limit = value.parse().map_err(|_| {
+                                    loon_tools::ToolError::InvalidArgs(
+                                        "Invalid review limit".into(),
+                                    )
+                                })?
+                            }
+                            "supervisor_model" => {
+                                s.supervisor_model = (!value.is_empty()).then(|| value.to_string())
+                            }
+                            "plan_mode" => s.plan_mode = value == "true",
+                            "session_goal" => {
+                                s.goal = (!value.is_empty()).then(|| value.to_string())
+                            }
+                            _ => {}
+                        }
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                self.session_goal = state.goal.clone();
+                self.emit(crate::AgentEvent::WorkStateChanged { state });
+                return Ok(format!("{key} updated; saved to this session"));
+            }
+            "context7_key_env" => {
+                if value.is_empty() || !value.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    return Err("use an environment variable name".into());
+                }
+                let mut cfg = loon_config::Config::load_or_builtin(&self.loon_paths())
+                    .map_err(|e| e.to_string())?
+                    .0;
+                cfg.context7.api_key_env = value.into();
+                cfg.save(&self.loon_paths()).map_err(|e| e.to_string())?;
+                let effective =
+                    loon_config::Config::load_effective(&self.loon_paths(), self.ctx.ws.root())
+                        .map_err(|e| e.to_string())?
+                        .0;
+                self.refresh_context7(&effective.context7);
+                return Ok(format!("Context7 key environment = {value}; saved. A key can also be entered in /settings → Context7."));
+            }
+            "autocompact_tokens" => {
+                let n = value.parse::<u64>().map_err(|_| "bad token count")?;
+                if n > 0 && n < 1024 {
+                    return Err("autocompact_tokens must be 0 or at least 1024".into());
+                }
+                self.autocompact_tokens = (n > 0).then_some(n);
+                // An absolute threshold replaces a percentage trigger.
+                if n > 0 {
+                    self.autocompact_percent = None;
+                }
+                format!("autocompact_tokens = {n}")
+            }
+            "autocompact_percent" => {
+                let p: u8 = value
+                    .trim_end_matches('%')
+                    .parse()
+                    .map_err(|_| "autocompact_percent expects 0-99")?;
+                if p > 99 {
+                    return Err("autocompact_percent must be between 0 and 99".into());
+                }
+                self.autocompact_percent = (p > 0).then_some(p);
+                if p > 0 {
+                    self.autocompact_tokens = None;
+                }
+                if self.cfg.context_window == 0 {
+                    self.cfg.context_window = 128_000;
+                }
+                format!(
+                    "autocompact at {}% of the window ({} tokens)",
+                    if p == 0 { 80 } else { p },
+                    self.compaction_trigger_tokens()
+                )
+            }
+            "check_command" => {
+                self.cfg.check_command = (!value.is_empty()).then(|| value.to_string());
+                format!("check_command = {value}")
+            }
+            "ultra_rounds" => {
+                self.cfg.ultra_rounds = value.parse().unwrap();
+                format!("ultra_rounds = {value}")
+            }
+            "max_retries" => {
+                self.cfg.max_retries = value.parse().unwrap();
+                format!("max_retries = {value}")
+            }
+            "animations" => {
+                self.emit(crate::AgentEvent::UiPreference {
+                    key: key.into(),
+                    value: value.into(),
+                });
+                format!("{key} = {value}")
+            }
+            "popup_rows" => {
+                self.emit(crate::AgentEvent::UiPreference {
+                    key: key.into(),
+                    value: value.into(),
+                });
+                format!("{key} = {value}")
+            }
             "tips" => {
                 self.tips = value == "true";
+                self.emit(crate::AgentEvent::UiPreference {
+                    key: "tips".into(),
+                    value: value.into(),
+                });
                 format!("tips = {}", self.tips)
             }
             "theme" => {
-                self.transparent_request = value == "transparent";
-                self.emit(crate::AgentEvent::SetTransparent {
-                    transparent: self.transparent_request,
-                });
+                let name = match value {
+                    "transparent" => "terminal",
+                    "opaque" => "dark",
+                    name => name,
+                };
+                self.transparent_request = name == "terminal";
+                self.emit(crate::AgentEvent::SetPalette { name: name.into() });
                 format!("theme = {value}")
             }
             "permission_mode" => {
-                self.cfg.permissions.mode = match value {
+                let mode = match value {
                     "bypass" => loon_config::PermissionMode::Bypass,
                     "auto" => loon_config::PermissionMode::Auto,
                     "ask" => loon_config::PermissionMode::Ask,
                     _ => loon_config::PermissionMode::Allowlist,
                 };
+                self.set_permission_mode(mode);
+                self.emit(crate::AgentEvent::ModeChanged { mode: value.into() });
                 format!("permission_mode = {value}")
             }
             "effort" => {
                 self.effort = Some(value.to_string());
+                self.worklog
+                    .update(|s| {
+                        s.effort = Some(value.into());
+                        Ok(())
+                    })
+                    .map_err(|e| e.to_string())?;
+                self.emit(crate::AgentEvent::EffortChanged {
+                    level: value.into(),
+                });
                 format!("effort = {value}")
             }
             "model" => {
                 self.registry.resolve(value)?;
-                self.cfg.model_ref = value.to_string();
-                format!("model = {value}")
+                return self.choose_model(value);
             }
             "context_window" => {
                 self.cfg.context_window = value.parse().unwrap_or(0);
                 format!("context_window = {}", self.cfg.context_window)
-            }
-            "max_steps" => {
-                self.cfg.max_steps = value.parse().unwrap_or(24);
-                format!("max_steps = {}", self.cfg.max_steps)
             }
             "tool_output_bytes" => {
                 let n: usize = value.parse().unwrap_or(65_536);
                 self.cfg.tool_output_bytes = n;
                 self.ctx.output_limit = n;
                 format!("tool_output_bytes = {n}")
-            }
-            "check_command" => {
-                self.cfg.check_command = if value.is_empty() || value == "none" {
-                    None
-                } else {
-                    Some(value.to_string())
-                };
-                format!(
-                    "check_command = {}",
-                    self.cfg
-                        .check_command
-                        .clone()
-                        .unwrap_or_else(|| "(none)".into())
-                )
             }
             "autocompact" => {
                 let enable = value == "on";
@@ -1247,6 +1940,12 @@ impl Agent {
             }
             other => return Err(format!("unknown setting `{other}`")),
         };
+        if matches!(key, "context_window" | "autocompact") {
+            self.emit(crate::AgentEvent::UiPreference {
+                key: "context_window".into(),
+                value: self.cfg.context_window.to_string(),
+            });
+        }
         let persisted = self.persist_setting(key, value);
         Ok(match persisted {
             Ok(()) => format!("{applied}; saved to config.toml"),
@@ -1259,13 +1958,45 @@ impl Agent {
         let paths = self.loon_paths();
         let (mut cfg, findings) =
             loon_config::Config::load_or_builtin(&paths).map_err(|e| e.to_string())?;
-        if !findings.is_empty() {
-            return Err("existing config has validation findings; not overwriting".into());
+        if findings.iter().any(|f| f.is_error) {
+            return Err("existing config has validation errors; not overwriting".into());
         }
         match key {
+            "autocompact_tokens" => {
+                let n = value.parse::<u64>().map_err(|_| "bad token count")?;
+                cfg.session.autocompact_tokens = (n > 0).then_some(n);
+                if n > 0 {
+                    cfg.session.autocompact_percent = None;
+                }
+            }
+            "autocompact_percent" => {
+                let p: u8 = value
+                    .trim_end_matches('%')
+                    .parse()
+                    .map_err(|_| "bad percent")?;
+                cfg.session.autocompact_percent = (p > 0).then_some(p);
+                if p > 0 {
+                    cfg.session.autocompact_tokens = None;
+                }
+            }
+            "check_command" => {
+                cfg.session.check_command = (!value.is_empty()).then(|| value.to_string())
+            }
+            "ultra_rounds" => {
+                cfg.session.ultra_rounds = value.parse().map_err(|_| "bad integer")?
+            }
+            "max_retries" => cfg.session.max_retries = value.parse().map_err(|_| "bad integer")?,
+            "animations" => cfg.ui.animations = value == "true",
+            "popup_rows" => cfg.ui.popup_rows = value.parse().map_err(|_| "bad integer")?,
             "tips" => cfg.ui.tips = value == "true",
             "theme" => {
-                cfg.appearance.mode = if value == "transparent" {
+                cfg.appearance.palette = match value {
+                    "transparent" => "terminal",
+                    "opaque" => "dark",
+                    name => name,
+                }
+                .into();
+                cfg.appearance.mode = if value == "transparent" || value == "terminal" {
                     loon_config::AppearanceMode::Transparent
                 } else {
                     loon_config::AppearanceMode::Opaque
@@ -1287,18 +2018,13 @@ impl Agent {
                     cfg.session.context_window = Some(value.parse().map_err(|_| "bad integer")?);
                 }
             }
-            "max_steps" => cfg.session.max_steps = value.parse().map_err(|_| "bad integer")?,
             "tool_output_bytes" => {
                 cfg.session.tool_output_bytes = value.parse().map_err(|_| "bad integer")?
             }
-            "check_command" => {
-                cfg.session.check_command = if value.is_empty() || value == "none" {
-                    None
-                } else {
-                    Some(value.to_string())
-                }
+            "effort" => cfg.session.effort = Some(value.into()),
+            "autocompact" => {
+                cfg.session.context_window = Some(if value == "off" { 0 } else { 128_000 })
             }
-            "effort" | "autocompact" => {} // session-scoped on purpose; nothing to persist
             other => return Err(format!("unknown setting {other}")),
         }
         cfg.save(&paths).map_err(|e| e.to_string())
@@ -1307,11 +2033,16 @@ impl Agent {
     fn config_report(&self) -> String {
         let p = &self.cfg.permissions;
         format!(
-            "effective configuration\n  model: {}\n  context window: {} tokens (compaction at {}%)\n  max steps: {}\n  permission mode: {} ({} allow / {} deny rules)\n  tool output cap: {} bytes\n  appearance dir: config at {}",
+            "effective configuration\n  model: {}\n  context window: {} tokens (autocompact at {})\n  permission mode: {} ({} allow / {} deny rules)\n  tool output cap: {} bytes\n  appearance dir: config at {}",
             self.cfg.model_ref,
-            self.cfg.context_window,
-            (crate::compaction::COMPACT_THRESHOLD * 100.0) as u32,
-            self.cfg.max_steps,
+            loon_config::tokens::format_tokens(self.cfg.context_window),
+            match self.autocompact_percent {
+                Some(percent) => format!("{percent}% of the window"),
+                None => format!(
+                    "{}% of the window",
+                    (crate::compaction::COMPACT_THRESHOLD * 100.0) as u32
+                ),
+            },
             match p.mode {
                 loon_config::PermissionMode::Bypass => "bypass",
                 loon_config::PermissionMode::Ask => "ask",
@@ -1332,13 +2063,6 @@ impl Agent {
                 self.registry.resolve(value)?;
                 self.cfg.model_ref = value.to_string();
                 "model switched (next request uses it)".to_string()
-            }
-            "max_steps" => {
-                let v: u32 = value
-                    .parse()
-                    .map_err(|_| "max_steps must be a positive integer")?;
-                self.cfg.max_steps = v;
-                format!("max steps set to {v}")
             }
             "context_window" => {
                 let v: u64 = value
@@ -1368,7 +2092,7 @@ impl Agent {
             }
             other => {
                 return Err(format!(
-                    "unknown key `{other}` — keys: model, max_steps, context_window, permission_mode, tool_output_bytes"
+                    "unknown key `{other}` — keys: model, context_window, permission_mode, tool_output_bytes"
                 ))
             }
         };
@@ -1418,7 +2142,6 @@ impl Agent {
         }
         match key {
             "model" => cfg.session.model = value.to_string(),
-            "max_steps" => cfg.session.max_steps = value.parse().map_err(|_| "bad integer")?,
             "context_window" => {
                 if let Some(def) = cfg.models.get_mut(&self.cfg.model_ref) {
                     def.context_window = Some(value.parse().map_err(|_| "bad integer")?);
@@ -1459,110 +2182,6 @@ impl Agent {
 
     fn paths_data_dir(&self) -> Result<std::path::PathBuf, String> {
         Ok(self.data_dir.clone())
-    }
-
-    fn providers_snapshot(&self) -> Vec<(String, loon_config::Provider)> {
-        // Config-driven listing; the live registry does not expose provider defs.
-        let paths = self.loon_paths();
-        let Ok((cfg, _)) = loon_config::Config::load_or_builtin(&paths) else {
-            return Vec::new();
-        };
-        cfg.providers.into_iter().collect()
-    }
-
-    fn combos_snapshot(&self) -> Vec<(String, String)> {
-        let paths = self.loon_paths();
-        let Ok((cfg, _)) = loon_config::Config::load_or_builtin(&paths) else {
-            return Vec::new();
-        };
-        cfg.combos
-            .into_iter()
-            .map(|(name, combo)| {
-                let members: Vec<String> = combo
-                    .members
-                    .iter()
-                    .map(|m| format!("{}:{}", m.provider, m.model))
-                    .collect();
-                (name, members.join(", "))
-            })
-            .collect()
-    }
-
-    /// Persist a new provider to config.toml. The LIVE registry is immutable, so new
-    /// entries load next session — stated plainly, never implied otherwise.
-    fn persist_provider(
-        &self,
-        name: &str,
-        url: &str,
-        api: &str,
-        key_env: Option<&str>,
-    ) -> Result<String, String> {
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-        {
-            return Err("provider name must be alphanumeric/-/_".into());
-        }
-        let paths = self.loon_paths();
-        let (mut cfg, _) =
-            loon_config::Config::load_or_builtin(&paths).map_err(|e| e.to_string())?;
-        cfg.providers.insert(
-            name.to_string(),
-            loon_config::Provider {
-                base_url: url.to_string(),
-                api: match api {
-                    "responses" => loon_config::ApiFamily::Responses,
-                    _ => loon_config::ApiFamily::Chat,
-                },
-                api_key_env: key_env.filter(|k| !k.is_empty()).map(str::to_string),
-                ..loon_config::Provider::default()
-            },
-        );
-        cfg.save(&paths).map_err(|e| e.to_string())?;
-        Ok(format!(
-            "provider `{name}` saved to config.toml — restart (or /new after adding models) to use it"
-        ))
-    }
-
-    fn persist_combo(&self, name: &str, members: &[&str]) -> Result<String, String> {
-        let paths = self.loon_paths();
-        let (mut cfg, _) =
-            loon_config::Config::load_or_builtin(&paths).map_err(|e| e.to_string())?;
-        let mut parsed = Vec::new();
-        for m in members {
-            let (provider, model) = m
-                .split_once(':')
-                .ok_or_else(|| format!("member `{m}` must be provider:model"))?;
-            // accept either a models-key name or provider:model-id spelling
-            if cfg.models.contains_key(model) {
-                let def = &cfg.models[model];
-                parsed.push(loon_config::ComboMember {
-                    provider: def.provider.clone(),
-                    model: def.id.clone(),
-                    max_retries: None,
-                });
-            } else {
-                parsed.push(loon_config::ComboMember {
-                    provider: provider.to_string(),
-                    model: model.to_string(),
-                    max_retries: None,
-                });
-            }
-        }
-        cfg.combos.insert(
-            name.to_string(),
-            loon_config::Combo {
-                mode: loon_config::ComboMode::Fallback,
-                members: parsed,
-                requires: loon_config::ComboRequires::default(),
-                cost_ceiling: None,
-                persistent_rotation: false,
-            },
-        );
-        cfg.save(&paths).map_err(|e| e.to_string())?;
-        Ok(format!(
-            "combo `{name}` saved to config.toml — usable as combo:{name} next session"
-        ))
     }
 
     /// /usage: per-day request and token totals from RequestFinished events, rendered
@@ -1632,9 +2251,56 @@ impl Agent {
         out
     }
 
+    /// `/context <size>`: one command to change the window. Accepts `1m`, `100k`,
+    /// `128000`, `off` (disables compaction) and `90%` (compact at 90% of the window).
+    pub fn set_context_size(&mut self, size: &str) -> Result<String, String> {
+        use loon_config::tokens::{format_tokens, parse_token_spec, TokenSpec};
+        match size.trim().to_ascii_lowercase().as_str() {
+            "off" | "0" => {
+                self.config_apply("context_window", "0")?;
+                return Ok("context compaction off (window = 0)".into());
+            }
+            "auto" => {
+                self.config_apply("autocompact_percent", "0")?;
+                self.config_apply("autocompact_tokens", "0")?;
+                return Ok(format!(
+                    "autocompact back to the default {}% of the window",
+                    (crate::compaction::COMPACT_THRESHOLD * 100.0) as u32
+                ));
+            }
+            _ => {}
+        }
+        match parse_token_spec(size) {
+            Some(TokenSpec::Percent(p)) => {
+                self.config_apply("autocompact_percent", &p.to_string())?;
+                Ok(format!(
+                    "autocompact at {p}% of the window (now ~{} of {} tokens)",
+                    format_tokens(self.compaction_trigger_tokens()),
+                    format_tokens(self.cfg.context_window)
+                ))
+            }
+            Some(TokenSpec::Tokens(n)) => {
+                if n > 0 && n < 1024 {
+                    return Err("context window must be 0 (off) or at least 1024 tokens".into());
+                }
+                self.config_apply("context_window", &n.to_string())?;
+                Ok(format!(
+                    "context window = {} ({n} tokens); autocompact at ~{}",
+                    format_tokens(n),
+                    format_tokens(self.compaction_trigger_tokens())
+                ))
+            }
+            None => Err(
+                "usage: /context [1m|200k|128000|90%|off|auto] — no argument shows the report"
+                    .into(),
+            ),
+        }
+    }
+
     /// /context: where the window stands, with a usage bar. Estimates are labeled as
     /// estimates everywhere they appear.
     pub fn context_report(&self) -> String {
+        use loon_config::tokens::format_tokens;
         let est = self.estimated_context_tokens();
         let window = self.cfg.context_window;
         let bar = if window > 0 {
@@ -1660,17 +2326,27 @@ impl Agent {
             *roles.entry(format!("{:?}", m.role)).or_insert(0usize) += 1;
         }
         let roles: Vec<String> = roles.into_iter().map(|(k, v)| format!("{k}×{v}")).collect();
+        let trigger = match self.autocompact_percent {
+            Some(p) if (1..=99).contains(&p) => format!("{p}% of the window"),
+            _ => format!(
+                "{}% of the window",
+                (crate::compaction::COMPACT_THRESHOLD * 100.0) as u32
+            ),
+        };
         format!(
-            "context: ~{est} est. tokens {bar}{pct}\n{} message(s) [{}]\ncompaction at {}% of window ({} tokens); {}",
+            "context: ~{} est. tokens {bar}{pct}\n{} message(s) [{}]\nwindow {} · autocompact at {trigger} = {} tokens; {}\nchange it with /context 1m, /context 200k or /context 90%",
+            format_tokens(est),
             self.history.len(),
             roles.join(" "),
-            (crate::compaction::COMPACT_THRESHOLD * 100.0) as u32,
-            (window as f64 * crate::compaction::COMPACT_THRESHOLD) as u64,
-            if self.should_compact() {
-                "compaction will trigger before the next request"
+            if window > 0 { format_tokens(window) } else { "off".into() },
+            format_tokens(self.compaction_trigger_tokens()),
+            if window == 0 {
+                "compaction disabled".to_string()
+            } else if self.should_compact() {
+                "compaction will trigger before the next request".to_string()
             } else {
-                "no compaction needed"
-            }
+                "no compaction needed".to_string()
+            },
         )
     }
 

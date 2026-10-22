@@ -61,6 +61,13 @@ pub struct Workspace {
 }
 
 impl Workspace {
+    /// Rebuild write-root authority without resetting the mutation sequence used by undo.
+    pub fn with_write_roots(&self, roots: Vec<PathBuf>) -> Result<Workspace> {
+        let ws = Workspace::new(&self.root, roots)?;
+        ws.mutation_seq
+            .store(self.mutation_seq.load(Ordering::Relaxed), Ordering::Relaxed);
+        Ok(ws)
+    }
     pub fn new(root: impl Into<PathBuf>, extra_write_roots: Vec<PathBuf>) -> Result<Workspace> {
         let root = root.into();
         let root = root.canonicalize().map_err(|e| WsError::Io {
@@ -361,5 +368,24 @@ mod tests {
             .cas_write(&f, b"y", Some(EMPTY_HASH), "write", &g)
             .unwrap_err();
         assert!(matches!(err, WsError::StaleWrite { .. }));
+    }
+    #[test]
+    fn changing_write_roots_preserves_mutation_order_for_undo() {
+        let (d, w) = ws();
+        let path = w.root().join("sequence.txt");
+        let first = {
+            let guard = w.write_lock();
+            w.cas_write(&path, b"before", None, "write", &guard)
+                .unwrap()
+        };
+        let extra = d.path().join("extra");
+        std::fs::create_dir(&extra).unwrap();
+        let updated = w.with_write_roots(vec![extra.clone()]).unwrap();
+        updated.check_writable(&extra.join("allowed")).unwrap();
+        let guard = updated.write_lock();
+        let next = updated
+            .cas_write(&path, b"after", Some(&first.after_sha256), "write", &guard)
+            .unwrap();
+        assert!(next.seq > first.seq);
     }
 }

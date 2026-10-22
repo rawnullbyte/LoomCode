@@ -25,14 +25,14 @@ fn test_paths(dir: &std::path::Path) -> LoonPaths {
 fn cfg() -> AgentConfig {
     AgentConfig {
         model_ref: "mock".into(),
-        max_steps: 12,
         tool_output_bytes: 4096,
         max_retries: 0,
         allow_retry_after_partial_stream: false,
+        check_command: None,
+        ultra_rounds: 0,
         permissions: loon_config::Permissions::default(),
         context_window: 128_000,
         extra_tools: Vec::new(),
-        check_command: None,
     }
 }
 
@@ -375,4 +375,47 @@ fn nothing_to_undo_is_a_clean_error() {
     let ws = loon_workspace::Workspace::new(tmp.path(), vec![]).unwrap();
     let err = rewind::undo(&j, &ws, &[]).unwrap_err();
     assert!(matches!(err, rewind::RewindError::NothingToUndo));
+}
+
+/// The picker needs more than "rewound 1 boundary": it needs the prompt that opened
+/// each turn and what that turn changed.
+#[tokio::test]
+async fn rewind_entries_describe_each_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_root = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    std::fs::write(ws_root.join("a.txt"), "one\ntwo\n").unwrap();
+
+    let registry = ProviderRegistry::with_mock(loon_providers::MockProvider::with_scripts(vec![
+        MockScript::new(vec![MockStep::tool_call(
+            "c1",
+            "write",
+            json!({"path": "a.txt", "content": "one\ntwo\nthree\n"}),
+        )]),
+        MockScript::text("done"),
+    ]));
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let mut agent = Agent::new_session(
+        &paths,
+        cfg(),
+        Arc::new(registry),
+        ToolRegistry::standard(),
+        ws_root.clone(),
+        true,
+    )
+    .unwrap();
+    let sid = agent.session_id();
+    agent.run_turn("add a third line").await;
+
+    let store = loon_core::open_store(&paths).unwrap();
+    let (journal, events) = Journal::open_default(&store, &paths.sessions_dir(), sid).unwrap();
+    let entries = rewind::rewind_entries(&journal, &events);
+    // The picker has one entry for the user message, including every tool round.
+    assert_eq!(entries.len(), 1, "one user message");
+    let e = &entries[0];
+    assert_eq!(e.n, 2);
+    assert_eq!(e.prompt, "add a third line");
+    assert_eq!(e.files_changed, 1, "a.txt was mutated");
+    assert!(e.added >= 1, "the new line is counted: +{}", e.added);
 }

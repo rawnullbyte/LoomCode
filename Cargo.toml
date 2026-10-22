@@ -56,7 +56,8 @@ tempfile = "3"
 proptest = "1"
 
 [profile.release]
-lto = "thin"
+# Standard release optimization avoids thin-LTO linker failures with current stable.
+lto = false
 strip = true
 codegen-units = 1
 

@@ -29,14 +29,14 @@ fn agent(tmp: &std::path::Path, ws: &std::path::Path) -> Agent {
         &paths,
         loon_core::AgentConfig {
             model_ref: "mock".into(),
-            max_steps: 4,
             tool_output_bytes: 4096,
             max_retries: 0,
             allow_retry_after_partial_stream: false,
+            check_command: None,
+            ultra_rounds: 0,
             permissions: Default::default(),
             context_window: 128_000,
             extra_tools: Vec::new(),
-            check_command: None,
         },
         registry,
         loon_core::standard_tools(&paths, ws),
@@ -58,10 +58,16 @@ async fn slash_commands_execute_honestly() {
     assert!(out.contains("/rewind"));
 
     // context
-    let out = a.run_slash(SlashCommand::Context).await.unwrap();
+    let out = a
+        .run_slash(SlashCommand::Context { size: None })
+        .await
+        .unwrap();
     assert!(out.contains("est. tokens"), "{out}");
     assert!(out.contains("no compaction needed"), "{out}");
-    assert!(out.contains("80% of window"), "{out}");
+    assert!(out.contains("80% of the window"), "{out}");
+    // Compact units, and a discoverable way to change the window in one command.
+    assert!(out.contains("window 128k"), "{out}");
+    assert!(out.contains("/context 1m"), "{out}");
 
     // model: show + switch + invalid
     let out = a
@@ -256,14 +262,14 @@ async fn agent_side_loop_cancel_via_tool() {
     ));
     let cfg = loon_core::AgentConfig {
         model_ref: "mock".into(),
-        max_steps: 4,
         tool_output_bytes: 4096,
         max_retries: 0,
         allow_retry_after_partial_stream: false,
+        check_command: None,
+        ultra_rounds: 0,
         permissions: Default::default(),
         context_window: 128_000,
         extra_tools: Vec::new(),
-        check_command: None,
     };
     let tools = loon_core::subagent::default_tools(
         &paths,
@@ -303,4 +309,14 @@ async fn agent_side_loop_cancel_via_tool() {
         .expect("cancel live loop");
     assert!(out.text.contains("cancelled"));
     assert!(agent.loops.is_empty());
+}
+
+#[test]
+fn clear_is_an_alias_for_new() {
+    let parse = |s: &str| loon_core::commands::parse(s).unwrap().unwrap();
+    assert_eq!(parse("/new"), SlashCommand::New);
+    assert_eq!(parse("/clear"), SlashCommand::New);
+    assert!(loon_core::commands::command_list()
+        .iter()
+        .any(|(name, _)| *name == "clear"));
 }

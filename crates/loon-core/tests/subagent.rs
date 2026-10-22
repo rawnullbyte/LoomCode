@@ -43,14 +43,14 @@ async fn delegate_runs_a_child_session_and_returns_its_report() {
     paths.ensure().unwrap();
     let cfg = AgentConfig {
         model_ref: "mock".into(),
-        max_steps: 6,
         tool_output_bytes: 4096,
         max_retries: 0,
         allow_retry_after_partial_stream: false,
+        check_command: None,
+        ultra_rounds: 0,
         permissions: Default::default(),
         context_window: 128_000,
         extra_tools: Vec::new(),
-        check_command: None,
     };
     let tools = loon_core::subagent::default_tools(&paths, &ws, &cfg, registry.clone(), None);
     let mut agent = Agent::new_session(&paths, cfg, registry, tools, ws.clone(), true).unwrap();

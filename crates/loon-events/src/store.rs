@@ -57,6 +57,7 @@ impl Store {
             std::fs::create_dir_all(parent)?;
         }
         let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
@@ -69,7 +70,8 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
-        let conn = self.conn.lock().expect("store lock");
+        let mut guard = self.conn.lock().expect("store lock");
+        let conn = guard.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS schema_migrations (
                 version INTEGER PRIMARY KEY,
@@ -98,6 +100,7 @@ impl Store {
         // A database written by a *newer* build must not be silently downgraded.
         let highest_known = MIGRATIONS.len() as u32;
         let _ = highest_known;
+        conn.commit()?;
         Ok(())
     }
 

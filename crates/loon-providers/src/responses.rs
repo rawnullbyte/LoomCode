@@ -37,7 +37,10 @@ impl ResponsesAdapter {
     pub fn build_body(req: &ChatRequest) -> serde_json::Value {
         let mut input = Vec::with_capacity(req.messages.len());
         for m in &req.messages {
-            input.push(message_to_item(m));
+            match message_to_item(m) {
+                serde_json::Value::Array(items) => input.extend(items),
+                item => input.push(item),
+            }
         }
         let mut body = serde_json::json!({
             "model": req.model,
@@ -67,6 +70,9 @@ impl ResponsesAdapter {
         if let Some(t) = req.temperature {
             body["temperature"] = serde_json::json!(t);
         }
+        if let Some(effort) = &req.reasoning_effort {
+            body["reasoning"] = serde_json::json!({"effort": effort});
+        }
         if let Some(m) = req.max_output_tokens {
             body["max_output_tokens"] = serde_json::json!(m);
         }
@@ -93,6 +99,11 @@ impl ResponsesAdapter {
             let Some(frame) = stream.next_frame(self.idle_timeout).await? else {
                 break;
             };
+            // Empty SSE frames are keepalives (some gateways send `data:` with no payload
+            // or bare blank lines); skipping beats killing the turn over heartbeat noise.
+            if frame.data.trim().is_empty() {
+                continue;
+            }
             // Some OpenAI-compatible proxies append a chat-style [DONE] sentinel to
             // Responses streams; treat it as stream end, not protocol data.
             if frame.data.trim() == "[DONE]" {
@@ -271,29 +282,19 @@ impl ResponsesAdapter {
                     .await;
                 continue;
             }
-            match serde_json::from_str::<serde_json::Value>(&entry.args) {
-                Ok(o) if o.is_object() => {
-                    let _ = tx
-                        .send(ProviderEvent::ToolCallComplete {
-                            call: ToolCallReq {
-                                id: entry.call_id,
-                                name: entry.name,
-                                arguments_json: entry.args,
-                            },
-                        })
-                        .await;
-                }
-                _ => {
-                    let _ = tx
-                        .send(ProviderEvent::Failure {
-                            error: ProviderError::Malformed(format!(
-                                "tool call `{}` arguments are not a valid JSON object",
-                                entry.name
-                            )),
-                        })
-                        .await;
-                }
-            }
+            // Match Chat Completions recovery: malformed arguments become a tool
+            // validation result the model can correct, rather than killing the turn.
+            let arguments_json =
+                crate::args::normalize_tool_arguments(&entry.args).unwrap_or_else(|| "{}".into());
+            let _ = tx
+                .send(ProviderEvent::ToolCallComplete {
+                    call: ToolCallReq {
+                        id: entry.call_id,
+                        name: entry.name,
+                        arguments_json,
+                    },
+                })
+                .await;
         }
 
         let finish = match completed_status.as_deref() {

@@ -18,6 +18,7 @@ pub struct Theme {
     fg_accent: Color,
     fg_ok: Color,
     fg_err: Color,
+    fg_warn: Color,
     #[allow(dead_code)] // used by member_fg helper consumers in a later milestone
     fg_member: Color,
 }
@@ -33,6 +34,7 @@ impl Theme {
                 fg_accent: Color::Cyan,
                 fg_ok: Color::Green,
                 fg_err: Color::Red,
+                fg_warn: Color::Yellow,
                 fg_member: Color::Yellow,
             },
             AppearanceMode::Opaque => Theme {
@@ -43,9 +45,59 @@ impl Theme {
                 fg_accent: Color::Rgb(102, 204, 255),
                 fg_ok: Color::Rgb(126, 211, 126),
                 fg_err: Color::Rgb(240, 113, 120),
+                fg_warn: Color::Rgb(235, 203, 139),
                 fg_member: Color::Rgb(235, 203, 139),
             },
         }
+    }
+
+    pub fn from_palette(name: &str, transparent: bool) -> Self {
+        let mut t = Self::from_mode(if transparent {
+            AppearanceMode::Transparent
+        } else {
+            AppearanceMode::Opaque
+        });
+        if !transparent {
+            match name {
+                "light" => {
+                    t.bg = Color::Rgb(247, 248, 250);
+                    t.fg_base = Color::Rgb(30, 40, 56);
+                    t.fg_dim = Color::Rgb(83, 96, 115);
+                    t.fg_accent = Color::Rgb(27, 89, 181);
+                    t.fg_ok = Color::Rgb(25, 117, 66);
+                    t.fg_err = Color::Rgb(184, 38, 56);
+                    t.fg_warn = Color::Rgb(146, 101, 0);
+                }
+                "violet" => {
+                    t.bg = Color::Rgb(25, 23, 37);
+                    t.fg_base = Color::Rgb(229, 224, 242);
+                    t.fg_dim = Color::Rgb(151, 142, 171);
+                    t.fg_accent = Color::Rgb(188, 155, 246);
+                    t.fg_ok = Color::Rgb(149, 213, 178);
+                }
+                "ember" => {
+                    t.bg = Color::Rgb(32, 25, 22);
+                    t.fg_base = Color::Rgb(237, 225, 210);
+                    t.fg_dim = Color::Rgb(161, 145, 127);
+                    t.fg_accent = Color::Rgb(240, 176, 109);
+                    t.fg_ok = Color::Rgb(162, 204, 151);
+                }
+                "graphite" => {
+                    t.bg = Color::Rgb(20, 22, 25);
+                    t.fg_base = Color::Rgb(222, 228, 235);
+                    t.fg_dim = Color::Rgb(139, 151, 167);
+                    t.fg_accent = Color::Rgb(158, 190, 226);
+                }
+                "ocean" => {
+                    t.bg = Color::Rgb(14, 28, 40);
+                    t.fg_base = Color::Rgb(214, 231, 239);
+                    t.fg_accent = Color::Rgb(91, 218, 200);
+                    t.fg_warn = Color::Rgb(240, 200, 120);
+                }
+                _ => {}
+            }
+        }
+        t
     }
 
     pub fn base(&self) -> Style {
@@ -68,13 +120,33 @@ impl Theme {
     pub fn err(&self) -> Style {
         self.bg(Style::default().fg(self.fg_err))
     }
+    pub fn warn(&self) -> Style {
+        self.bg(Style::default().fg(self.fg_warn))
+    }
+    /// Permission-mode colour: bypass red, auto yellow, ask green, allowlist accent.
+    pub fn mode_style(&self, mode: &str) -> Style {
+        match mode {
+            "bypass" => self.err(),
+            "auto" => self.warn(),
+            "ask" => self.ok(),
+            "allowlist" => self.accent(),
+            _ => self.dim(),
+        }
+    }
     pub fn border(&self) -> Style {
         self.bg(Style::default().fg(self.fg_dim))
     }
     /// Menu/selected rows (autocomplete, settings): dim background bar.
     pub fn menu_selected(&self) -> Style {
         // explicit RGB — kitty remaps 8-bit palette entries to its theme
-        Style::default().fg(Color::Reset).bg(Color::Rgb(64, 64, 88))
+        if self.transparent {
+            self.accent_bold().add_modifier(Modifier::UNDERLINED)
+        } else {
+            Style::default().fg(self.fg_base).bg(match self.bg {
+                Color::Rgb(247, 248, 250) => Color::Rgb(221, 230, 244),
+                _ => Color::Rgb(46, 57, 76),
+            })
+        }
     }
 
     fn bg(&self, mut s: Style) -> Style {
@@ -91,9 +163,13 @@ impl Theme {
 // Free helpers used by the transcript builder (default transparent theme).
 pub fn user_fg() -> Style {
     Style::default()
-        .fg(Color::Reset)
+        .fg(Color::Cyan)
         .add_modifier(Modifier::BOLD)
         .bg(Color::Reset)
+}
+/// Default foreground for plain banner/transcript text.
+pub fn base_style() -> Style {
+    Style::default().fg(Color::Reset).bg(Color::Reset)
 }
 pub fn assistant_fg() -> Style {
     Style::default().fg(Color::Reset).bg(Color::Reset)

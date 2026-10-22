@@ -153,11 +153,19 @@ pub fn validate_args(spec: &ToolSpec, args: &Value) -> Result<(), ToolError> {
         ));
     }
     let issues = crate::schema::validate(args, &spec.parameters);
-    if issues.is_empty() {
+    // Extra keys are ignored, not fatal. Models add `reason`, `description` or a stray
+    // `path` all the time; rejecting the call costs a whole turn and teaches nothing,
+    // and the tool only reads the keys it declares anyway. Missing or wrongly-typed
+    // required arguments are still errors.
+    let fatal: Vec<_> = issues
+        .into_iter()
+        .filter(|i| !i.message.starts_with("unknown field"))
+        .collect();
+    if fatal.is_empty() {
         Ok(())
     } else {
         Err(ToolError::InvalidArgs(
-            issues
+            fatal
                 .iter()
                 .map(|i| i.to_string())
                 .collect::<Vec<_>>()
@@ -176,4 +184,44 @@ pub fn to_provider_format(spec: &ToolSpec) -> Value {
             "parameters": spec.parameters,
         }
     })
+}
+
+/// Normalize only unambiguous aliases seen from compatible coding endpoints.
+/// Canonical fields always win; unknown fields remain available to MCP tools.
+pub fn normalize_args(spec: &ToolSpec, mut args: Value) -> Value {
+    let Some(obj) = args.as_object_mut() else {
+        return args;
+    };
+    let mut alias = |target: &str, alternatives: &[&str]| {
+        if !obj.contains_key(target) {
+            if let Some(value) = alternatives.iter().find_map(|a| obj.get(*a).cloned()) {
+                obj.insert(target.to_string(), value);
+            }
+        }
+    };
+    match spec.name.as_str() {
+        "bash" => {
+            alias("command", &["cmd", "script"]);
+            alias("cwd", &["workdir", "working_directory"]);
+            alias("timeout_secs", &["timeout"]);
+        }
+        "read" | "write" | "edit" | "fuzzy_edit" | "multi_edit" | "read_json" | "json_edit"
+        | "notebook_read" | "notebook_edit" | "file_info" => {
+            alias("path", &["file_path", "file", "filename"]);
+            if spec.name == "read" {
+                alias("offset", &["start_line"]);
+                alias("limit", &["max_lines"]);
+            }
+            if spec.name == "write" {
+                alias("content", &["text"]);
+            }
+            if spec.name == "edit" || spec.name == "fuzzy_edit" {
+                alias("old_string", &["old_text"]);
+                alias("new_string", &["new_text"]);
+            }
+        }
+        "grep" | "glob" => alias("pattern", &["query", "search_pattern"]),
+        _ => {}
+    }
+    args
 }

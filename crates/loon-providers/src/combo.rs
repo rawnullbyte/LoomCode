@@ -64,7 +64,7 @@ pub struct ComboOutcome {
 
 pub struct ComboRunner {
     pub registry: Arc<ProviderRegistry>,
-    pub rotation: RotationState,
+    pub rotation: Arc<RotationState>,
     /// Per-member retry budget for retriable transport-class errors.
     pub max_retries: u32,
     /// Session opt-in: allow restarting from scratch after a partial stream.
@@ -76,7 +76,7 @@ impl ComboRunner {
     pub fn new(registry: Arc<ProviderRegistry>) -> ComboRunner {
         ComboRunner {
             registry,
-            rotation: RotationState::new(),
+            rotation: Arc::new(RotationState::new()),
             max_retries: 2,
             allow_retry_after_partial_stream: false,
             backoff_base: Duration::from_millis(300),
@@ -212,6 +212,11 @@ impl ComboRunner {
             candidates.push(member);
         }
 
+        // Providers that recently rate-limited us are moved to the back rather than
+        // dropped: a fallback chain still works, it just prefers a member that is
+        // actually available now.
+        candidates.sort_by_key(|m| self.registry.cooldown_remaining(&m.provider_id).is_some());
+
         if candidates.is_empty() {
             let reasons = trail
                 .iter()
@@ -301,6 +306,10 @@ impl ComboRunner {
     }
 }
 
+/// Longest a cooldown may block a request; providers asking for more are retried
+/// sooner rather than leaving the turn waiting indefinitely.
+const MAX_COOLDOWN_WAIT: Duration = Duration::from_secs(30);
+
 /// Runs one member with bounded same-member retries for retriable transport-class errors.
 struct MemberRunner {
     registry: Arc<ProviderRegistry>,
@@ -323,12 +332,46 @@ impl MemberRunner {
         let mut streamed = false;
         let mut retried = 0u32;
 
+        // Honour a cooldown this provider earned earlier in the session. Bounded so a
+        // stale cooldown can never stall a turn indefinitely.
+        if let Some(wait) = self.registry.cooldown_remaining(&member.provider_id) {
+            let wait = wait.min(MAX_COOLDOWN_WAIT);
+            if !wait.is_zero() {
+                let _ = tx
+                    .send(AttemptEvent {
+                        attempt: member.clone(),
+                        event: ProviderEvent::Failure {
+                            error: ProviderError::Rejected(format!(
+                                "{}/{} is cooling down; waiting {}s",
+                                member.provider_id,
+                                member.model_id,
+                                wait.as_secs_f32().ceil()
+                            )),
+                        },
+                    })
+                    .await;
+                tokio::time::sleep(wait).await;
+            }
+        }
+
         loop {
             let (etx, mut erx) = mpsc::channel::<ProviderEvent>(256);
             let registry = self.registry.clone();
             let member_owned = member.clone();
             let member_for_task = member.clone();
-            let req_owned = req.clone();
+            let mut req_owned = req.clone();
+            req_owned.model = member.model_id.clone();
+            req_owned.reasoning_effort = req
+                .reasoning_effort
+                .as_deref()
+                .and_then(|e| self.registry.reasoning_level(&member.provider_id, e));
+            if let Some(cap) = self
+                .registry
+                .output_limit(&member.provider_id, &member.model_id)
+            {
+                req_owned.max_output_tokens =
+                    Some(req_owned.max_output_tokens.unwrap_or(cap).min(cap));
+            }
             let handle = tokio::spawn(async move {
                 let member_owned = member_for_task;
                 let is_mock = registry.is_mock(&member_owned.provider_id);
@@ -383,22 +426,37 @@ impl MemberRunner {
                     ProviderEvent::Finished { finish } => finished = Some(*finish),
                     ProviderEvent::Failure { error } => {
                         let (outcome, retry_same, switchable) = classify_failure(error, streamed);
+                        // A rate limit is a provider-wide condition, not a one-off: cool
+                        // the provider down so the next request (and other combos) do not
+                        // walk straight back into it.
+                        if matches!(
+                            error,
+                            ProviderError::RateLimited(_) | ProviderError::Transient { .. }
+                        ) {
+                            let wait = error.retry_after().unwrap_or_else(|| {
+                                self.backoff_base.mul_f64(2f64.powi(retried as i32))
+                            });
+                            self.registry.note_cooldown(&member.provider_id, wait);
+                        }
                         if retry_same && retried < self.max_retries {
                             retried += 1;
-                            let delay = self.backoff_base.mul_f64(2f64.powi(retried as i32 - 1))
-                                + Duration::from_millis(jitter_ms());
+                            let delay = error.retry_after().unwrap_or_else(|| {
+                                self.backoff_base.mul_f64(2f64.powi(retried as i32 - 1))
+                            }) + Duration::from_millis(jitter_ms());
                             let _ = tx
                                 .send(AttemptEvent {
                                     attempt: member_owned.clone(),
-                                    event: ProviderEvent::Failure {
-                                        error: ProviderError::Rejected(format!(
-                                            "{error} — same-member retry {retried}/{} in {delay:?}",
-                                            self.max_retries
-                                        )),
+                                    event: ProviderEvent::Retrying {
+                                        reason: format!(
+                                            "{error} — retry {retried}/{} in {}s",
+                                            self.max_retries,
+                                            delay.as_secs_f32().ceil()
+                                        ),
                                     },
                                 })
                                 .await;
                             do_retry = true;
+                            streamed = false;
                             break;
                         }
                         terminal = Some((outcome, switchable));
@@ -460,6 +518,9 @@ fn classify_failure(error: &ProviderError, streamed: bool) -> (RequestOutcome, b
             error: error.to_string(),
             retriable,
         },
+        // A stream dropped after output stays "unknown": the request may have landed
+        // remotely, so the combo must not silently repeat it against another member.
+        // It is still retried on the *same* member — see `retry_same` below.
         ProviderError::Dropped(_) => {
             if streamed {
                 RequestOutcome::Unknown {
@@ -472,7 +533,9 @@ fn classify_failure(error: &ProviderError, streamed: bool) -> (RequestOutcome, b
                 }
             }
         }
-        ProviderError::RateLimited(_) | ProviderError::Server { .. } => RequestOutcome::Errored {
+        ProviderError::RateLimited(_)
+        | ProviderError::Transient { .. }
+        | ProviderError::Server { .. } => RequestOutcome::Errored {
             error: error.to_string(),
             retriable,
         },
@@ -485,7 +548,12 @@ fn classify_failure(error: &ProviderError, streamed: bool) -> (RequestOutcome, b
             retriable: false,
         },
     };
-    let retry_same = retriable && !streamed && !matches!(error, ProviderError::Auth(_));
+    // A dropped stream is worth repeating on the same member: no complete answer was
+    // received, and the caller discards whatever the failed attempt streamed. Other
+    // errors after output reached the user are not repeated.
+    let retry_same = retriable
+        && !matches!(error, ProviderError::Auth(_))
+        && (!streamed || matches!(error, ProviderError::Dropped(_)));
     let switchable = error.switchable() || matches!(error, ProviderError::Malformed(_));
     (outcome, retry_same, switchable)
 }

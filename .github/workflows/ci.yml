@@ -17,12 +17,17 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Format
         run: cargo fmt --check
       - name: Clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
+      - name: Docs site (generated from the repository Markdown)
+        run: python3 docs/site/build.py --check
       - name: Build release
         run: cargo build --release
       - name: Smoke test (offline, mock provider)

@@ -16,7 +16,17 @@ pub struct SchemaIssue {
 
 impl std::fmt::Display for SchemaIssue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}: {}", self.pointer, self.message)
+        // Root-level issues have no pointer; printing one yields a bare ": message".
+        if self.pointer.is_empty() {
+            return write!(f, "{}", self.message);
+        }
+        // `/command` reads better as `command` in a message the model must act on.
+        write!(
+            f,
+            "{}: {}",
+            self.pointer.trim_start_matches('/'),
+            self.message
+        )
     }
 }
 
@@ -174,9 +184,14 @@ fn check(instance: &Value, schema: &Value, ptr: String, issues: &mut Vec<SchemaI
                         if !props.contains_key(k) {
                             issues.push(SchemaIssue {
                                 message: format!(
-                                    "unknown field `{k}` (additionalProperties is false)"
+                                    "unknown field `{k}` (this tool accepts: {})",
+                                    if props.is_empty() {
+                                        "no parameters".to_string()
+                                    } else {
+                                        props.keys().cloned().collect::<Vec<_>>().join(", ")
+                                    }
                                 ),
-                                pointer: pointer_join(&ptr, k),
+                                pointer: ptr.clone(),
                             });
                         }
                     }
@@ -194,6 +209,51 @@ fn check(instance: &Value, schema: &Value, ptr: String, issues: &mut Vec<SchemaI
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod message_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn messages(instance: Value, schema: Value) -> Vec<String> {
+        validate(&instance, &schema)
+            .iter()
+            .map(|i| i.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn root_level_issues_have_no_stray_colon() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+            "additionalProperties": false
+        });
+        let msgs = messages(json!({}), schema.clone());
+        assert_eq!(msgs, vec!["missing required field `command`"]);
+        assert!(
+            !msgs[0].starts_with(':'),
+            "a message the model must act on cannot start with a colon"
+        );
+    }
+
+    #[test]
+    fn an_unknown_field_names_the_accepted_ones() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"command": {"type": "string"}, "timeout_secs": {"type": "integer"}},
+            "required": ["command"],
+            "additionalProperties": false
+        });
+        let msgs = messages(json!({"wd": "/tmp", "command": "ls"}), schema);
+        assert!(msgs[0].contains("unknown field `wd`"), "got {msgs:?}");
+        assert!(
+            msgs[0].contains("command") && msgs[0].contains("timeout_secs"),
+            "the accepted fields are listed: {msgs:?}"
+        );
     }
 }
 

@@ -136,6 +136,48 @@ async fn chat_malformed_chunk_is_classified() {
 }
 
 #[tokio::test]
+async fn chat_empty_keepalive_frames_are_skipped_not_fatal() {
+    // Real gateways interleave empty `data:` heartbeats and whitespace-only frames.
+    // These must be skipped, not reported as "chunk is not JSON".
+    let body = b"data: \n\ndata:   \n\n: keepalive\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n".to_vec();
+    let fixture = support::Fixture::start(vec![(200, "text/event-stream", body)]).await;
+    let adapter = ChatCompletionsAdapter::new(Arc::new(HttpTransport::new().unwrap()));
+    let (tx, rx) = mpsc::channel(64);
+    adapter
+        .stream(&endpoint_of(&fixture.base_url), &ChatRequest::default(), tx)
+        .await
+        .expect("empty keepalive frames must be skipped");
+    let events = drain(rx).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ProviderEvent::TextDelta { text } if text == "hi"
+        )),
+        "text after keepalives is delivered: {events:?}"
+    );
+}
+
+#[tokio::test]
+async fn responses_empty_keepalive_frames_are_skipped_not_fatal() {
+    let body = b"data: \n\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"yo\"}\n\ndata: {\"type\":\"response.completed\"}\n\n".to_vec();
+    let fixture = support::Fixture::start(vec![(200, "text/event-stream", body)]).await;
+    let adapter = ResponsesAdapter::new(Arc::new(HttpTransport::new().unwrap()));
+    let (tx, rx) = mpsc::channel(64);
+    adapter
+        .stream(&endpoint_of(&fixture.base_url), &ChatRequest::default(), tx)
+        .await
+        .expect("empty keepalive frames must be skipped");
+    let events = drain(rx).await;
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            ProviderEvent::TextDelta { text } if text == "yo"
+        )),
+        "text after keepalives is delivered: {events:?}"
+    );
+}
+
+#[tokio::test]
 async fn chat_stream_ended_without_terminator_is_dropped() {
     // No finish_reason, no [DONE] — endpoint died mid-stream.
     let body =
@@ -275,4 +317,63 @@ async fn responses_body_shape_uses_items() {
         body.get("messages").is_none(),
         "no chat-completions leakage"
     );
+}
+
+#[tokio::test]
+async fn transport_retains_every_frame_in_a_coalesced_network_chunk() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let body = (0..30)
+        .map(|i| format!("data: {i}\n\n"))
+        .collect::<String>();
+    let expected = body.len();
+    tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut buf = [0u8; 4096];
+        let _ = socket.read(&mut buf).await;
+        let response=format!("HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {expected}\r\nconnection: close\r\n\r\n{body}");
+        socket.write_all(response.as_bytes()).await.unwrap();
+    });
+    let http = HttpTransport::new().unwrap();
+    let mut stream = http
+        .post_sse(
+            &endpoint_of(&format!("http://{addr}")),
+            "/",
+            &serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    let mut frames = Vec::new();
+    while let Some(frame) = stream.next_frame(Duration::from_secs(2)).await.unwrap() {
+        frames.push(frame.data);
+    }
+    assert_eq!(frames, (0..30).map(|i| i.to_string()).collect::<Vec<_>>());
+}
+#[test]
+fn responses_serializes_flat_call_and_output_items() {
+    let req = ChatRequest {
+        messages: vec![
+            ChatMessage::user("inspect"),
+            ChatMessage {
+                role: loon_providers::Role::Assistant,
+                text: "Reading now".into(),
+                tool_calls: vec![loon_providers::ToolCallReq {
+                    id: "c1".into(),
+                    name: "read".into(),
+                    arguments_json: r#"{"path":"a"}"#.into(),
+                }],
+                tool_call_id: None,
+            },
+            ChatMessage::tool_result("c1", "contents"),
+            ChatMessage::assistant("done"),
+        ],
+        ..Default::default()
+    };
+    let body = ResponsesAdapter::build_body(&req);
+    let items = body["input"].as_array().unwrap();
+    assert!(items.iter().all(|v| v.is_object()));
+    assert_eq!(items[2]["type"], "function_call");
+    assert_eq!(items[3]["type"], "function_call_output");
+    assert_eq!(items[2]["call_id"], items[3]["call_id"]);
 }

@@ -19,6 +19,7 @@ pub struct Skill {
     /// Which scope it came from; workspace shadows global on the same name.
     pub scope: &'static str,
     pub body: String,
+    pub description: String,
 }
 
 /// Load every `.md` skill from both scopes. Workspace skills shadow global ones with
@@ -33,11 +34,16 @@ pub fn load(data_dir: &Path, cwd: &Path) -> Vec<Skill> {
             continue;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
+            let entry_path = entry.path();
+            let path = if entry_path.is_dir() {
+                entry_path.join("SKILL.md")
+            } else {
+                entry_path.clone()
+            };
             if path.extension().and_then(|e| e.to_str()) != Some("md") {
                 continue;
             }
-            let Some(name) = path.file_stem().and_then(|s| s.to_str()) else {
+            let Some(name) = entry_path.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
             if name.is_empty()
@@ -53,11 +59,24 @@ pub fn load(data_dir: &Path, cwd: &Path) -> Vec<Skill> {
             if body.trim().is_empty() {
                 continue;
             }
+            let (fields, text) = crate::guidance::frontmatter(&body);
+            let description = fields.get("description").cloned().unwrap_or_else(|| {
+                text.lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim_start_matches('#')
+                    .trim()
+                    .chars()
+                    .take(240)
+                    .collect()
+            });
+            let body = text.to_string();
             out.push(Skill {
                 name: name.to_string(),
                 path,
                 scope,
                 body,
+                description,
             });
         }
     }
@@ -67,6 +86,7 @@ pub fn load(data_dir: &Path, cwd: &Path) -> Vec<Skill> {
         if a.name == b.name {
             // keep the later-inserted (workspace) one
             std::mem::swap(&mut a.body, &mut b.body);
+            std::mem::swap(&mut a.description, &mut b.description);
             std::mem::swap(&mut a.scope, &mut b.scope);
             std::mem::swap(&mut a.path, &mut b.path);
             true
@@ -86,6 +106,69 @@ pub fn expand(body: &str, args: &str) -> String {
         body.to_string()
     } else {
         format!("{body}\n\nAdditional arguments: {args}")
+    }
+}
+
+/// Bundled workflows can be overridden by user/workspace files without copying defaults.
+pub fn load_with_builtins(data_dir: &Path, cwd: &Path) -> Vec<Skill> {
+    let mut skills: Vec<Skill> = crate::builtin_skills::SKILLS
+        .iter()
+        .map(|(name, text)| {
+            let (metadata, body) = crate::guidance::frontmatter(text);
+            Skill {
+                name: (*name).into(),
+                path: PathBuf::from(format!("<bundled>/{name}/SKILL.md")),
+                scope: "bundled",
+                description: metadata.get("description").cloned().unwrap_or_default(),
+                body: body.to_string(),
+            }
+        })
+        .collect();
+    for skill in load(data_dir, cwd) {
+        skills.retain(|s| s.name != skill.name);
+        skills.push(skill);
+    }
+    skills.sort_by(|a, b| a.name.cmp(&b.name));
+    skills
+}
+pub struct LoadSkillTool {
+    pub data_dir: PathBuf,
+    pub cwd: PathBuf,
+}
+#[async_trait::async_trait]
+impl loon_tools::Tool for LoadSkillTool {
+    fn spec(&self) -> loon_tools::ToolSpec {
+        loon_tools::ToolSpec {
+        name:"load_skill".into(),description:"List available skills or load a named workflow's full instructions. Reads fresh from global and workspace skills, including <name>/SKILL.md directories. Apply relevant instructions, then continue the task using the normal tools.".into(),
+        parameters:serde_json::json!({"type":"object","properties":{"name":{"type":"string"}},"additionalProperties":false}), effects:loon_tools::Effects::ReadOnly,
+    }
+    }
+    async fn run(
+        &self,
+        args: serde_json::Value,
+        ctx: &loon_tools::ToolCtx,
+    ) -> Result<loon_tools::ToolOutput, loon_tools::ToolError> {
+        let skills = load_with_builtins(&self.data_dir, &self.cwd);
+        let text = if let Some(name) = args["name"].as_str().filter(|s| !s.is_empty()) {
+            let skill = skills.iter().find(|s| s.name == name).ok_or_else(|| {
+                loon_tools::ToolError::InvalidArgs(format!("unknown skill {name}"))
+            })?;
+            format!("Skill /{} ({})\n{}", skill.name, skill.scope, skill.body)
+        } else {
+            skills
+                .iter()
+                .map(|s| format!("/{} ({}) — {}", s.name, s.scope, s.description))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let (text, full, truncated) = ctx.bound(text);
+        Ok(loon_tools::ToolOutput {
+            ok: true,
+            text,
+            full,
+            truncated,
+            structured: serde_json::Value::Null,
+        })
     }
 }
 

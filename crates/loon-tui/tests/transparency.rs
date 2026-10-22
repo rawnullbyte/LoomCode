@@ -26,12 +26,18 @@ fn make_app(transparent: bool) -> App {
         ok: true,
         excerpt: "1  fn parse() {".into(),
         pending: false,
+        detail: String::new(),
+        started: None,
+        elapsed: None,
     });
     app.push_block(Block::Tool {
         name: "edit".into(),
         ok: false,
         excerpt: "tool error: conflict".into(),
         pending: false,
+        detail: String::new(),
+        started: None,
+        elapsed: None,
     });
     app.push_block(Block::Member("skipped x: capability".into()));
     app.stream_text("Here is what I found and the fix I am applying…");

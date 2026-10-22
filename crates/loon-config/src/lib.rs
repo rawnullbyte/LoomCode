@@ -4,15 +4,17 @@
 //! callers on top of a loaded [`Config`]). Saving goes through `toml_edit` so user comments
 //! and unknown extension fields survive a round trip.
 
+pub mod editor;
 pub mod paths;
 pub mod schema;
+pub mod tokens;
 pub mod validate;
 
 pub use paths::LoonPaths;
 pub use schema::{
     ApiFamily, Appearance, AppearanceMode, CapState, CapabilityOverrides, Combo, ComboMember,
-    ComboMode, ComboRequires, Mcp, McpServerConfig, ModelDef, PermissionMode, PermissionRule,
-    Permissions, Provider, SessionCfg, UiCfg,
+    ComboMode, ComboRequires, Effort, Mcp, McpServerConfig, ModelDef, PermissionMode,
+    PermissionRule, Permissions, Provider, SessionCfg, UiCfg,
 };
 pub use validate::{ConfigError, Finding, Validator};
 
@@ -41,6 +43,11 @@ pub struct Config {
     pub combos: std::collections::BTreeMap<String, Combo>,
     #[serde(default)]
     pub mcp: Mcp,
+    #[serde(default)]
+    pub context7: schema::Context7,
+    /// Lifecycle hooks keyed by event name.
+    #[serde(default)]
+    pub hooks: std::collections::BTreeMap<String, Vec<schema::Hook>>,
 }
 
 impl Config {
@@ -54,10 +61,12 @@ impl Config {
                 base_url: "http://mock.invalid/v1".into(),
                 api: ApiFamily::Chat,
                 api_key_env: None,
+                api_key: None,
                 headers: Default::default(),
                 timeout_secs: 30,
                 models: vec![],
                 mock: true,
+                reasoning_efforts: vec![],
             },
         );
         let mut models = std::collections::BTreeMap::new();
@@ -81,6 +90,8 @@ impl Config {
             models,
             combos: Default::default(),
             mcp: Mcp::default(),
+            context7: Default::default(),
+            hooks: Default::default(),
         }
     }
 
@@ -105,6 +116,51 @@ impl Config {
                 message: e.to_string(),
             }),
         }
+    }
+
+    /// User settings followed by project and local overlays. Scalars override;
+    /// tables merge recursively; arrays replace (never silently broaden permission lists).
+    pub fn load_effective(
+        paths: &LoonPaths,
+        cwd: &std::path::Path,
+    ) -> Result<(Config, Vec<Finding>), ConfigError> {
+        let (base, _) = Self::load_or_builtin(paths)?;
+        let cfg = base.with_overlays(cwd)?;
+        let findings = Validator::new(&cfg).validate();
+        Ok((cfg, findings))
+    }
+
+    /// Apply project/local overlays to this candidate, including before an interactive save.
+    pub fn with_overlays(&self, cwd: &std::path::Path) -> Result<Config, ConfigError> {
+        let base = self;
+        let mut value = toml::Value::try_from(base).map_err(|e| ConfigError::Parse {
+            path: cwd.join(".loon/config.toml"),
+            message: e.to_string(),
+        })?;
+        for path in [
+            cwd.join(".loon/config.toml"),
+            cwd.join(".loon/config.local.toml"),
+        ] {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let overlay: toml::Value =
+                        toml::from_str(&text).map_err(|e| ConfigError::Parse {
+                            path: path.clone(),
+                            message: e.to_string(),
+                        })?;
+                    merge_settings(&mut value, overlay);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(ConfigError::Io { path, source: e }),
+            }
+        }
+        let cfg: Config = value
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError::Parse {
+                path: cwd.join(".loon/config.toml"),
+                message: e.to_string(),
+            })?;
+        Ok(cfg)
     }
 
     /// Save while preserving comments/unknown fields of the existing document.
@@ -155,7 +211,14 @@ fn write_atomic(path: &PathBuf, text: String) -> Result<(), ConfigError> {
     use std::io::Write;
     let tmp = path.with_extension("toml.tmp");
     {
-        let mut f = std::fs::File::create(&tmp).map_err(|e| ConfigError::Io {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(&tmp).map_err(|e| ConfigError::Io {
             path: tmp.clone(),
             source: e,
         })?;
@@ -194,7 +257,6 @@ mode = "bypass"
 [session]
 # Model reference: a [models] key or "combo:NAME".
 model = "mock"
-max_steps = 24
 
 # ── Providers: any number of OpenAI-compatible endpoints ─────────────────────────
 # [providers.ollama]
@@ -216,4 +278,18 @@ max_steps = 24
 #   { provider = "ollama", model = "llama3.1:8b" },
 # ]
 "#
+}
+
+fn merge_settings(base: &mut toml::Value, overlay: toml::Value) {
+    if let (Some(table), toml::Value::Table(next)) = (base.as_table_mut(), &overlay) {
+        for (key, value) in next {
+            if let Some(existing) = table.get_mut(key) {
+                merge_settings(existing, value.clone());
+            } else {
+                table.insert(key.clone(), value.clone());
+            }
+        }
+    } else {
+        *base = overlay;
+    }
 }

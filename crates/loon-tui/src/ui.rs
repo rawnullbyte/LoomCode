@@ -1,37 +1,67 @@
 //! Layout and drawing.
 //!
-//! Zones: animated status line, transcript (with text-selection highlighting),
-//! (optional) slash-command popup above the input, input line, permission-mode footer.
-//! The transparent invariant holds everywhere: every style comes from the theme, so
-//! every background is `Color::Reset` and reverse video is never used; all animation is
-//! foreground glyph cycling driven by `App::tick`, and selection highlight is
-//! underline — never reverse video.
+//! Zones: transcript (which begins with the animated loom banner and scrolls it away),
+//! (optional) slash-command popup above the input, input line, one-row status bar. The transparent invariant holds everywhere: every
+//! style comes from the theme, so every background is `Color::Reset` and reverse video
+//! is never used; animation is foreground glyph/colour cycling driven by `App::tick`.
 
 use crate::{theme, App};
 use ratatui::layout::{Constraint, Layout};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block as RtBlock, Borders, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
-const POPUP_MAX_ROWS: usize = 6;
-
-/// Spinner verbs, cycled slowly while a turn runs — one word per ~4 s at 20 fps.
-const VERBS: [&str; 5] = ["Thinking", "Working", "Forging", "Verifying", "Polishing"];
+/// Most input rows shown before the editor scrolls its own view.
+const MAX_INPUT_LINES: usize = 8;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
+    draw_inner(f, app);
+    apply_terminal_preferences(f, app);
+}
+fn draw_inner(f: &mut Frame, app: &mut App) {
     let area = f.area();
+    if app.viewport_area.is_some() && app.viewport_area != Some(area) {
+        app.resized();
+    }
+    app.viewport_area = Some(area);
+    crate::manager::preview_theme(app);
     let completions = app.visible_completions();
-    let popup_rows = completions.len().min(POPUP_MAX_ROWS) as u16;
-    let [status, transcript, popup, input, footer] = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Min(3),
-        Constraint::Length(if popup_rows > 0 { popup_rows + 1 } else { 0 }), // +1 border row
-        Constraint::Length(3),
-        Constraint::Length(1),
+    let desired_popup = completions.len().min(app.popup_rows.clamp(3, 20)) as u16;
+    // The banner lives in the transcript, so there is no fixed header: the transcript
+    // owns everything between the top of the screen and the input.
+    let footer_h = if app.footer && area.height >= 2 { 1 } else { 0 };
+    // The input grows with its lines (Shift+Enter), up to eight visible rows.
+    let lines = app.input_lines().len().min(MAX_INPUT_LINES);
+    let room = area.height.saturating_sub(footer_h);
+    let input_h = if area.height >= 6 {
+        ((lines as u16) + 2).min(room.saturating_sub(3)).max(3)
+    } else if area.height > footer_h {
+        1
+    } else {
+        0
+    };
+    let spare = area.height.saturating_sub(footer_h + input_h);
+    let transcript_min = spare.min(3);
+    let popup_rows = desired_popup.min(spare.saturating_sub(transcript_min));
+    let [transcript, popup, input, footer] = Layout::vertical([
+        Constraint::Min(transcript_min),
+        Constraint::Length(popup_rows), // borderless [CC]-style list
+        Constraint::Length(input_h),
+        Constraint::Length(footer_h),
     ])
     .areas(area);
     app.popup_rect = None;
-    app.input_rect = Some((input.x + 1, input.y + 1));
+    // The input block has only top/bottom borders, so its content starts at input.x
+    // (no left border column to offset).
+    app.input_rect = if input.height >= 3 {
+        Some((input.x, input.y + 1))
+    } else if input.height > 0 {
+        Some((input.x, input.y))
+    } else {
+        None
+    };
     app.transcript_rect = Some((
         transcript.x,
         transcript.y,
@@ -39,33 +69,16 @@ pub fn draw(f: &mut Frame, app: &mut App) {
         transcript.height,
     ));
 
-    let theme = theme::Theme::from_mode(if app.transparent {
-        loon_config::AppearanceMode::Transparent
-    } else {
-        loon_config::AppearanceMode::Opaque
-    });
-
-    // ── status line: animated while busy, quiet when idle ───────────────────────
-    // idle: nothing (the banner already said who we are); busy: spinner only
-    let status_spans: Vec<Span> = if app.status.busy {
-        let elapsed = app.elapsed_secs();
-        let verb = VERBS[(app.tick as usize / 80) % VERBS.len()];
-        vec![Span::styled(
-            format!("{} {}… {}s", app.spinner_glyph(), verb, elapsed),
-            theme.accent_bold(),
-        )]
-    } else {
-        vec![]
-    };
-    f.render_widget(
-        Paragraph::new(Line::from(status_spans)).style(theme.base()),
-        status,
-    );
+    let theme = theme::Theme::from_palette(&app.palette, app.transparent);
+    f.render_widget(Paragraph::new("").style(theme.base()), area);
 
     // ── transcript, with selection highlight ────────────────────────────────────
     let lines = app.transcript_lines(transcript.width);
-    let total = lines.len() as u16;
-    let visible = transcript.height;
+    let total = lines.len();
+    let visible = transcript.height as usize;
+    if let Some(off) = app.scroll_from_bottom {
+        app.scroll_from_bottom = Some(off.min(total.saturating_sub(visible)));
+    }
     let (start, end) = match app.scroll_from_bottom {
         None => (total.saturating_sub(visible), total),
         Some(off) => {
@@ -73,309 +86,208 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             (end.saturating_sub(visible), end)
         }
     };
+    // Normalise first, then overlay selection: normalisation paints every span with
+    // the theme background, so doing it afterwards would erase the selection bar.
     let sel = app.selection;
-    let shown: Vec<Line> = lines[start as usize..end as usize]
+    let shown: Vec<Line> = lines[start..end]
         .iter()
         .enumerate()
-        .map(|(i, line)| match sel {
-            Some(sel) => {
-                let abs = (start as usize + i) as u64;
-                apply_selection(line, abs, &sel)
+        .map(|(i, line)| {
+            let line = normalize_line(line.clone(), &theme);
+            match sel {
+                Some(sel) => apply_selection(&line, (start + i) as u64, &sel),
+                None => line,
             }
-            None => line.clone(),
         })
         .collect();
-    f.render_widget(Paragraph::new(shown), transcript);
+    f.render_widget(Paragraph::new(shown).style(theme.base()), transcript);
 
     // ── slash-command popup, directly above the input ───────────────────────────
-    if popup_rows > 0 {
+    // [CC] style: borderless list, "❯ " marker on the hovered/selected row, name
+    // column padded to a common width, description dimmed beside it. Hovering
+    // highlights only; Enter/click picks.
+    if popup_rows > 0 && popup.height > 0 {
         app.popup_rect = Some((popup.x, popup.y, popup.height));
         let selected = app.completion_selected.min(completions.len() - 1);
         // window the list so the selection stays visible when there are more rows
         // than fit
         let start = selected
-            .saturating_sub(POPUP_MAX_ROWS - 1)
+            .saturating_sub(popup_rows.saturating_sub(1) as usize)
             .min(completions.len().saturating_sub(popup_rows as usize));
         app.popup_window_start = start;
-        let mut rows: Vec<Line> = Vec::new();
-        for (i, c) in completions
+        let visible: Vec<_> = completions
             .iter()
             .skip(start)
             .take(popup_rows as usize)
-            .enumerate()
-        {
+            .collect();
+        // Shared name-column width, capped so descriptions still have room.
+        let name_w = visible
+            .iter()
+            .map(|c| c.display.chars().count() + 1) // leading '/'
+            .max()
+            .unwrap_or(0)
+            .min((popup.width as usize / 2).max(8));
+        let mut rows: Vec<Line> = Vec::new();
+        for (i, c) in visible.iter().enumerate() {
             let idx = start + i;
-            let display = c.display.clone();
-            let desc = c.description.clone();
-            let row = if idx == selected {
-                Line::from(vec![
-                    Span::styled("› ", theme.menu_selected()),
-                    Span::styled(format!("/{display}"), theme.menu_selected()),
-                    Span::styled(format!("  {desc}"), theme.menu_selected()),
-                ])
+            let full_name = format!("/{}", c.display);
+            let name = if full_name.chars().count() > name_w {
+                full_name
+                    .chars()
+                    .take(name_w.saturating_sub(1))
+                    .collect::<String>()
+                    + "…"
             } else {
-                Line::from(vec![
-                    Span::styled("  ", theme.dim()),
-                    Span::styled(format!("/{display}"), theme.base()),
-                    Span::styled(format!("  {desc}"), theme.dim()),
-                ])
+                full_name
             };
-            rows.push(row.style(theme.base()));
-        }
-        let block = RtBlock::default()
-            .borders(Borders::TOP)
-            .border_style(theme.border());
-        f.render_widget(Paragraph::new(rows).block(block).style(theme.base()), popup);
-    }
-
-    // ── input: animated glyph while busy, accent caret when idle ────────────────
-    let prompt = if app.status.busy {
-        app.spinner_glyph().to_string()
-    } else {
-        "›".to_string()
-    };
-    let block = RtBlock::default()
-        .borders(Borders::TOP | Borders::BOTTOM)
-        .border_style(theme.border());
-    // Empty input + tips enabled: show a rotating placeholder like [CC]'s prompt.
-    let placeholder = if app.input.is_empty() && app.tips {
-        Some(placeholder_tip(app.tick))
-    } else {
-        None
-    };
-    let input_line = match &placeholder {
-        Some(tip) => Line::from(vec![
-            Span::styled(prompt.clone(), theme.accent_bold()),
-            Span::styled(format!(" {tip}"), theme.dim()),
-        ]),
-        None => Line::from(vec![
-            Span::styled(prompt.clone(), theme.accent_bold()),
-            Span::styled(format!(" {}", app.input), theme.base()),
-        ]),
-    };
-    let para = Paragraph::new(input_line).block(block).style(theme.base());
-    f.render_widget(para, input);
-
-    // ── permission-mode footer ──────────────────────────────────────────────────
-    let footer_text = permission_footer(&app.status.mode);
-    let footer_style = if app.status.mode == "bypass" {
-        theme.dim()
-    } else {
-        theme.ok()
-    };
-    f.render_widget(
-        Paragraph::new(Line::styled(
-            truncate_str(&footer_text, footer.width as usize),
-            footer_style,
-        )),
-        footer,
-    );
-
-    // ── model picker overlay (bare /model) ──────────────────────────────────────
-    if let Some((refs, selected)) = &app.model_picker {
-        let rows_n = refs.len().min(10) as u16;
-        let w = 48u16.min(area.width.saturating_sub(4));
-        let h = (rows_n + 2).min(area.height.saturating_sub(4));
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
-        let y = area.y + (area.height.saturating_sub(h)) / 2;
-        let rect = ratatui::layout::Rect {
-            x,
-            y,
-            width: w,
-            height: h,
-        };
-        f.render_widget(ratatui::widgets::Clear, rect);
-        let mut rows: Vec<Line> = vec![Line::styled(
-            " switch model — arrows · enter · esc ".to_string(),
-            theme.accent_bold(),
-        )];
-        for (i, r) in refs.iter().take(rows_n as usize).enumerate() {
-            let current = *r == app.status.model;
-            if i == *selected {
-                rows.push(Line::from(Span::styled(
-                    format!("› {r}{}", if current { "  (current)" } else { "" }),
-                    theme.menu_selected(),
-                )));
-            } else {
-                rows.push(Line::from(Span::styled(
-                    format!("  {r}"),
-                    if current { theme.ok() } else { theme.base() },
-                )));
-            }
-        }
-        let block = RtBlock::default()
-            .borders(Borders::ALL)
-            .border_style(theme.border())
-            .style(theme.base());
-        f.render_widget(Paragraph::new(rows).block(block).style(theme.base()), rect);
-    }
-
-    // ── add-provider form overlay (bare /provider) ──────────────────────────────
-    if let Some((fields, focused)) = &app.provider_form {
-        let labels = [
-            "name",
-            "base url",
-            "api (chat|responses)",
-            "api key env var",
-        ];
-        let w = 64u16.min(area.width.saturating_sub(4));
-        let h = 8u16.min(area.height.saturating_sub(4));
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
-        let y = area.y + (area.height.saturating_sub(h)) / 2;
-        let rect = ratatui::layout::Rect {
-            x,
-            y,
-            width: w,
-            height: h,
-        };
-        f.render_widget(ratatui::widgets::Clear, rect);
-        let mut rows: Vec<Line> = vec![Line::styled(
-            " Add provider ".to_string(),
-            theme.accent_bold(),
-        )];
-        for (i, (label, value)) in labels.iter().zip(fields.iter()).enumerate() {
-            let style = if i == *focused {
-                theme.menu_selected()
+            let pad = name_w.saturating_sub(name.chars().count());
+            let marker = if idx == selected { "❯ " } else { "  " };
+            let name_style = if idx == selected {
+                theme.accent_bold()
             } else {
                 theme.base()
             };
+            let desc_style = theme.dim();
             rows.push(Line::from(vec![
-                Span::styled(format!(" {label:<22}"), style),
-                Span::styled(value.clone(), style),
+                Span::styled(marker, theme.accent_bold()),
+                Span::styled(name, name_style),
+                Span::styled(" ".repeat(pad), theme.base()),
+                Span::styled("  ", theme.base()),
+                Span::styled(c.description.clone(), desc_style),
             ]));
         }
-        rows.push(Line::styled(
-            "  tab next · enter saves to config · esc cancels".to_string(),
-            theme.dim(),
-        ));
-        let block = RtBlock::default()
-            .borders(Borders::ALL)
-            .border_style(theme.border())
-            .style(theme.base());
-        f.render_widget(Paragraph::new(rows).block(block).style(theme.base()), rect);
+        f.render_widget(Paragraph::new(rows).style(theme.base()), popup);
     }
 
-    // ── effort picker overlay (bare /effort) ────────────────────────────────────
-    if let Some(selected) = app.effort_picker {
-        let w = 36u16.min(area.width.saturating_sub(4));
-        let h = 6u16.min(area.height.saturating_sub(4));
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
-        let y = area.y + (area.height.saturating_sub(h)) / 2;
-        let rect = ratatui::layout::Rect {
-            x,
-            y,
-            width: w,
-            height: h,
-        };
-        f.render_widget(ratatui::widgets::Clear, rect);
-        let mut rows: Vec<Line> = vec![Line::styled(
-            " effort — arrows · enter · esc ".to_string(),
-            theme.accent_bold(),
-        )];
-        for (i, level) in ["low — 2k output tokens", "medium — 8k", "high — 32k"]
+    // ── input: a steady caret; motion belongs to the header, not the prompt ─────
+    let prompt = "›".to_string();
+    let block = RtBlock::default()
+        .borders(if input.height >= 3 {
+            Borders::TOP | Borders::BOTTOM
+        } else {
+            Borders::NONE
+        })
+        .border_style(if app.status.busy && app.animations {
+            theme.accent().fg(crate::motion::pulse(app.tick))
+        } else {
+            theme.border()
+        });
+    let input_chars: Vec<char> = app.input.chars().collect();
+    app.cursor = app.cursor.min(input_chars.len());
+    let text_lines: Vec<String> = app.input_lines().into_iter().map(str::to_string).collect();
+    let (cursor_line, cursor_col) = app.cursor_line_col();
+    // Horizontal scroll follows the cursor line only.
+    let available = input.width.saturating_sub(3).max(1) as usize;
+    let current: Vec<char> = text_lines
+        .get(cursor_line)
+        .map(|l| l.chars().collect())
+        .unwrap_or_default();
+    app.input_view_start = app.input_view_start.min(cursor_col);
+    while current[app.input_view_start..cursor_col]
+        .iter()
+        .map(|c| c.width().unwrap_or(0))
+        .sum::<usize>()
+        >= available
+        && app.input_view_start < cursor_col
+    {
+        app.input_view_start += 1;
+    }
+    let shown: Vec<Line> = if app.input.is_empty() && app.tips {
+        vec![Line::from(vec![
+            Span::styled(prompt.clone(), theme.accent_bold()),
+            Span::styled(
+                format!(
+                    " {}",
+                    if app.tip_text.is_empty() {
+                        placeholder_tip(app.tick)
+                    } else {
+                        &app.tip_text
+                    }
+                ),
+                theme.dim(),
+            ),
+        ])]
+    } else {
+        text_lines
             .iter()
             .enumerate()
-        {
-            if i == selected {
-                rows.push(Line::from(Span::styled(
-                    format!("› {level}"),
-                    theme.menu_selected(),
-                )));
-            } else {
-                rows.push(Line::from(Span::styled(format!("  {level}"), theme.base())));
-            }
-        }
-        let block = RtBlock::default()
-            .borders(Borders::ALL)
-            .border_style(theme.border())
-            .style(theme.base());
-        f.render_widget(Paragraph::new(rows).block(block).style(theme.base()), rect);
+            .map(|(i, text)| {
+                let marker = if i == 0 { prompt.clone() } else { " ".into() };
+                let view = if i == cursor_line {
+                    app.input_view_start
+                } else {
+                    0
+                };
+                let body: String = text.chars().skip(view).collect();
+                Line::from(vec![
+                    Span::styled(marker, theme.accent_bold()),
+                    Span::styled(format!(" {body}"), theme.base()),
+                ])
+            })
+            .collect()
+    };
+    let content_height = if input.height >= 3 {
+        input.height - 2
+    } else {
+        input.height
+    };
+    let input_start = cursor_line.saturating_sub(content_height.saturating_sub(1) as usize);
+    let shown = shown.into_iter().skip(input_start).collect::<Vec<_>>();
+    let para = Paragraph::new(shown).block(block).style(theme.base());
+    f.render_widget(para, input);
+
+    // Use the whole row: identity, activity, and resource usage have distinct zones.
+    if footer.height > 0 {
+        draw_status(f, app, &theme, footer);
     }
 
-    // ── settings menu overlay (bare /config) ────────────────────────────────────
-    if let Some(selected) = app.settings {
-        let w = 56u16.min(area.width.saturating_sub(4));
-        let h = 15u16.min(area.height.saturating_sub(4));
-        let x = area.x + (area.width.saturating_sub(w)) / 2;
-        let y = area.y + (area.height.saturating_sub(h)) / 2;
-        let rect = ratatui::layout::Rect {
-            x,
-            y,
-            width: w,
-            height: h,
-        };
-        f.render_widget(ratatui::widgets::Clear, rect);
-        let items: [String; 8] = [
-            format!("permission mode: {}   (enter cycles)", app.status.mode),
-            format!(
-                "autocompact: {}   (enter toggles)",
-                if app.settings_autocompact {
-                    "on"
-                } else {
-                    "off"
-                }
-            ),
-            format!(
-                "effort: {}   (enter cycles low/medium/high)",
-                app.settings_effort
-            ),
-            format!("max steps: {}   (enter cycles)", app.settings_max_steps),
-            format!(
-                "tool output cap: {}   (enter cycles)",
-                if app.settings_tool_cap >= 262_144 {
-                    "256k".to_string()
-                } else if app.settings_tool_cap >= 65_536 {
-                    "64k".to_string()
-                } else {
-                    format!("{}b", app.settings_tool_cap)
-                }
-            ),
-            "theme: enter to cycle transparent/opaque".to_string(),
-            "model…".to_string(),
-            "providers list".to_string(),
-        ];
-        let mut rows: Vec<Line> = vec![Line::styled(" Settings ".to_string(), theme.accent_bold())];
-        for (i, item) in items.iter().enumerate() {
-            if i == selected {
-                let pad = w
-                    .saturating_sub(4)
-                    .saturating_sub(item.chars().count() as u16);
-                rows.push(Line::from(vec![
-                    Span::styled(" › ", theme.menu_selected()),
-                    Span::styled(item.clone(), theme.menu_selected()),
-                    Span::styled(" ".repeat(pad as usize), theme.menu_selected()),
-                ]));
-            } else {
-                rows.push(Line::from(vec![
-                    Span::styled("   ", theme.dim()),
-                    Span::styled(item.clone(), theme.base()),
-                ]));
-            }
-        }
-        let block = RtBlock::default()
-            .borders(Borders::ALL)
-            .border_style(theme.border())
-            .style(theme.base());
-        f.render_widget(Paragraph::new(rows).block(block).style(theme.base()), rect);
+    if app.navigator.is_some() || app.editor.is_some() {
+        crate::manager::draw(f, app, &theme);
+        return;
     }
 
-    // text cursor at the recorded cursor position (hidden while busy streaming to
-    // avoid flicker)
-    if !app.status.busy {
-        let x = (prompt.chars().count() + 1 + app.cursor)
-            .min(input.width.saturating_sub(2) as usize) as u16;
-        f.set_cursor_position((
-            input.x + 1 + x.min(input.width.saturating_sub(2)),
-            input.y + 1,
-        ));
+    // The caret stays visible while a turn runs: prompts typed during a turn are
+    // still edited (and queued), so hiding the cursor made arrows look dead.
+    if input.height > 0 && input.width > 0 {
+        let cursor_cells = current[app.input_view_start.min(cursor_col)..cursor_col]
+            .iter()
+            .map(|c| c.width().unwrap_or(0))
+            .sum::<usize>();
+        let x = (prompt.chars().count() + 1 + cursor_cells)
+            .min(input.width.saturating_sub(1) as usize) as u16;
+        let visible = content_height as usize;
+        let row = cursor_line
+            .saturating_sub(input_start)
+            .min(visible.saturating_sub(1)) as u16;
+        f.set_cursor_position((input.x + x, input.y + u16::from(input.height >= 3) + row));
     }
 }
 
-/// Overlay the selection for one transcript line: the selected character range is
-/// re-rendered underlined (fg-only; reverse video stays banned).
+/// Normalise a transcript line onto the theme: every span gets the theme background
+/// (Reset in transparent mode), never reverse video.
+fn normalize_line(mut line: Line<'static>, theme: &theme::Theme) -> Line<'static> {
+    let base = theme.base();
+    line.style = base;
+    for span in &mut line.spans {
+        span.style.fg = match span.style.fg {
+            Some(Color::Reset) => base.fg,
+            Some(Color::Cyan | Color::Magenta) => theme.accent().fg,
+            Some(Color::Green) => theme.ok().fg,
+            Some(Color::Red) => theme.err().fg,
+            Some(Color::Yellow) => theme.warn().fg,
+            Some(Color::DarkGray) => theme.dim().fg,
+            color => color,
+        };
+        span.style.bg = base.bg;
+    }
+    line
+}
+
+/// Overlay the selection for one transcript line: the selected character range gets
+/// the theme's grey selection background (the one deliberate exception to bg=Reset).
 fn apply_selection(line: &Line<'static>, abs_line: u64, sel: &crate::SelRange) -> Line<'static> {
-    let (sel_first_line, sel_first_col, sel_last_line, sel_last_col) =
-        if sel.start_line <= sel.end_line {
+    let (first_line, first_col, last_line, last_col) =
+        if (sel.start_line, sel.start_col) <= (sel.end_line, sel.end_col) {
             (
                 sel.start_line as u64,
                 sel.start_col,
@@ -390,31 +302,31 @@ fn apply_selection(line: &Line<'static>, abs_line: u64, sel: &crate::SelRange) -
                 sel.start_col,
             )
         };
-    if abs_line < sel_first_line || abs_line > sel_last_line {
+    if abs_line < first_line || abs_line > last_line {
         return line.clone();
     }
     let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-    let begin = if abs_line == sel_first_line {
-        sel_first_col
-    } else {
-        0
-    };
-    let stop = if abs_line == sel_last_line {
-        sel_last_col
+    let begin = if abs_line == first_line { first_col } else { 0 };
+    let stop = if abs_line == last_line {
+        last_col
     } else {
         text.chars().count()
     };
     if stop <= begin {
         return line.clone();
     }
-    let chars: Vec<char> = text.chars().collect();
-    let byte = |i: usize| -> usize {
-        chars[..i.min(chars.len())]
-            .iter()
-            .map(|c| c.len_utf8())
-            .sum()
+    use unicode_width::UnicodeWidthChar;
+    let cell_byte = |column: usize| -> usize {
+        let mut n = 0;
+        for (i, c) in text.char_indices() {
+            if n >= column {
+                return i;
+            }
+            n += c.width().unwrap_or(0);
+        }
+        text.len()
     };
-    let (b0, b1, b2) = (byte(begin), byte(stop), byte(chars.len()));
+    let (b0, b1, b2) = (cell_byte(begin), cell_byte(stop), text.len());
     let mut out = Line::default();
     if b0 > 0 {
         out.spans
@@ -432,20 +344,153 @@ fn apply_selection(line: &Line<'static>, abs_line: u64, sel: &crate::SelRange) -
     out
 }
 
-/// The footer glyph and hint live here once; labels are plain data per mode. Change
-/// the symbol or the key hint by editing exactly one constant.
-const MODE_GLYPH: &str = "⏵⏵";
-const MODE_HINT: &str = "(shift+tab to cycle)";
-
-fn permission_footer(mode: &str) -> String {
-    let label = match mode {
-        "bypass" => "bypass permissions on",
-        "auto" => "auto review on — a reviewer agent checks calls, doubtful ones ask you",
-        "ask" => "manual mode on — mutating calls ask first",
-        "allowlist" => "allowlist mode on — only allowlisted tools run",
-        other => return format!("{MODE_GLYPH} {other} {MODE_HINT}"),
+fn draw_status(f: &mut Frame, app: &App, theme: &theme::Theme, area: ratatui::layout::Rect) {
+    use ratatui::layout::Alignment;
+    if area.width < 55 {
+        let text = format!(
+            "{} {}",
+            if app.status.busy {
+                crate::motion::spinner(app.tick)
+            } else {
+                '●'
+            },
+            if app.request_rate.active() {
+                format!("{} · {}", app.request_rate.label(), app.activity)
+            } else {
+                app.activity.clone()
+            }
+        );
+        f.render_widget(Paragraph::new(text).style(theme.accent()), area);
+        return;
+    }
+    let [identity, activity, resources] = Layout::horizontal([
+        Constraint::Percentage(26),
+        Constraint::Percentage(42),
+        Constraint::Percentage(32),
+    ])
+    .areas(area);
+    let model = app
+        .status
+        .model
+        .rsplit('/')
+        .next()
+        .unwrap_or(&app.status.model);
+    let left = vec![
+        (
+            format!(" {} ", app.status.mode),
+            theme.mode_style(&app.status.mode),
+        ),
+        (format!("│ {model}"), theme.accent_bold()),
+    ];
+    f.render_widget(
+        Paragraph::new(Line::from(clip_spans(left, identity.width))),
+        identity,
+    );
+    let activity_text = if app.status.busy {
+        format!(
+            "{} {}",
+            crate::motion::spinner(if app.animations { app.tick } else { 0 }),
+            if app.spinner_verbs.is_empty() {
+                app.activity.as_str()
+            } else {
+                app.spinner_verbs[(app.tick as usize / 30) % app.spinner_verbs.len()].as_str()
+            }
+        )
+    } else {
+        app.activity.clone()
     };
-    format!("{MODE_GLYPH} {label} {MODE_HINT}")
+    let middle = vec![
+        (
+            activity_text,
+            if app.status.busy {
+                theme.warn()
+            } else {
+                theme.ok()
+            },
+        ),
+        (
+            if app.work_state.ultraloop {
+                " · ULTRA"
+            } else {
+                ""
+            }
+            .into(),
+            theme.accent(),
+        ),
+    ];
+    f.render_widget(
+        Paragraph::new(Line::from(clip_spans(middle, activity.width))).alignment(Alignment::Center),
+        activity,
+    );
+    let context = if app.context_limit > 0 {
+        // Compact units: a 1M window reads `1M`, not the old `1000k`.
+        format!(
+            "~{} / {}",
+            loon_config::tokens::format_tokens(app.status.context_est),
+            loon_config::tokens::format_tokens(app.context_limit)
+        )
+    } else {
+        "compact off".into()
+    };
+    let queue = if app.queued.is_empty() {
+        String::new()
+    } else {
+        format!(" · {} queued", app.queued.len())
+    };
+    let text = if app.status.busy {
+        format!(
+            "{} · {} · {context}{queue}",
+            app.request_rate.label(),
+            format_elapsed(app.elapsed_secs())
+        )
+    } else {
+        format!("{context} · {}{queue} ", app.settings_effort)
+    };
+    let right = vec![(text, theme.accent())];
+    f.render_widget(
+        Paragraph::new(Line::from(clip_spans(right, resources.width))).alignment(Alignment::Right),
+        resources,
+    );
+}
+
+fn format_elapsed(secs: u64) -> String {
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
+}
+
+/// Clip styled segments to the terminal width, ending with an ellipsis.
+fn clip_spans(segments: Vec<(String, Style)>, width: u16) -> Vec<Span<'static>> {
+    let width = width as usize;
+    let mut out = Vec::new();
+    let mut used = 0;
+    for (text, style) in segments {
+        if used >= width {
+            break;
+        }
+        let mut shown = String::new();
+        for c in text.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > width {
+                if used < width {
+                    shown.push('…');
+                    used += 1;
+                }
+                break;
+            }
+            shown.push(c);
+            used += w;
+        }
+        if !shown.is_empty() {
+            out.push(Span::styled(shown, style));
+        }
+        if used >= width {
+            break;
+        }
+    }
+    out
 }
 
 /// Rotating placeholder tips, one per ~6 s at 20 fps — Claude-Code's prompt feel.
@@ -461,10 +506,119 @@ fn placeholder_tip(tick: u64) -> &'static str {
     TIPS[(tick as usize / 120) % TIPS.len()]
 }
 
-fn truncate_str(s: &str, w: usize) -> String {
-    if s.chars().count() <= w {
-        s.to_string()
-    } else {
-        s.chars().take(w.saturating_sub(1)).collect::<String>() + "…"
+/// Apply terminal color-depth and UI-glyph preferences without changing transcript source text.
+fn apply_terminal_preferences(f: &mut Frame, app: &App) {
+    if !app.ascii_only && matches!(app.color_mode.as_str(), "auto" | "true") {
+        return;
     }
+    let area = f.area();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let cell = &mut f.buffer_mut()[(x, y)];
+            if app.ascii_only {
+                let symbol: String = cell
+                    .symbol()
+                    .chars()
+                    .map(|c| match c {
+                        '─' | '━' | '═' => '-',
+                        '│' | '┃' | '║' => '|',
+                        '\u{2500}'..='\u{257f}' => '+',
+                        '›' | '❯' | '→' | '▶' => '>',
+                        '←' | '◀' => '<',
+                        '↑' => '^',
+                        '↓' => 'v',
+                        '•' | '●' | '○' | '◌' | '✦' | '✧' => '*',
+                        '✓' | '✔' => '+',
+                        '✗' | '✕' => 'x',
+                        '…' => '.',
+                        '█' | '▓' | '▒' | '░' => '#',
+                        _ => c,
+                    })
+                    .collect();
+                cell.set_symbol(&symbol);
+            }
+            cell.fg = terminal_color(cell.fg, &app.color_mode);
+            cell.bg = terminal_color(cell.bg, &app.color_mode);
+        }
+    }
+}
+fn terminal_color(color: Color, mode: &str) -> Color {
+    if mode == "mono" {
+        return Color::Reset;
+    }
+    let rgb = match color {
+        Color::Rgb(r, g, b) => Some((r, g, b)),
+        Color::Indexed(n) if mode == "c16" => {
+            if n < 16 {
+                return basic_color(n);
+            }
+            if n >= 232 {
+                let v = 8 + (n - 232) * 10;
+                Some((v, v, v))
+            } else {
+                let n = n - 16;
+                let level = |n: u8| if n == 0 { 0 } else { 55 + 40 * n };
+                Some((level(n / 36), level((n / 6) % 6), level(n % 6)))
+            }
+        }
+        _ => None,
+    };
+    let Some((r, g, b)) = rgb else {
+        return color;
+    };
+    if mode == "c256" {
+        let level = |v: u8| ((v as u16 * 5 + 127) / 255) as u8;
+        return Color::Indexed(16 + 36 * level(r) + 6 * level(g) + level(b));
+    }
+    if mode == "c16" {
+        let colors = [
+            (0, 0, 0),
+            (170, 0, 0),
+            (0, 170, 0),
+            (170, 85, 0),
+            (0, 0, 170),
+            (170, 0, 170),
+            (0, 170, 170),
+            (170, 170, 170),
+            (85, 85, 85),
+            (255, 85, 85),
+            (85, 255, 85),
+            (255, 255, 85),
+            (85, 85, 255),
+            (255, 85, 255),
+            (85, 255, 255),
+            (255, 255, 255),
+        ];
+        let i = colors
+            .iter()
+            .enumerate()
+            .min_by_key(|(_, c)| {
+                let d = |a: u8, b: i32| (a as i32 - b).pow(2);
+                d(r, c.0) + d(g, c.1) + d(b, c.2)
+            })
+            .unwrap()
+            .0;
+        return basic_color(i as u8);
+    }
+    color
+}
+fn basic_color(n: u8) -> Color {
+    [
+        Color::Black,
+        Color::Red,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Magenta,
+        Color::Cyan,
+        Color::Gray,
+        Color::DarkGray,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::LightYellow,
+        Color::LightBlue,
+        Color::LightMagenta,
+        Color::LightCyan,
+        Color::White,
+    ][(n % 16) as usize]
 }

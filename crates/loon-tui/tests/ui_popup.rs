@@ -2,9 +2,8 @@
 //! highlighted selection, the spinner animates across ticks, and — critically — the
 //! transparent invariant survives all of it.
 
-use loon_tui::{App, StatusLine};
+use loon_tui::{App, Block, StatusLine};
 use ratatui::backend::TestBackend;
-use ratatui::style::Color;
 use ratatui::Terminal;
 
 fn app() -> App {
@@ -48,21 +47,20 @@ fn typing_slash_opens_popup_showing_all_commands() {
     a.input = "/".into();
     let t = draw(&mut a);
     // popup sits just above the input; with 12 commands it is capped at 6 rows
-    // layout: 6 content rows + 1 border row above the 3-row input + 1 footer row
-    // → content at 14..20
+    // layout: 6 borderless rows above the 3-row input + 1 footer row
     let rows: Vec<String> = (0..6)
-        .map(|i| row_text(&t, 24 - 3 - 1 - 7 + 1 + i, 80))
+        .map(|i| row_text(&t, 24 - 3 - 1 - 6 + i, 80))
         .collect();
     let joined = rows.join("\n");
     assert!(joined.contains("/help"), "{joined}");
     assert!(joined.contains("/undo"), "{joined}");
-    assert!(joined.contains("/fork"), "{joined}");
+    assert!(joined.contains("/ultraloop"), "{joined}");
     // capped at 6 visible rows: /compact (7th) is windowed out, not rendered
     assert!(!joined.contains("/compact"), "cap must hold: {joined}");
     // the first row is the selected one: caret + bold
     assert!(
-        rows[0].trim_start().starts_with('›'),
-        "selected row caret: {}",
+        rows[0].starts_with('❯'),
+        "selected row [CC]-style marker: {}",
         rows[0]
     );
     assert!(
@@ -77,8 +75,8 @@ fn prefix_narrows_and_selection_renders_highlighted() {
     let mut a = app();
     a.input = "/re".into();
     let t = draw(&mut a);
-    let rows: Vec<String> = (0..3)
-        .map(|i| row_text(&t, 24 - 3 - 1 - 4 + 1 + i, 80))
+    let rows: Vec<String> = (0..5)
+        .map(|i| row_text(&t, 24 - 3 - 1 - 5 + i, 80))
         .collect();
     let joined = rows.join("\n");
     assert!(joined.contains("/redo"), "{joined}");
@@ -103,51 +101,45 @@ fn spinner_glyph_animates_across_ticks_and_styled_accent_while_busy() {
     // palindrome cycle: glyph changes across ticks and repeats (frame 0 == frame 10)
     assert_ne!(glyphs[0], glyphs[1], "spinner must animate");
     assert_eq!(glyphs[0], glyphs[10], "palindrome period = 2n-2 = 10");
-    // rendered status line carries the animated glyph + elapsed seconds
+    // The status bar (bottom row) carries elapsed seconds and throughput; the header
+    // above it is the wordmark only.
     let t = draw(&mut a);
-    let status = row_text(&t, 0, 80);
-    assert!(status.contains("…"), "elapsed seconds shown: {status}");
-    let status_cell = t.backend().buffer().cell((1, 0)).unwrap();
-    assert_eq!(
-        status_cell.fg,
-        Color::Cyan,
-        "busy spinner styled accent (transparent theme)"
-    );
-    // idle status is intentionally blank (the banner carries identity)
+    let status = row_text(&t, 23, 80);
+    assert!(status.contains("0s"), "elapsed seconds shown: {status}");
+    assert!(status.contains("t/s"), "throughput shown: {status}");
+
+    // idle: the status bar drops the timing readouts and shows readiness
     a.status.busy = false;
     a.turn_started = None;
     let t2 = draw(&mut a);
-    let idle = row_text(&t2, 0, 80);
-    assert!(
-        idle.trim().is_empty(),
-        "idle status must be empty: {idle:?}"
-    );
+    let idle = row_text(&t2, 23, 80);
+    assert!(idle.contains("Ready"), "idle status: {idle:?}");
+    assert!(!idle.contains("tok/s"), "no throughput when idle: {idle:?}");
 }
 
 #[test]
 fn settings_menu_navigation_and_toggles() {
+    use loon_core::catalog::MenuItem;
+    use loon_tui::manager::{Navigator, View};
     let mut a = app();
-    assert!(a.settings.is_none());
-    a.settings = Some(0);
-    // up from 0 wraps to the last row
-    a.settings = Some((a.settings.unwrap() + 4) % 5);
-    assert_eq!(a.settings, Some(4));
-    a.settings = Some(0);
-    // toggling autocompact flips the mirror
-    let before = a.settings_autocompact;
-    a.settings_autocompact = !a.settings_autocompact;
-    assert_ne!(a.settings_autocompact, before);
-    // effort cycles low → medium → high
-    a.settings_effort = "low".into();
-    let next = match a.settings_effort.as_str() {
-        "low" => "medium",
-        "medium" => "high",
-        _ => "low",
-    };
-    assert_eq!(next, "medium");
-    // esc closes
-    a.settings = None;
-    assert!(a.settings.is_none());
+    a.navigator = Some(Navigator::new(
+        Default::default(),
+        View::Menu(
+            "Settings".into(),
+            vec![MenuItem {
+                label: "effort".into(),
+                detail: "coding effort".into(),
+                command: "/effort".into(),
+            }],
+        ),
+    ));
+    let t = draw(&mut a);
+    let screen = (0..24)
+        .map(|y| row_text(&t, y, 80))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(screen.contains("Settings"));
+    assert!(screen.contains("coding effort"));
 }
 
 #[test]
@@ -167,4 +159,213 @@ fn tab_accept_and_input_update_flow() {
     assert_eq!(b.completion_count(), 0);
     b.input_changed();
     assert!(b.completion_count() > 0);
+}
+
+#[test]
+fn argument_completion_keeps_the_command() {
+    // "/config ti" + Tab must yield "/config tips ", never "/tips ".
+    let mut a = app();
+    a.input = "/config ti".into();
+    assert!(a.accept_completion());
+    assert_eq!(a.input, "/config tips ");
+    // and the value suggestions then appear for that key
+    let values = a.visible_completions();
+    let names: Vec<&str> = values.iter().map(|c| c.insert.as_str()).collect();
+    assert_eq!(names, vec!["true", "false"], "{names:?}");
+    // accepting a value replaces only the value word
+    a.input = "/config permission_mode aut".into();
+    assert!(a.accept_completion());
+    assert_eq!(a.input, "/config permission_mode auto ");
+}
+
+#[test]
+fn banner_is_a_transcript_block_that_scrolls_away() {
+    let mut a = app();
+    a.push_welcome_banner();
+    let t = draw(&mut a);
+    let fresh = (0..24)
+        .map(|y| row_text(&t, y, 80))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        fresh.contains("██████╗") || fresh.contains("L O O M"),
+        "wordmark drawn: {fresh}"
+    );
+    assert!(
+        fresh.contains(&format!("v{}", env!("CARGO_PKG_VERSION"))),
+        "{fresh}"
+    );
+    assert!(
+        !fresh.contains("/model · /providers"),
+        "the banner carries no command list: {fresh}"
+    );
+
+    // Enough chat pushes the banner off the top of the screen.
+    for n in 0..40 {
+        a.blocks.push(Block::Assistant(format!("message {n}")));
+    }
+    let t = draw(&mut a);
+    let scrolled = (0..24)
+        .map(|y| row_text(&t, y, 80))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !scrolled.contains("██████╗") && !scrolled.contains("L O O M"),
+        "banner scrolled away: {scrolled}"
+    );
+    assert!(scrolled.contains("message 39"), "{scrolled}");
+}
+
+#[test]
+fn the_banner_animates_between_frames() {
+    let mut a = app();
+    a.push_welcome_banner();
+    let colours = |app: &App| -> Vec<Option<ratatui::style::Color>> {
+        app.transcript_lines(80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.style.fg))
+            .collect()
+    };
+    let first = colours(&a);
+    for _ in 0..12 {
+        a.tick();
+    }
+    let later = colours(&a);
+    assert_eq!(
+        first.len(),
+        later.len(),
+        "the wordmark itself does not change shape"
+    );
+    assert_ne!(first, later, "the gradient sweeps as the clock advances");
+}
+
+#[test]
+fn only_the_selected_ultra_row_shimmers_like_the_logo() {
+    use loon_core::catalog::MenuItem;
+    use loon_tui::manager::{Navigator, View};
+
+    let items: Vec<MenuItem> = loon_config::Effort::LEVELS
+        .into_iter()
+        .map(|n| MenuItem {
+            label: n.into(),
+            detail: "effort".into(),
+            command: format!("/effort {n}"),
+        })
+        .collect();
+    let ultra_index = items.iter().position(|i| i.label == "ultra").unwrap();
+
+    let row_of = |a: &mut App, needle: &str| -> Vec<ratatui::buffer::Cell> {
+        let t = draw(a);
+        let y = (0..24)
+            .find(|y| row_text(&t, *y, 80).contains(needle))
+            .unwrap_or_else(|| panic!("row {needle} drawn"));
+        let buf = t.backend().buffer();
+        (0..80)
+            .map(|x| buf.cell((x, y)).cloned().unwrap())
+            .collect()
+    };
+    let word = |cells: &[ratatui::buffer::Cell], n: usize| -> Vec<ratatui::style::Color> {
+        let chars: Vec<String> = cells.iter().map(|c| c.symbol().to_string()).collect();
+        let start = chars
+            .windows(n)
+            .position(|w| {
+                w.iter()
+                    .all(|c| c.chars().all(|ch| ch.is_ascii_alphabetic()))
+            })
+            .unwrap_or(0);
+        (start..start + n).map(|i| cells[i].fg).collect()
+    };
+
+    // Cursor on ultra: its glyphs carry several distinct hues, and the band travels.
+    let mut a = app();
+    a.animations = true;
+    let mut nav = Navigator::new(
+        Default::default(),
+        View::Menu("Coding effort".into(), items.clone()),
+    );
+    nav.selected = ultra_index;
+    a.navigator = Some(nav);
+    a.tick = 0;
+    let first = word(&row_of(&mut a, "ultra"), 5);
+    a.tick = 40;
+    let later = word(&row_of(&mut a, "ultra"), 5);
+    assert!(
+        first.windows(2).any(|w| w[0] != w[1]),
+        "the wordmark gradient varies across the glyphs: {first:?}"
+    );
+    assert_ne!(first, later, "the gradient travels over time");
+
+    // A different row (cursor on `low`) is plain: no shimmer anywhere else.
+    let mut b = app();
+    b.animations = true;
+    let mut nav = Navigator::new(
+        Default::default(),
+        View::Menu("Coding effort".into(), items.clone()),
+    );
+    nav.selected = 0;
+    b.navigator = Some(nav);
+    b.tick = 0;
+    let low = word(&row_of(&mut b, "low"), 3);
+    b.tick = 40;
+    let low_later = word(&row_of(&mut b, "low"), 3);
+    assert_eq!(low, low_later, "only the selected ultra row animates");
+    assert_eq!(low[0], low[2], "an unselected row keeps one flat colour");
+
+    // Animations off: ultra is static too.
+    a.animations = false;
+    a.tick = 0;
+    let still = word(&row_of(&mut a, "ultra"), 5);
+    a.tick = 40;
+    let still_later = word(&row_of(&mut a, "ultra"), 5);
+    assert_eq!(still, still_later, "no motion when animations are disabled");
+
+    // No popup background is painted in transparent mode (the ripple is gone).
+    let t = draw(&mut a);
+    let buf = t.backend().buffer();
+    for (x, y) in (0..24).flat_map(|y| (0..80).map(move |x| (x, y))) {
+        assert_eq!(
+            buf.cell((x, y)).unwrap().bg,
+            ratatui::style::Color::Reset,
+            "transparent background at ({x},{y})"
+        );
+    }
+}
+
+#[test]
+fn other_popups_do_not_shimmer() {
+    use loon_core::catalog::MenuItem;
+    use loon_tui::manager::{Navigator, View};
+    // A settings menu whose selected row happens to be labelled "ultra" must stay plain:
+    // the shimmer belongs to the effort selector only.
+    let mut a = app();
+    a.animations = true;
+    let mut nav = Navigator::new(
+        Default::default(),
+        View::Menu(
+            "Settings".into(),
+            vec![MenuItem {
+                label: "ultra".into(),
+                detail: "not the effort picker".into(),
+                command: "/config ultra".into(),
+            }],
+        ),
+    );
+    nav.selected = 0;
+    a.navigator = Some(nav);
+    let colors = |a: &mut App| -> Vec<ratatui::style::Color> {
+        let t = draw(a);
+        let y = (0..24)
+            .find(|y| row_text(&t, *y, 80).contains("ultra"))
+            .unwrap();
+        let buf = t.backend().buffer();
+        (0..80).map(|x| buf.cell((x, y)).unwrap().fg).collect()
+    };
+    a.tick = 0;
+    let first = colors(&mut a);
+    a.tick = 40;
+    assert_eq!(
+        first,
+        colors(&mut a),
+        "no shimmer outside the effort picker"
+    );
 }

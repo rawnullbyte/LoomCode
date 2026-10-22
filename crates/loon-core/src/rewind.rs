@@ -90,7 +90,7 @@ struct Mutation {
 
 fn mutations(events: &[Event]) -> Vec<Mutation> {
     let mut out = Vec::new();
-    for e in events {
+    for e in crate::replay::active_events(events, None) {
         if let EventKind::FileMutated {
             tx,
             path,
@@ -306,12 +306,25 @@ pub struct RequestBoundary {
     pub member_note: String,
 }
 
+pub fn visible_user_prompt(text: &str) -> bool {
+    ![
+        "[ultraloop ",
+        "[ultra loop]",
+        "[Local lifecycle hook]",
+        "[Earlier conversation summary]",
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+}
+
 pub fn request_boundaries(events: &[Event]) -> Vec<RequestBoundary> {
     let mut out = Vec::new();
     let mut last_user_seq: Option<u64> = None;
-    for e in events {
+    for e in crate::replay::active_events(events, None) {
         match &e.kind {
-            EventKind::UserMessage { .. } => last_user_seq = Some(e.seq),
+            EventKind::UserMessage { text } if visible_user_prompt(text) => {
+                last_user_seq = Some(e.seq)
+            }
             EventKind::RequestStarted { request, .. } => {
                 // Conversation rewind drops the triggering user message too, so the
                 // replay bound is the seq *before* it (replay is inclusive).
@@ -331,6 +344,114 @@ pub fn request_boundaries(events: &[Event]) -> Vec<RequestBoundary> {
     out
 }
 
+/// One row in the rewind picker: what the turn was, and what it changed.
+#[derive(Debug, Clone)]
+pub struct RewindEntry {
+    /// 1 = the latest boundary, matching `/rewind N`.
+    pub n: usize,
+    pub boundary: RequestBoundary,
+    /// The user message that opened the turn, flattened to one line.
+    pub prompt: String,
+    pub files_changed: usize,
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// Boundaries with the context a person needs to choose one: the prompt that opened
+/// the turn, and how much it changed. Line counts come from the journal's blobs; when a
+/// snapshot is missing the counts are simply left at zero rather than guessed.
+pub fn rewind_entries(journal: &Journal, events: &[Event]) -> Vec<RewindEntry> {
+    let bounds = request_boundaries(events);
+    let total = bounds.len();
+    let active = crate::replay::active_events(events, None);
+    let grouped: Vec<_> = bounds
+        .iter()
+        .enumerate()
+        .filter(|(i, b)| *i == 0 || bounds[*i - 1].truncate_to_seq != b.truncate_to_seq)
+        .collect();
+    let mut out = Vec::with_capacity(grouped.len());
+    for (position, (i, boundary)) in grouped.iter().enumerate() {
+        let boundary = (*boundary).clone();
+        // Everything between this boundary and the next belongs to this turn.
+        let end_seq = grouped
+            .get(position + 1)
+            .map(|(_, b)| b.seq)
+            .unwrap_or(u64::MAX);
+        let mut prompt = String::new();
+        let mut files = std::collections::BTreeMap::<String, (String, String)>::new();
+        for e in active.iter().filter(|e| e.seq <= boundary.seq) {
+            if let EventKind::UserMessage { text } = &e.kind {
+                if visible_user_prompt(text) {
+                    prompt = flatten(text);
+                }
+            }
+        }
+        for e in active
+            .iter()
+            .filter(|e| e.seq >= boundary.seq && e.seq < end_seq)
+        {
+            if let EventKind::FileMutated {
+                path,
+                before_sha256,
+                after_sha256,
+                ..
+            } = &e.kind
+            {
+                files.insert(path.clone(), (before_sha256.clone(), after_sha256.clone()));
+            }
+        }
+        let (mut added, mut removed) = (0, 0);
+        for (before, after) in files.values() {
+            let (a, r) = line_delta(journal, before, after);
+            added += a;
+            removed += r;
+        }
+        out.push(RewindEntry {
+            n: total - i,
+            boundary,
+            prompt,
+            files_changed: files.len(),
+            added,
+            removed,
+        });
+    }
+    out.reverse();
+    out
+}
+
+/// Added/removed line counts between two blob hashes, or (0, 0) when either is gone.
+fn line_delta(journal: &Journal, before: &str, after: &str) -> (usize, usize) {
+    let read = |sha: &str| {
+        journal
+            .blob_by_sha(sha)
+            .ok()
+            .flatten()
+            .and_then(|b| String::from_utf8(b).ok())
+    };
+    let (Some(old), Some(new)) = (read(before), read(after)) else {
+        return (0, 0);
+    };
+    let old: Vec<&str> = old.lines().collect();
+    let new: Vec<&str> = new.lines().collect();
+    // A cheap LCS would be nicer; this reports the net change per file, which is what
+    // the picker shows and is honest about direction.
+    let common = old.iter().filter(|l| new.contains(l)).count();
+    (
+        new.len().saturating_sub(common),
+        old.len().saturating_sub(common),
+    )
+}
+
+/// One line, trimmed for a menu row.
+fn flatten(text: &str) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= 90 {
+        flat
+    } else {
+        flat.chars().take(89).collect::<String>() + "…"
+    }
+}
+
 /// Rewind to before the n-th-from-last request boundary (1 = latest request).
 /// Conversation mode truncates in-memory history; workspace mode restores file state.
 /// Everything is journaled so resume agrees.
@@ -339,6 +460,8 @@ pub struct RewindOutcome {
     pub mode: RewindMode,
     pub history_len_after: usize,
     pub restore: Option<RestoreReport>,
+    /// Original multiline user prompt, for editing and resubmission after rewind.
+    pub prompt: String,
 }
 
 pub fn rewind_n(
@@ -425,11 +548,23 @@ pub fn rewind_n(
         },
     )?;
 
+    let prompt = events
+        .iter()
+        .find_map(|e| {
+            if e.seq > boundary.truncate_to_seq && e.seq <= boundary.seq {
+                if let EventKind::UserMessage { text } = &e.kind {
+                    return Some(text.clone());
+                }
+            }
+            None
+        })
+        .unwrap_or_default();
     Ok(RewindOutcome {
         boundary,
         mode,
         history_len_after,
         restore,
+        prompt,
     })
 }
 

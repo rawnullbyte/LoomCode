@@ -1,7 +1,7 @@
 //! `loon` — terminal-native coding agent.
 //!
 //! Exit codes (documented contract):
-//!   0 success · 1 task failed · 2 cancelled · 3 budget paused · 64 usage/config error
+//!   0 success · 1 task failed · 2 cancelled · 64 usage/config error
 
 use clap::{Parser, Subcommand};
 use loon_config::{Config, LoonPaths};
@@ -13,10 +13,10 @@ use std::sync::Arc;
 
 #[derive(Parser)]
 #[command(
-    name = "loon",
+    name = "loom",
     version,
     about = "A transparent, inspectable, terminal-native coding agent",
-    after_help = "Exit codes: 0 success · 1 failed · 2 cancelled · 3 budget paused · 64 usage/config error"
+    after_help = "Exit codes: 0 success · 1 failed · 2 cancelled · 64 usage/config error"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -39,8 +39,18 @@ enum Command {
         /// Output mode: text (default) | jsonl | json.
         #[arg(long)]
         output: Option<String>,
-        #[arg(long, default_value_t = 24)]
-        max_steps: u32,
+        /// Coding effort; wire reasoning is sent only to opted-in providers.
+        #[arg(long, value_parser = ["low","medium","high","xhigh","ultra"])]
+        effort: Option<String>,
+        /// Keep an independent supervisor reviewing every agent stop.
+        #[arg(long)]
+        ultraloop: bool,
+        /// Optional separate provider/model or combo for the supervisor.
+        #[arg(long, requires = "ultraloop")]
+        supervisor_model: Option<String>,
+        /// Supervisor review budget; 0 means unlimited until complete/cancelled.
+        #[arg(long, default_value_t = 0, requires = "ultraloop")]
+        ultraloop_limit: u32,
         /// Run the opaque TUI palette instead of transparent mode (interactive only).
         #[arg(long)]
         opaque: bool,
@@ -101,7 +111,7 @@ async fn main() {
 fn load_env() -> anyhow::Result<(LoonPaths, Config)> {
     let paths = LoonPaths::resolve();
     paths.ensure()?;
-    let (cfg, findings) = Config::load_or_builtin(&paths)?;
+    let (cfg, findings) = Config::load_effective(&paths, &std::env::current_dir()?)?;
     for f in &findings {
         let tag = if f.is_error { "error" } else { "warning" };
         eprintln!("config {tag}: {}: {}", f.path, f.message);
@@ -154,7 +164,10 @@ async fn run_headless(cli: Cli) -> i32 {
         cwd,
         model,
         output,
-        max_steps,
+        effort,
+        ultraloop,
+        supervisor_model,
+        ultraloop_limit,
         opaque: _,
     }) = &cli.cmd
     else {
@@ -188,9 +201,6 @@ async fn run_headless(cli: Cli) -> i32 {
     };
     if let Some(m) = model {
         cfg.session.model = m.clone();
-    }
-    if *max_steps != 24 {
-        cfg.session.max_steps = *max_steps;
     }
     let workspace = cwd
         .clone()
@@ -249,6 +259,28 @@ async fn run_headless(cli: Cli) -> i32 {
             }
         };
 
+    if let Some(effort) = effort {
+        agent.effort = Some(effort.clone());
+    }
+    if *ultraloop {
+        if let Some(model) = supervisor_model {
+            if let Err(e) = agent.registry.resolve(model) {
+                eprintln!("supervisor model: {e}");
+                return 64;
+            }
+        }
+        agent.session_goal = Some(text.clone());
+        if let Err(e) = agent.worklog.update(|s| {
+            s.ultraloop = true;
+            s.goal = Some(text.clone());
+            s.supervisor_model = supervisor_model.clone();
+            s.ultraloop_limit = *ultraloop_limit;
+            Ok(())
+        }) {
+            eprintln!("ultraloop: {e}");
+            return 1;
+        }
+    }
     let mode = output.clone().unwrap_or_else(|| "text".into());
     let jsonl = mode == "jsonl" || mode == "json";
     if !jsonl && mode != "text" {
@@ -260,7 +292,12 @@ async fn run_headless(cli: Cli) -> i32 {
     agent.set_event_sink(tx);
     let session_id = agent.session_id();
 
-    let turn = tokio::spawn(async move { agent.run_turn(&text).await });
+    let cancel = agent.cancel_handle();
+    let mut turn = tokio::spawn(async move {
+        let result = agent.run_turn(&text).await;
+        agent.finish_session().await;
+        result
+    });
 
     if jsonl {
         let mut w = std::io::stdout();
@@ -286,13 +323,17 @@ async fn run_headless(cli: Cli) -> i32 {
                     let _ = writeln!(std::io::stderr(), "warning: {w}");
                 }
                 (AgentEvent::MemberNote(m), false) => {
-                    let _ = writeln!(std::io::stderr(), "combo: {m}");
+                    let _ = writeln!(std::io::stderr(), "{m}");
                 }
                 _ => {}
             }
         }
     });
-    let result = match turn.await {
+    let outcome = tokio::select! {
+        result=&mut turn=>result,
+        _=tokio::signal::ctrl_c()=>{let _=cancel.send(true);turn.await}
+    };
+    let result = match outcome {
         Ok(r) => r,
         Err(e) => {
             eprintln!("loon: turn task: {e}");
@@ -325,13 +366,15 @@ async fn run_headless(cli: Cli) -> i32 {
         TurnStatus::Completed => 0,
         TurnStatus::Failed(_) => 1,
         TurnStatus::Cancelled => 2,
-        TurnStatus::BudgetPaused { .. } => 3,
     }
 }
 
 /// Effective context window for a model reference: the model def's window, a combo's
 /// minimum across members, or a conservative 128k default when unknown.
 fn effective_context_window(cfg: &loon_config::Config, model_ref: &str) -> u64 {
+    if let Some(window) = cfg.session.context_window {
+        return window;
+    }
     if let Some(def) = cfg.models.get(model_ref) {
         if let Some(w) = def.context_window {
             return w;
@@ -346,7 +389,12 @@ fn effective_context_window(cfg: &loon_config::Config, model_ref: &str) -> u64 {
             let windows: Vec<u64> = combo
                 .members
                 .iter()
-                .filter_map(|m| cfg.models.get(&m.model).and_then(|d| d.context_window))
+                .filter_map(|m| {
+                    cfg.models
+                        .values()
+                        .find(|d| d.provider == m.provider && d.id == m.model)
+                        .and_then(|d| d.context_window)
+                })
                 .collect();
             if let Some(min) = windows.iter().min() {
                 return *min;
@@ -358,8 +406,27 @@ fn effective_context_window(cfg: &loon_config::Config, model_ref: &str) -> u64 {
 
 fn event_type(ev: &AgentEvent) -> &'static str {
     match ev {
+        AgentEvent::UiPreference { .. } => "ui_preference",
+        AgentEvent::CatalogUpdated { .. } => "catalog_updated",
+        AgentEvent::OpenCatalog { .. } => "open_catalog",
+        AgentEvent::OpenEditor(_) => "open_editor",
+        AgentEvent::OpenMenu { .. } => "open_menu",
+        AgentEvent::SetPalette { .. } => "set_palette",
+        AgentEvent::ContextUpdated { .. } => "context_updated",
+        AgentEvent::ModelChanged { .. } => "model_changed",
+        AgentEvent::EffortChanged { .. } => "effort_changed",
+        AgentEvent::SessionLoaded { .. } => "session_loaded",
+        AgentEvent::ConversationRewound { .. } => "conversation_rewound",
+        AgentEvent::WorkStateChanged { .. } => "work_state_changed",
+        AgentEvent::TurnStarted => "turn_started",
         AgentEvent::TextDelta(_) => "text_delta",
+        AgentEvent::StreamReset { .. } => "stream_reset",
         AgentEvent::ReasoningDelta(_) => "reasoning_delta",
+        AgentEvent::RequestStarted => "request_started",
+        AgentEvent::RequestFinished => "request_finished",
+        AgentEvent::RequestUsage { .. } => "request_usage",
+        AgentEvent::OutputProgress { .. } => "output_progress",
+        AgentEvent::ReasoningUsage { .. } => "reasoning_usage",
         AgentEvent::ToolStarted { .. } => "tool_started",
         AgentEvent::ToolFinished { .. } => "tool_finished",
         AgentEvent::MemberNote(_) => "member_note",
@@ -382,7 +449,6 @@ fn status_name(s: &TurnStatus) -> &'static str {
         TurnStatus::Completed => "completed",
         TurnStatus::Failed(_) => "failed",
         TurnStatus::Cancelled => "cancelled",
-        TurnStatus::BudgetPaused { .. } => "budget_paused",
     }
 }
 

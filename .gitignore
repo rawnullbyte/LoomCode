@@ -3,3 +3,6 @@ prompt.md
 **/*.rs.bk
 *.swp
 /target
+
+# Documentation site build output (generated; deployed by .github/workflows/docs.yml)
+docs/site/_out/

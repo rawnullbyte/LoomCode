@@ -1,0 +1,80 @@
+name: Docs
+
+# Builds the documentation site from the repository's own Markdown and deploys it
+# to GitHub Pages. The generator is stdlib-only Python, so this job needs no
+# toolchain beyond the runner's default Python.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "README.md"
+      - "ARCHITECTURE.md"
+      - "CHANGELOG.md"
+      - "VALIDATION.md"
+      - "docs/**"
+      - "Cargo.toml"
+      - ".github/workflows/docs.yml"
+  pull_request:
+    paths:
+      - "README.md"
+      - "ARCHITECTURE.md"
+      - "CHANGELOG.md"
+      - "VALIDATION.md"
+      - "docs/**"
+      - "Cargo.toml"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time; a newer push supersedes an in-flight run.
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build site and verify links
+        run: python3 docs/site/build.py --check
+
+      - name: Check the site is not empty
+        run: |
+          set -eu
+          test -f docs/site/_out/index.html
+          test -f docs/site/_out/guide.html
+          test -f docs/site/_out/assets/site.css
+          test -f docs/site/_out/assets/logo.svg
+          test -f docs/site/_out/.nojekyll
+          pages=$(find docs/site/_out -name '*.html' | wc -l)
+          echo "generated $pages pages"
+          test "$pages" -ge 6
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/site/_out
+
+  deploy:
+    # Pull requests build and validate only; deploying needs a push to main.
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

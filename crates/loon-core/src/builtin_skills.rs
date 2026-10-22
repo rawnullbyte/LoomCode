@@ -1,0 +1,38 @@
+//! Embedded coding workflows, available without installing a plugin or files.
+pub const SKILLS: &[(&str, &str)] = &[
+    ("implement", include_str!("../skills/implement.md")),
+    ("debug", include_str!("../skills/debug.md")),
+    ("review", include_str!("../skills/review.md")),
+    ("handoff", include_str!("../skills/handoff.md")),
+    ("refactor", include_str!("../skills/refactor.md")),
+    ("test", include_str!("../skills/test.md")),
+    ("optimize", include_str!("../skills/optimize.md")),
+    ("audit", include_str!("../skills/audit.md")),
+    ("document", include_str!("../skills/document.md")),
+    ("backend", include_str!("../skills/backend.md")),
+    ("frontend", include_str!("../skills/frontend.md")),
+    ("api-design", include_str!("../skills/api-design.md")),
+    ("database", include_str!("../skills/database.md")),
+    ("migrations", include_str!("../skills/migrations.md")),
+    ("devops", include_str!("../skills/devops.md")),
+    (
+        "dependency-upgrade",
+        include_str!("../skills/dependency-upgrade.md"),
+    ),
+    (
+        "repository-explore",
+        include_str!("../skills/repository-explore.md"),
+    ),
+    ("docs-research", include_str!("../skills/docs-research.md")),
+    ("rust", include_str!("../skills/rust.md")),
+    ("python", include_str!("../skills/python.md")),
+    ("typescript", include_str!("../skills/typescript.md")),
+    ("go", include_str!("../skills/go.md")),
+    (
+        "security-review",
+        include_str!("../skills/security-review.md"),
+    ),
+    ("test-repair", include_str!("../skills/test-repair.md")),
+    ("release", include_str!("../skills/release.md")),
+    ("performance", include_str!("../skills/performance.md")),
+];

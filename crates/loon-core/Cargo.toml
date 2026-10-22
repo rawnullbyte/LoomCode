@@ -16,12 +16,14 @@ tokio.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+futures.workspace = true
+reqwest.workspace = true
 chrono.workspace = true
 ignore.workspace = true
+glob.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-futures.workspace = true
 
 [features]
 rewind_debug = []

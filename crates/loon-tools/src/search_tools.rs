@@ -27,16 +27,28 @@ impl Tool for GlobTool {
 
     async fn run(&self, args: Value, ctx: &ToolCtx) -> Result<ToolOutput, ToolError> {
         let pattern = args["pattern"].as_str().unwrap_or_default();
-        let full = ctx.ws.root().join(pattern);
-        let full_str = full.to_string_lossy().to_string();
-        let mut hits: Vec<String> = glob::glob(&full_str)
-            .map_err(|e| ToolError::InvalidArgs(format!("bad glob pattern: {e}")))?
-            .filter_map(|e| e.ok())
-            .map(|p| {
-                p.strip_prefix(ctx.ws.root())
-                    .unwrap_or(&p)
-                    .to_string_lossy()
-                    .to_string()
+        let matcher = glob::Pattern::new(pattern)
+            .map_err(|e| ToolError::InvalidArgs(format!("bad glob pattern: {e}")))?;
+        let options = glob::MatchOptions {
+            case_sensitive: true,
+            require_literal_separator: true,
+            require_literal_leading_dot: false,
+        };
+        let mut builder = ignore::WalkBuilder::new(ctx.ws.root());
+        builder
+            .hidden(false)
+            .require_git(false)
+            .git_global(false)
+            .filter_entry(|e| e.file_name() != ".git");
+        let mut hits: Vec<String> = builder
+            .build()
+            .flatten()
+            .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+            .filter_map(|e| {
+                let rel = e.path().strip_prefix(ctx.ws.root()).ok()?;
+                matcher
+                    .matches_path_with(rel, options)
+                    .then(|| rel.to_string_lossy().to_string())
             })
             .collect();
         hits.sort();
@@ -109,7 +121,12 @@ impl Tool for GrepTool {
         let mut binaries_skipped = 0usize;
         let mut truncated = false;
         let mut builder = ignore::WalkBuilder::new(&base);
-        builder.hidden(false).git_ignore(true).git_global(false);
+        builder
+            .hidden(false)
+            .git_ignore(true)
+            .git_global(false)
+            .require_git(false)
+            .filter_entry(|e| e.file_name() != ".git");
         for entry in builder.build().flatten() {
             if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;
@@ -226,6 +243,12 @@ impl Tool for TreeTool {
                 }
                 let ft = e.file_type()?;
                 let name = e.file_name().to_string_lossy().to_string();
+                if ft.is_dir()
+                    && [".git", "node_modules", "target", ".venv", "__pycache__"]
+                        .contains(&name.as_str())
+                {
+                    continue;
+                }
                 let r = if rel.is_empty() {
                     name.clone()
                 } else {

@@ -1,0 +1,271 @@
+<section class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <span class="eyebrow">Terminal-native coding agent</span>
+      <h1>Weave code with an agent<br><span class="grad">you can actually inspect</span></h1>
+      <p class="lede">
+        Loom is a coding agent for your terminal. Point it at <strong>any
+        OpenAI-compatible endpoint</strong>, hand it a goal, and it reads, edits, runs
+        and verifies — writing
+        every state change to an append-only journal you can replay, rewind and audit.
+      </p>
+
+      <div class="cta-row">
+        <a class="btn btn-primary" href="guide.html">Read the guide</a>
+        <a class="btn btn-ghost" href="harness.html">Harness reference</a>
+      </div>
+
+      <div class="install">
+        <span class="prompt" aria-hidden="true">$</span>
+        <code>cargo install --path crates/loon-cli --force</code>
+      </div>
+      <p style="margin-top:12px;font-size:.86rem;color:var(--fg-faint)">
+        Or build from source: <code>cargo build --release</code> → <code>./target/release/loom</code>.
+        The default provider is a deterministic mock, so the first run needs no credentials.
+      </p>
+    </div>
+
+    <div class="term" role="img" aria-label="Loom terminal session showing a task, a file edit diff and verification">
+      <div class="term-bar" aria-hidden="true"><i></i><i></i><i></i><span>loom — ~/projects/api</span></div>
+      <div class="term-body"><span class="t-dim">╭─</span> <span class="t-sky">Loom</span> <span class="t-dim">· ultra · auto</span>
+<span class="t-dim">│</span>
+<span class="t-dim">❯</span> fix the token parser and prove it
+
+<span class="t-violet">▸</span> read <span class="t-dim">crates/loon-config/src/tokens.rs</span>
+<span class="t-violet">▸</span> edit <span class="t-dim">tokens.rs</span> <span class="t-dim">(+18 −4)</span>
+<span class="t-add">+  "1m"  =&gt; TokenSpec::Tokens(1_000_000),</span>
+<span class="t-add">+  "100k" =&gt; TokenSpec::Tokens(100_000),</span>
+<span class="t-del">-  parse(s).unwrap()</span>
+<span class="t-violet">▸</span> bash <span class="t-dim">cargo test -p loon-config tokens</span>
+<span class="t-teal">✓ 14 passed</span> <span class="t-dim">· 0 failed · 0.31s</span>
+
+<span class="t-amber">context</span> ~41.2k / 200k <span class="t-dim">(21%)</span>
+<span class="t-dim">──</span> <span class="t-teal">verified</span> <span class="t-dim">· journal seq 1,204 · replayable</span></div>
+    </div>
+  </div>
+</section>
+
+<section id="why">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>Built on the opposite of a black box</h2>
+      <p>
+        Most agents ask you to trust a spinner. Loom records what happened: every message,
+        tool call, file hash and verification result lands in a journal that the transcript
+        is merely a projection of.
+      </p>
+    </div>
+
+    <div class="grid">
+      <article class="card">
+        <div class="icon" aria-hidden="true">↺</div>
+        <h3>Replayable by construction</h3>
+        <p>The journal is authoritative. Sessions resume to the exact context they held,
+           and a rewrite of history is visible rather than silent.</p>
+      </article>
+      <article class="card">
+        <div class="icon" aria-hidden="true">◈</div>
+        <h3>Your endpoint, not a vendor list</h3>
+        <p>Chat Completions and Responses protocols are both first-class. Any base URL
+           works, including local models and gateways that support neither discovery nor
+           tool calling.</p>
+      </article>
+      <article class="card">
+        <div class="icon" aria-hidden="true">⌘</div>
+        <h3>Supervision that can say no</h3>
+        <p>An independent reviewer reads the goal, the plan and the evidence. It cannot
+           accept completion while plan items are open or verification fails.</p>
+      </article>
+      <article class="card">
+        <div class="icon" aria-hidden="true">✎</div>
+        <h3>Edits with a paper trail</h3>
+        <p>Hash-protected writes reject stale edits, patches are atomic, and every mutation
+           keeps undo metadata. Conflicts are reported, never clobbered.</p>
+      </article>
+      <article class="card">
+        <div class="icon" aria-hidden="true">⧉</div>
+        <h3>Persistent processes</h3>
+        <p>A named shell keeps its working directory and exports. Monitors stream a
+           long-running build. SSH connections multiplex one authenticated session.</p>
+      </article>
+      <article class="card">
+        <div class="icon" aria-hidden="true">⇄</div>
+        <h3>Honest numbers</h3>
+        <p>Token counts are labelled estimates until the provider reports real usage.
+           No invented progress percentages, no fabricated speed.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<section id="showcase">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>The interface is the product</h2>
+      <p>
+        These are not mockups. Each image is rendered from the real Ratatui widgets with
+        sample data, so what you see is what the terminal draws.
+      </p>
+    </div>
+
+    <div class="showcase">
+      <figure class="shot">
+        <a href="assets/previews/models.svg"><img src="assets/previews/models.svg"
+           alt="Loom model browser listing providers, recent models and combos"></a>
+        <figcaption><b>Model browser.</b> Recent selections, per-provider search and combos, with a detail pane.</figcaption>
+      </figure>
+      <figure class="shot">
+        <a href="assets/previews/providers.svg"><img src="assets/previews/providers.svg"
+           alt="Loom provider manager showing endpoints and connection state"></a>
+        <figcaption><b>Providers.</b> Add, test, refresh and remove endpoints without restarting.</figcaption>
+      </figure>
+      <figure class="shot">
+        <a href="assets/previews/configuration.svg"><img src="assets/previews/configuration.svg"
+           alt="Loom nested configuration browser with staged changes"></a>
+        <figcaption><b>Configuration.</b> Every typed field, staged and validated before it is written.</figcaption>
+      </figure>
+      <figure class="shot">
+        <a href="assets/previews/settings.svg"><img src="assets/previews/settings.svg"
+           alt="Loom quick settings panel"></a>
+        <figcaption><b>Settings.</b> Arrows adjust values; Enter edits text; Escape backs out one page.</figcaption>
+      </figure>
+      <figure class="shot">
+        <a href="assets/previews/appearance.svg"><img src="assets/previews/appearance.svg"
+           alt="Loom appearance settings with live theme preview"></a>
+        <figcaption><b>Appearance.</b> Seven palettes preview live as you move through them.</figcaption>
+      </figure>
+      <figure class="shot">
+        <a href="assets/previews/thinking.svg"><img src="assets/previews/thinking.svg"
+           alt="Loom transcript showing reasoning activity and tool execution"></a>
+        <figcaption><b>Activity.</b> Thinking, writing and tool execution are distinguished, not blurred.</figcaption>
+      </figure>
+      <figure class="shot">
+        <a href="assets/previews/workspace.svg"><img src="assets/previews/workspace.svg"
+           alt="Loom workspace view showing changed files"></a>
+        <figcaption><b>Workspace.</b> What this session changed, read back from the journal.</figcaption>
+      </figure>
+      <figure class="shot">
+        <a href="assets/previews/context7.svg"><img src="assets/previews/context7.svg"
+           alt="Loom Context7 documentation settings with masked credentials"></a>
+        <figcaption><b>Documentation.</b> Library docs on demand, with masked credentials and a draft connection test.</figcaption>
+      </figure>
+    </div>
+  </div>
+</section>
+
+<section id="design">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>A palette borrowed from the terminal</h2>
+      <p>
+        The site uses the same ocean-and-thread colours the TUI ships with, so documentation
+        and product stay recognisably one thing.
+      </p>
+    </div>
+
+    <div class="swatches">
+      <div class="swatch"><div class="chip" style="background:#0e1c28"></div>
+        <div class="meta"><b>Ocean</b><span>#0e1c28 · base</span></div></div>
+      <div class="swatch"><div class="chip" style="background:#5bdac8"></div>
+        <div class="meta"><b>Teal</b><span>#5bdac8 · accent</span></div></div>
+      <div class="swatch"><div class="chip" style="background:#78bce1"></div>
+        <div class="meta"><b>Sky</b><span>#78bce1 · links</span></div></div>
+      <div class="swatch"><div class="chip" style="background:#bc9bf6"></div>
+        <div class="meta"><b>Violet</b><span>#bc9bf6 · highlight</span></div></div>
+      <div class="swatch"><div class="chip" style="background:#f0c878"></div>
+        <div class="meta"><b>Amber</b><span>#f0c878 · warning</span></div></div>
+      <div class="swatch"><div class="chip" style="background:#f07178"></div>
+        <div class="meta"><b>Rose</b><span>#f07178 · error</span></div></div>
+    </div>
+
+    <div class="callout" style="margin-top:26px">
+      <b>Why "Loom"?</b> A loom holds threads under tension and draws one weft through them
+      to make cloth. The agent holds your repository's threads — files, tests, processes —
+      and draws a change through them. The opening banner in the terminal is a frame with
+      warp threads and leaves falling through it.
+    </div>
+  </div>
+</section>
+
+<section id="start">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>Running in about a minute</h2>
+      <p>No credentials are needed to see it work; the bundled mock provider is deterministic.</p>
+    </div>
+
+    <div class="grid">
+      <article class="card">
+        <div class="icon" aria-hidden="true">1</div>
+        <h3>Build</h3>
+        <p>Rust 1.75 or newer.</p>
+        <pre style="margin-top:12px"><code>cargo build --release
+./target/release/loom</code></pre>
+      </article>
+      <article class="card">
+        <div class="icon" aria-hidden="true">2</div>
+        <h3>Smoke test</h3>
+        <p>Runs offline against the mock provider.</p>
+        <pre style="margin-top:12px"><code>loom run "Say hello" \
+  --output text</code></pre>
+      </article>
+      <article class="card">
+        <div class="icon" aria-hidden="true">3</div>
+        <h3>Connect a model</h3>
+        <p>Inside the TUI, add any compatible endpoint.</p>
+        <pre style="margin-top:12px"><code>/providers add local \
+  http://127.0.0.1:11434/v1
+/model local/my-model</code></pre>
+      </article>
+    </div>
+
+    <div class="callout" style="margin-top:26px">
+      <b>Headless too.</b> The same harness runs in CI:
+      <code>loom run "fix the parser" --effort high --output jsonl</code>.
+      Exit codes are a documented contract — 0 completed, 1 failed, 2 cancelled,
+      64 usage or config error.
+    </div>
+  </div>
+</section>
+
+<section id="docs">
+  <div class="wrap">
+    <div class="section-head">
+      <h2>Documentation</h2>
+      <p>Generated from the repository's own Markdown, so the site cannot drift from the code.</p>
+    </div>
+
+    <div class="grid">
+      <article class="card">
+        <h3><a href="guide.html">Guide</a></h3>
+        <p>The complete tour: providers, combos, sessions, tools, effort levels, keybindings and configuration.</p>
+        <a class="more" href="guide.html">Read the guide →</a>
+      </article>
+      <article class="card">
+        <h3><a href="harness.html">Harness reference</a></h3>
+        <p>MCP, lifecycle hooks, task dependencies, subagent profiles, plan mode and permission precedence.</p>
+        <a class="more" href="harness.html">Open the reference →</a>
+      </article>
+      <article class="card">
+        <h3><a href="architecture.html">Architecture</a></h3>
+        <p>Crate ownership, the event model, provider abstraction, combo resolution and mutation transactions.</p>
+        <a class="more" href="architecture.html">See the design →</a>
+      </article>
+      <article class="card">
+        <h3><a href="changelog.html">Changelog</a></h3>
+        <p>What changed in each update, in the order it landed.</p>
+        <a class="more" href="changelog.html">Read the changelog →</a>
+      </article>
+      <article class="card">
+        <h3><a href="validation.html">Validation</a></h3>
+        <p>The evidence: which tests ran, what was inspected, and what remains explicitly untested.</p>
+        <a class="more" href="validation.html">Check the evidence →</a>
+      </article>
+      <article class="card">
+        <h3><a href="{{REPO}}" rel="noopener">Source</a></h3>
+        <p>MIT licensed. Browse the crates, the 26 embedded coding workflows and the test suite.</p>
+        <a class="more" href="{{REPO}}" rel="noopener">View on GitHub →</a>
+      </article>
+    </div>
+  </div>
+</section>

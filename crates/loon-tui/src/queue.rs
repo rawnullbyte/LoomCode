@@ -37,6 +37,22 @@ impl PromptQueue {
         }
     }
 
+    /// Take everything queued, in order. Used to deliver all pending prompts with the
+    /// next request instead of one per turn boundary.
+    pub fn drain_all(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.items)
+    }
+
+    /// Most recently queued prompt, for "Up to edit" — the rest stay FIFO.
+    pub fn remove_last(&mut self) -> Option<String> {
+        self.items.pop()
+    }
+
+    /// A copy for the UI's queue mirror.
+    pub fn snapshot(&self) -> Vec<String> {
+        self.items.clone()
+    }
+
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -67,5 +83,19 @@ mod tests {
         let err = q.push("second".into()).unwrap_err();
         assert!(err.contains("full"));
         assert_eq!(q.len(), 1);
+    }
+
+    #[test]
+    fn remove_last_pops_only_the_newest_and_keeps_fifo_order() {
+        let mut q = PromptQueue::new(4);
+        q.push("one".into()).unwrap();
+        q.push("two".into()).unwrap();
+        q.push("three".into()).unwrap();
+        assert_eq!(q.remove_last().as_deref(), Some("three"));
+        assert_eq!(q.snapshot(), vec!["one", "two"]);
+        assert_eq!(q.pop().as_deref(), Some("one"));
+        assert_eq!(q.pop().as_deref(), Some("two"));
+        assert_eq!(q.remove_last(), None);
+        assert!(q.is_empty());
     }
 }

@@ -1,5 +1,5 @@
 # Example Loon configuration: multiple providers, models, and both combo modes.
-# Copy to ~/.config/loon/config.toml (or run `loon config init` for a minimal one).
+# Copy to ~/.config/loom/config.toml (or run `loom config init` for a minimal one).
 # Comments and unknown fields are preserved when Loon rewrites the file.
 
 schema_version = 1
@@ -16,9 +16,9 @@ allowed_hosts = []          # empty = unrestricted (future enforcement milestone
 
 [session]
 model = "combo:daily-driver"   # a [models] alias or combo:NAME
-max_steps = 24
 tool_output_bytes = 65536
 max_retries = 2
+autocompact_tokens = 50000      # optional; defaults to 80% of capacity
 allow_retry_after_partial_stream = false   # opt-in: restart after a partially streamed answer
 
 # ── Providers: any number of OpenAI-compatible endpoints ─────────────────────────────
@@ -87,3 +87,26 @@ members = [
     { provider = "selfhosted", model = "corp-coder-v3" },
 ]
 persistent_rotation = false  # per-session cursor; true keeps one cursor across sessions
+
+# UI motion and slash suggestion size; both are editable through /settings.
+[ui]
+animations = true
+popup_rows = 6
+
+# HTTP MCP (or use /mcp add local 3000):
+# [mcp.servers.local]
+# url = "http://127.0.0.1:3000/mcp"
+# timeout_secs = 60
+
+# Optional lifecycle command hook (see docs/HARNESS.md):
+# [[hooks.PreToolUse]]
+# matcher = "write|edit|apply_patch"
+# command = "python3 scripts/check-edit.py"
+# timeout_secs = 10
+
+# Native Context7 docs: also configurable from /settings → Context7.
+[context7]
+enabled = true
+# api_key = "..." # optional; masked UI entry supported; environment takes precedence
+api_key_env = "CONTEXT7_API_KEY"
+timeout_secs = 30

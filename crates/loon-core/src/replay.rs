@@ -8,12 +8,64 @@ use loon_events::model::{Event, EventKind};
 use loon_providers::{ChatMessage, Role, ToolCallReq};
 use std::collections::HashMap;
 
+fn push_result_ordered(history: &mut Vec<ChatMessage>, wire: String, text: String) {
+    if let Some(index) = history
+        .iter()
+        .rposition(|m| m.tool_calls.iter().any(|c| c.id == wire))
+    {
+        let calls = &history[index].tool_calls;
+        let rank = calls.iter().position(|c| c.id == wire).unwrap_or(0);
+        let before = history[index + 1..]
+            .iter()
+            .take_while(|m| m.role == Role::Tool)
+            .filter(|m| {
+                m.tool_call_id
+                    .as_ref()
+                    .and_then(|id| calls.iter().position(|c| &c.id == id))
+                    .map(|r| r < rank)
+                    .unwrap_or(false)
+            })
+            .count();
+        history.insert(index + 1 + before, ChatMessage::tool_result(wire, text));
+    } else {
+        history.push(ChatMessage::tool_result(wire, text));
+    }
+}
+
+/// Resolve conversation rewinds in journal order, retaining work created after a
+/// rewind. Workspace-only rewinds leave the conversation intact.
+pub(crate) fn active_events(events: &[Event], upto_seq: Option<u64>) -> Vec<&Event> {
+    let mut active: Vec<&Event> = Vec::new();
+    for event in events
+        .iter()
+        .take_while(|e| upto_seq.map(|n| e.seq <= n).unwrap_or(true))
+    {
+        if let EventKind::Rewound {
+            truncate_to_seq,
+            mode,
+            ..
+        } = &event.kind
+        {
+            if mode != "workspace" {
+                active.retain(|e| e.seq <= *truncate_to_seq);
+            }
+        } else {
+            active.push(event);
+        }
+    }
+    active
+}
+
 /// Replay journal events into conversation history. `upto_seq` (inclusive) bounds the
 /// replay — used by rewind to drop everything after a boundary.
 pub fn replay_history(events: &[Event], upto_seq: Option<u64>) -> Vec<ChatMessage> {
     let mut history: Vec<ChatMessage> = Vec::new();
-    // Calls observed but not yet answered, keyed by request id (wire ids preserved).
-    let mut pending_calls: HashMap<String, Vec<ToolCallReq>> = HashMap::new();
+    let mut pending_calls: std::collections::BTreeMap<String, Vec<ToolCallReq>> =
+        std::collections::BTreeMap::new();
+    let mut call_requests: HashMap<loon_events::EvId, String> = HashMap::new();
+    let mut call_wires: HashMap<loon_events::EvId, String> = HashMap::new();
+    let mut unanswered: std::collections::VecDeque<(String, String)> =
+        std::collections::VecDeque::new();
     let mut assistant_text = String::new();
 
     let flush_text = |history: &mut Vec<ChatMessage>, text: &mut String| {
@@ -22,12 +74,7 @@ pub fn replay_history(events: &[Event], upto_seq: Option<u64>) -> Vec<ChatMessag
         }
     };
 
-    for e in events {
-        if let Some(upto) = upto_seq {
-            if e.seq > upto {
-                break;
-            }
-        }
+    for e in active_events(events, upto_seq) {
         match &e.kind {
             EventKind::UserMessage { text } => {
                 flush_text(&mut history, &mut assistant_text);
@@ -39,8 +86,12 @@ pub fn replay_history(events: &[Event], upto_seq: Option<u64>) -> Vec<ChatMessag
                 wire_id,
                 name,
                 arguments_json,
+                call,
                 ..
             } => {
+                call_requests.insert(*call, request.to_string());
+                call_wires.insert(*call, wire_id.clone());
+                unanswered.push_back((wire_id.clone(), name.clone()));
                 pending_calls
                     .entry(request.to_string())
                     .or_default()
@@ -54,34 +105,26 @@ pub fn replay_history(events: &[Event], upto_seq: Option<u64>) -> Vec<ChatMessag
                 call,
                 excerpt,
                 blob,
+                name,
                 ..
             } => {
                 flush_text(&mut history, &mut assistant_text);
-                // Emit the assistant message that carried these calls (once per request
-                // is not trackable here; instead attach all still-pending calls of the
-                // same turn by matching nothing — the journal orders observed calls
-                // before their results, so drain per call in order).
-                // Find the oldest request that still has pending calls and pop one.
-                let mut answered: Option<String> = None;
-                for (req, calls) in pending_calls.iter_mut() {
-                    if !calls.is_empty() {
-                        let call_req = calls.remove(0);
-                        // push assistant-with-calls containing every call observed for
-                        // this request up to now that has not been emitted
-                        let all: Vec<ToolCallReq> = std::mem::take(calls);
-                        let mut batch = vec![call_req];
-                        batch.extend(all);
-                        history.push(ChatMessage {
-                            role: Role::Assistant,
-                            text: String::new(),
-                            tool_calls: batch,
-                            tool_call_id: None,
-                        });
-                        answered = Some(req.clone());
-                        break;
+                let req = call_requests
+                    .get(call)
+                    .cloned()
+                    .or_else(|| pending_calls.keys().next().cloned());
+                if let Some(req) = req {
+                    if let Some(batch) = pending_calls.remove(&req) {
+                        if !batch.is_empty() {
+                            history.push(ChatMessage {
+                                role: Role::Assistant,
+                                text: String::new(),
+                                tool_calls: batch,
+                                tool_call_id: None,
+                            });
+                        }
                     }
                 }
-                let _ = answered;
                 let result_text = match blob {
                     Some(b) => format!(
                         "{excerpt}\n[full output in blob {}]",
@@ -89,23 +132,71 @@ pub fn replay_history(events: &[Event], upto_seq: Option<u64>) -> Vec<ChatMessag
                     ),
                     None => excerpt.clone(),
                 };
-                // tool result id: the first wire id of the last assistant message
-                let call_id = history
-                    .iter()
-                    .rev()
-                    .find_map(|m| m.tool_calls.first().map(|c| c.id.clone()))
+                let wire = call_wires
+                    .remove(call)
+                    .or_else(|| {
+                        unanswered
+                            .iter()
+                            .find(|(_, n)| n == name)
+                            .map(|(id, _)| id.clone())
+                    })
                     .unwrap_or_else(|| call.to_string());
-                history.push(ChatMessage::tool_result(call_id, result_text));
+                unanswered.retain(|(id, _)| id != &wire);
+                push_result_ordered(&mut history, wire, result_text);
             }
-            EventKind::RequestFinished { .. } | EventKind::TurnFinished { .. } => {
+            EventKind::ToolCallRejected {
+                request,
+                name,
+                reason,
+            } => {
+                let req = call_requests.get(request).cloned();
+                if let Some(req) = req {
+                    if let Some(batch) = pending_calls.remove(&req) {
+                        history.push(ChatMessage {
+                            role: Role::Assistant,
+                            text: String::new(),
+                            tool_calls: batch,
+                            tool_call_id: None,
+                        });
+                    }
+                }
+                if let Some(wire) = call_wires.remove(request).or_else(|| {
+                    unanswered
+                        .iter()
+                        .find(|(_, n)| n == name)
+                        .map(|(id, _)| id.clone())
+                }) {
+                    unanswered.retain(|(id, _)| id != &wire);
+                    push_result_ordered(&mut history, wire, format!("ERROR: {reason}"));
+                }
+            }
+
+            EventKind::RequestFinished { request, .. } => {
+                flush_text(&mut history, &mut assistant_text);
+                if let Some(batch) = pending_calls.remove(&request.to_string()) {
+                    if !batch.is_empty() {
+                        history.push(ChatMessage {
+                            role: Role::Assistant,
+                            text: String::new(),
+                            tool_calls: batch,
+                            tool_call_id: None,
+                        });
+                    }
+                }
+            }
+            EventKind::TurnFinished { .. } => {
                 flush_text(&mut history, &mut assistant_text);
             }
+
             // Compaction replaces everything the model saw before this point with the
             // summary plus the verbatim kept tail — exactly what the live session held.
             EventKind::ContextCompacted { summary, kept, .. } => {
                 flush_text(&mut history, &mut assistant_text);
                 history.clear();
                 pending_calls.clear();
+                call_requests.clear();
+                call_wires.clear();
+                unanswered.clear();
                 history.push(ChatMessage::user(format!(
                     "[Earlier conversation summary]\n{summary}"
                 )));
@@ -135,6 +226,26 @@ pub fn replay_history(events: &[Event], upto_seq: Option<u64>) -> Vec<ChatMessag
     }
     flush_text(&mut history, &mut assistant_text);
     history
+}
+
+/// The visible transcript retains original exchanges even after model compaction.
+/// Compaction snapshots affect provider history only, never the user's chat view.
+pub fn visible_blocks(events: &[Event], upto_seq: Option<u64>) -> Vec<(String, String)> {
+    let visible: Vec<Event> = active_events(events, upto_seq)
+        .into_iter()
+        .filter(|e| !matches!(e.kind, EventKind::ContextCompacted { .. }))
+        .cloned()
+        .collect();
+    replay_history(&visible, None)
+        .into_iter()
+        .filter_map(|m| match m.role {
+            Role::User if crate::rewind::visible_user_prompt(&m.text) => {
+                Some(("user".into(), m.text))
+            }
+            Role::Assistant if !m.text.is_empty() => Some(("assistant".into(), m.text)),
+            _ => None,
+        })
+        .collect()
 }
 
 #[cfg(test)]

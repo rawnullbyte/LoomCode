@@ -76,6 +76,7 @@ pub struct PermissionEngine {
     pub mode: PermissionMode,
     pub allow_rules: Vec<PermissionRule>,
     pub deny_rules: Vec<PermissionRule>,
+    pub ask_rules: Vec<PermissionRule>,
     audit_path: Option<PathBuf>,
     audit_lock: Mutex<()>,
 }
@@ -86,35 +87,60 @@ impl PermissionEngine {
             mode: cfg.mode,
             allow_rules: cfg.allow_rules.clone(),
             deny_rules: cfg.deny_rules.clone(),
+            ask_rules: cfg.ask_rules.clone(),
             audit_path,
             audit_lock: Mutex::new(()),
         }
     }
 
-    /// Evaluate a tool call. `path_arg` is the resolved `path` argument when present.
+    /// Compatibility entry point for path-only policy callers.
     pub fn evaluate(&self, tool: &str, path_arg: Option<&str>, mutating: bool) -> Decision {
-        // Explicit denies first — they bind every mode, bypass included.
-        if let Some(rule) = self.matching_rule(&self.deny_rules, tool, path_arg) {
+        self.evaluate_details(tool, path_arg, None, None, mutating)
+    }
+
+    pub fn evaluate_call(
+        &self,
+        tool: &str,
+        args: &serde_json::Value,
+        root: &std::path::Path,
+        mutating: bool,
+    ) -> Decision {
+        let path = args["path"].as_str().map(|p| resolve_policy_path(root, p));
+        let host = args["url"]
+            .as_str()
+            .and_then(|u| reqwest::Url::parse(u).ok())
+            .and_then(|u| u.host_str().map(|h| h.to_lowercase()));
+        self.evaluate_details(
+            tool,
+            path.as_deref(),
+            args["command"].as_str(),
+            host.as_deref(),
+            mutating,
+        )
+    }
+    fn evaluate_details(
+        &self,
+        tool: &str,
+        path: Option<&str>,
+        command: Option<&str>,
+        host: Option<&str>,
+        mutating: bool,
+    ) -> Decision {
+        if let Some(rule) = matching_rule(&self.deny_rules, tool, path, command, host, false) {
             return Decision::Denied {
                 rule: describe(rule),
             };
         }
+        if matching_rule(&self.ask_rules, tool, path, command, host, false).is_some() {
+            return Decision::ApprovalRequired;
+        }
+        if matching_rule(&self.allow_rules, tool, path, command, host, true).is_some() {
+            return Decision::Allowed;
+        }
         match self.mode {
             PermissionMode::Bypass => Decision::Allowed,
-            PermissionMode::Allowlist => {
-                if self
-                    .matching_rule(&self.allow_rules, tool, path_arg)
-                    .is_some()
-                {
-                    Decision::Allowed
-                } else {
-                    Decision::NotAllowlisted
-                }
-            }
+            PermissionMode::Allowlist => Decision::NotAllowlisted,
             PermissionMode::Ask | PermissionMode::Auto => {
-                // Reads do not need approval: asking would only slow down looking.
-                // Mutating operations need a yes — from the reviewer (auto) or the
-                // user (ask).
                 if mutating {
                     Decision::ApprovalRequired
                 } else {
@@ -122,29 +148,6 @@ impl PermissionEngine {
                 }
             }
         }
-    }
-
-    fn matching_rule<'r>(
-        &self,
-        rules: &'r [PermissionRule],
-        tool: &str,
-        path_arg: Option<&str>,
-    ) -> Option<&'r PermissionRule> {
-        rules.iter().find(|r| {
-            if r.tool != tool {
-                return false;
-            }
-            match (&r.path_prefix, path_arg) {
-                (None, _) => true,
-                (Some(_), None) => false, // path-constrained rule cannot match a pathless call
-                (Some(prefix), Some(p)) => {
-                    // Real path-prefix match, not a substring test: /tmp/ws must not
-                    // match /tmp/ws-secret.
-                    let prefix = prefix.trim_end_matches('/');
-                    p == prefix || p.starts_with(&format!("{prefix}/"))
-                }
-            }
-        })
     }
 
     /// Append one redacted audit record. Failures are logged, never fatal: losing an
@@ -189,6 +192,86 @@ impl PermissionEngine {
     }
 }
 
+fn matching_rule<'a>(
+    rules: &'a [PermissionRule],
+    tool: &str,
+    path: Option<&str>,
+    command: Option<&str>,
+    host: Option<&str>,
+    allow: bool,
+) -> Option<&'a PermissionRule> {
+    rules.iter().find(|rule| {
+        if rule.tool != tool {
+            return false;
+        }
+        if let Some(prefix) = &rule.path_prefix {
+            let Some(path) = path else {
+                return false;
+            };
+            let prefix = prefix.trim_end_matches('/');
+            if path != prefix && !path.starts_with(&format!("{prefix}/")) {
+                return false;
+            }
+        }
+        if let Some(prefix) = &rule.command_prefix {
+            let Some(command) = command.map(str::trim_start) else {
+                return false;
+            };
+            let prefix = prefix.trim();
+            if prefix.is_empty()
+                || (command != prefix
+                    && !command
+                        .strip_prefix(prefix)
+                        .is_some_and(|s| s.starts_with(char::is_whitespace)))
+            {
+                return false;
+            }
+            if allow && command.chars().any(|c| ";&|`$()<>\n\r".contains(c)) {
+                return false;
+            }
+        }
+        if let Some(expected) = &rule.host {
+            if !host.is_some_and(|h| h.eq_ignore_ascii_case(expected.trim_end_matches('.'))) {
+                return false;
+            }
+        }
+        true
+    })
+}
+fn resolve_policy_path(root: &std::path::Path, path: &str) -> String {
+    let path = root.join(path);
+    let mut clean = std::path::PathBuf::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::ParentDir => {
+                clean.pop();
+            }
+            std::path::Component::CurDir => {}
+            part => clean.push(part),
+        }
+    }
+    if let Ok(path) = clean.canonicalize() {
+        return path.to_string_lossy().into_owned();
+    }
+    let mut tail = Vec::new();
+    let mut parent = clean.as_path();
+    while !parent.exists() {
+        if let Some(name) = parent.file_name() {
+            tail.push(name.to_os_string());
+        } else {
+            break;
+        }
+        parent = parent.parent().unwrap_or(parent);
+    }
+    let mut canonical = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
+    for name in tail.into_iter().rev() {
+        canonical.push(name);
+    }
+    canonical.to_string_lossy().into_owned()
+}
+
 fn describe(rule: &PermissionRule) -> String {
     match &rule.path_prefix {
         Some(p) => format!("{} (path under {p})", rule.tool),
@@ -218,6 +301,7 @@ mod tests {
             mode,
             allow_rules: allow,
             deny_rules: deny,
+            ask_rules: Vec::new(),
             audit_path: None,
             audit_lock: Mutex::new(()),
         }
@@ -231,6 +315,8 @@ mod tests {
             vec![PermissionRule {
                 tool: "bash".into(),
                 path_prefix: None,
+                command_prefix: None,
+                host: None,
             }],
         );
         assert!(e.evaluate("read", None, false).is_allowed());
@@ -249,10 +335,14 @@ mod tests {
                 PermissionRule {
                     tool: "read".into(),
                     path_prefix: None,
+                    command_prefix: None,
+                    host: None,
                 },
                 PermissionRule {
                     tool: "write".into(),
                     path_prefix: Some("/tmp/ws".into()),
+                    command_prefix: None,
+                    host: None,
                 },
             ],
             vec![],

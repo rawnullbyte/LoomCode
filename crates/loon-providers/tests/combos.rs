@@ -28,10 +28,12 @@ fn reg_with(
                 base_url: format!("http://{name}.invalid/v1"),
                 api: ApiFamily::Chat,
                 api_key_env: None,
+                api_key: None,
                 headers: Default::default(),
                 timeout_secs: 5,
                 models: vec![],
                 mock: *is_mock,
+                reasoning_efforts: vec![],
             },
         );
     }
@@ -409,9 +411,11 @@ async fn credentials_resolve_per_member_origin() {
             base_url: "http://needskey.invalid/v1".into(),
             api: ApiFamily::Chat,
             api_key_env: Some("DEFINITELY_NOT_SET_LOON_TEST_KEY".into()),
+            api_key: None,
             headers: Default::default(),
             timeout_secs: 5,
             models: vec![],
+            reasoning_efforts: vec![],
             mock: false, // real endpoint shape: its api_key_env must actually resolve
         },
     );
@@ -497,6 +501,56 @@ async fn usage_attributed_to_serving_member_only() {
         "usage comes from the serving member"
     );
     assert!(outcome.usage_reported);
+}
+
+#[tokio::test]
+async fn a_dropped_stream_is_retried_on_the_same_member() {
+    let registry = reg_with(
+        &[("mocka", true)],
+        &[("mocka", "mocka", None)],
+        BTreeMap::new(),
+    );
+    // First attempt drops mid-stream; the retry gets a complete answer.
+    registry
+        .mock
+        .push_script(MockScript::new(vec![MockStep::FailMidStream {
+            text: "half".into(),
+            error: ProviderError::Dropped("reset by peer".into()),
+        }]));
+    registry
+        .mock
+        .push_script(MockScript::text("the whole answer"));
+    let mut runner = ComboRunner::new(registry.clone());
+    runner.max_retries = 2;
+    let req = loon_providers::ChatRequest {
+        model: "mocka".into(),
+        messages: vec![loon_providers::ChatMessage::user("go")],
+        ..Default::default()
+    };
+    let (tx, mut rx) = mpsc::channel(256);
+    let outcome = runner.run("mocka", &req, tx).await.expect("combo run");
+    let mut events = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        events.push(ev);
+    }
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e.event, ProviderEvent::Retrying { .. })),
+        "the retry must be announced so the UI can discard the partial text"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            &e.event,
+            ProviderEvent::TextDelta { text } if text == "the whole answer"
+        )),
+        "the retry's answer is what the user sees"
+    );
+    assert!(
+        matches!(outcome.outcome, RequestOutcome::Completed { .. }),
+        "got {:?}",
+        outcome.outcome
+    );
 }
 
 #[tokio::test]

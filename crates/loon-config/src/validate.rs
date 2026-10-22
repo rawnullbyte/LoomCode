@@ -60,6 +60,24 @@ impl<'a> Validator<'a> {
             ));
         }
 
+        if let Some(effort) = &self.cfg.session.effort {
+            if crate::schema::Effort::parse(effort).is_none() {
+                f.push(err(
+                    "session.effort",
+                    "must be low, medium, high, xhigh or ultra".into(),
+                ));
+            }
+        }
+        if ![
+            "terminal", "dark", "light", "ocean", "violet", "ember", "graphite",
+        ]
+        .contains(&self.cfg.appearance.palette.as_str())
+        {
+            f.push(err(
+                "appearance.palette",
+                "must be terminal, dark, light, ocean, violet, ember or graphite".into(),
+            ));
+        }
         if self.cfg.providers.is_empty() {
             f.push(warn(
                 "providers",
@@ -71,6 +89,15 @@ impl<'a> Validator<'a> {
             let base = format!("providers.{name}");
             if name.is_empty() {
                 f.push(err(&base, "provider id must not be empty".into()));
+            }
+            if p.reasoning_efforts
+                .iter()
+                .any(|e| !["low", "medium", "high", "xhigh", "max"].contains(&e.as_str()))
+            {
+                f.push(err(
+                    &format!("{base}.reasoning_efforts"),
+                    "use accepted wire levels: low, medium, high, xhigh, max".into(),
+                ));
             }
             if p.mock {
                 continue; // built-in mock provider is exempt from URL/auth checks
@@ -240,7 +267,12 @@ impl<'a> Validator<'a> {
                     ),
                 ));
             }
-        } else if !self.cfg.models.contains_key(mref) {
+        } else if !self.cfg.models.contains_key(mref)
+            && !mref
+                .split_once('/')
+                .map(|(p, m)| self.cfg.providers.contains_key(p) && !m.is_empty())
+                .unwrap_or(false)
+        {
             f.push(err(
                 "session.model",
                 format!(
@@ -257,6 +289,99 @@ impl<'a> Validator<'a> {
             }
         }
 
+        if self
+            .cfg
+            .session
+            .autocompact_tokens
+            .is_some_and(|n| n != 0 && !(1024..=10_000_000).contains(&n))
+        {
+            f.push(err(
+                "session.autocompact_tokens",
+                "must be 0 or between 1024 and 10000000".into(),
+            ));
+        }
+        if self
+            .cfg
+            .session
+            .autocompact_percent
+            .is_some_and(|p| !(1..=99).contains(&p))
+        {
+            f.push(err(
+                "session.autocompact_percent",
+                "must be between 1 and 99 (percent of the context window)".into(),
+            ));
+        }
+        for (event, hooks) in &self.cfg.hooks {
+            if ![
+                "SessionStart",
+                "SessionEnd",
+                "UserPromptSubmit",
+                "PreToolUse",
+                "PostToolUse",
+                "PostToolUseFailure",
+                "Stop",
+                "StopFailure",
+                "PreCompact",
+                "PostCompact",
+            ]
+            .contains(&event.as_str())
+            {
+                f.push(warn(
+                    &format!("hooks.{event}"),
+                    "unsupported lifecycle event; hook will not run".into(),
+                ));
+            }
+            for (i, hook) in hooks.iter().enumerate() {
+                let path = format!("hooks.{event}[{i}]");
+                if hook.command.is_some() == hook.url.is_some() {
+                    f.push(err(&path, "set exactly one command or url".into()));
+                }
+                if !(1..=600).contains(&hook.timeout_secs) {
+                    f.push(err(&path, "timeout_secs must be 1–600".into()));
+                }
+                if hook.command.as_ref().is_some_and(|s| s.trim().is_empty()) {
+                    f.push(err(&path, "command cannot be empty".into()));
+                }
+                if let Some(url) = &hook.url {
+                    if !url_check(url).is_ok_and(|s| s == "http" || s == "https") {
+                        f.push(err(&path, "url must be http(s)".into()));
+                    }
+                }
+            }
+        }
+        for (name, server) in &self.cfg.mcp.servers {
+            let path = format!("mcp.servers.{name}");
+            if server.url.is_some() == !server.command.trim().is_empty() {
+                f.push(err(&path, "set exactly one command or url".into()));
+            }
+            if server.timeout_secs == 0 || server.timeout_secs > 600 {
+                f.push(err(&path, "timeout_secs must be 1–600".into()));
+            }
+            if let Some(url) = &server.url {
+                if !url_check(url).is_ok_and(|s| s == "http" || s == "https") {
+                    f.push(err(
+                        &path,
+                        "url must be http(s); use /mcp add for bare ports".into(),
+                    ));
+                }
+            }
+        }
+        if self.cfg.context7.api_key_env.trim().is_empty()
+            || !self
+                .cfg
+                .context7
+                .api_key_env
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            f.push(err(
+                "context7.api_key_env",
+                "use a nonempty environment variable name".into(),
+            ));
+        }
+        if !(1..=120).contains(&self.cfg.context7.timeout_secs) {
+            f.push(err("context7.timeout_secs", "must be 1–120".into()));
+        }
         f.sort_by(|a, b| a.path.cmp(&b.path));
         f
     }

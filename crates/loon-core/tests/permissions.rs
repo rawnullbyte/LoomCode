@@ -27,14 +27,14 @@ fn cfg_with(mode: PermissionMode, mut perms: Permissions, _ws: &std::path::Path)
     perms.mode = mode;
     AgentConfig {
         model_ref: "mock".into(),
-        max_steps: 12,
         tool_output_bytes: 4096,
         max_retries: 0,
         allow_retry_after_partial_stream: false,
+        check_command: None,
+        ultra_rounds: 0,
         permissions: perms,
         context_window: 128_000,
         extra_tools: Vec::new(),
-        check_command: None,
     }
 }
 
@@ -105,6 +105,8 @@ async fn bypass_writes_but_explicit_deny_refuses_with_audit() {
         deny_rules: vec![PermissionRule {
             tool: "write".into(),
             path_prefix: Some(ws2.join("secrets").display().to_string()),
+            command_prefix: None,
+            host: None,
         }],
         ..Permissions::default()
     };
@@ -127,6 +129,8 @@ async fn allowlist_mode_refuses_unlisted_tools() {
         allow_rules: vec![PermissionRule {
             tool: "read".into(),
             path_prefix: None,
+            command_prefix: None,
+            host: None,
         }],
         ..Permissions::default()
     };
@@ -146,6 +150,8 @@ async fn allowlist_prefix_rule_allows_in_scope_and_refuses_out_of_scope() {
         allow_rules: vec![PermissionRule {
             tool: "write".into(),
             path_prefix: Some(ws.join("notes").display().to_string()),
+            command_prefix: None,
+            host: None,
         }],
         ..Permissions::default()
     };
