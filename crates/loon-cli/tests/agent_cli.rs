@@ -125,3 +125,121 @@ fn an_empty_prompt_is_refused_and_creates_no_session() {
         );
     }
 }
+
+/// Resume lists the session you last messaged first, and `loom resume` continues that
+/// same session instead of starting a new one.
+#[test]
+fn sessions_are_ordered_by_last_use_and_resume_continues_them() {
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    let session_ids = |out: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(out)
+            .lines()
+            .skip(1)
+            .filter_map(|l| l.split_whitespace().next().map(str::to_string))
+            .collect()
+    };
+
+    assert!(loom()
+        .args(["run", "first"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(loom()
+        .args(["run", "second"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let list = loom().args(["sessions", "list"]).output().unwrap();
+    let order = session_ids(&list.stdout);
+    assert_eq!(order.len(), 2, "both sessions are listed");
+    let (second, first) = (order[0].clone(), order[1].clone());
+    assert_ne!(first, second);
+
+    // Resuming the older session must not create a third, and must move it to the top.
+    let resumed = loom().args(["resume", &first, "third"]).output().unwrap();
+    assert!(
+        resumed.status.success(),
+        "resume failed: {}",
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    let list = loom().args(["sessions", "list"]).output().unwrap();
+    let order = session_ids(&list.stdout);
+    assert_eq!(
+        order.len(),
+        2,
+        "resume continues a session, it does not create one"
+    );
+    assert_eq!(
+        order[0], first,
+        "the resumed session is now the most recent"
+    );
+    assert_eq!(order[1], second);
+
+    // `LAST USED` is shown so the ordering is self-explanatory.
+    let header = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        header.lines().next().unwrap().contains("LAST USED"),
+        "header must name the sort key: {}",
+        header.lines().next().unwrap()
+    );
+}
+
+/// An unknown id and an ambiguous prefix are both refused by name.
+#[test]
+fn resume_refuses_unknown_and_ambiguous_ids() {
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    let unknown = loom()
+        .args(["resume", "01a164c1-0000-7000-8000-000000000000", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(unknown.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&unknown.stderr).contains("no session 01a164c1"),
+        "{}",
+        String::from_utf8_lossy(&unknown.stderr)
+    );
+
+    // Two sessions sharing a prefix: list them, do not guess.
+    for _ in 0..2 {
+        assert!(loom()
+            .args(["run", "hello"])
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+    let list = loom().args(["sessions", "list"]).output().unwrap();
+    let text = String::from_utf8_lossy(&list.stdout).to_string();
+    let ids: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split_whitespace().next())
+        .collect();
+    assert_eq!(ids.len(), 2);
+    // Find the shortest shared prefix of the two ids.
+    let shared: String = ids[0]
+        .chars()
+        .zip(ids[1].chars())
+        .take_while(|(a, b)| a == b)
+        .map(|(a, _)| a)
+        .collect();
+    if shared.len() >= 8 {
+        let ambiguous = loom().args(["resume", &shared, "x"]).output().unwrap();
+        assert_eq!(ambiguous.status.code(), Some(1));
+        let err = String::from_utf8_lossy(&ambiguous.stderr);
+        assert!(err.contains("matches 2 sessions"), "{err}");
+        assert!(err.contains(ids[0]), "candidates are listed: {err}");
+    }
+}

@@ -6,6 +6,7 @@
 
 pub mod checks;
 pub mod context7;
+pub mod diff;
 pub mod exec;
 pub mod fetch;
 pub mod fs_tools;

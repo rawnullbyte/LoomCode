@@ -14,7 +14,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const STORE_SCHEMA_VERSION: u32 = 1;
+pub const STORE_SCHEMA_VERSION: u32 = 2;
 
 const MIGRATIONS: &[&str] = &[
     // v1: initial schema
@@ -40,7 +40,15 @@ const MIGRATIONS: &[&str] = &[
         sha256 TEXT PRIMARY KEY,
         bytes INTEGER NOT NULL,
         data BLOB NOT NULL
-    );",
+    );
+    CREATE INDEX IF NOT EXISTS idx_events_ts ON events(session, ts_ms);",
+    // v2: resume ordering by last activity. `created_ms` only ever said when a session
+    // was made, so the most recently *used* session sank below freshly created ones.
+    // Backfill from the newest event of each existing session so old databases get the
+    // same ordering immediately instead of after their next message.
+    "ALTER TABLE sessions ADD COLUMN updated_ms INTEGER NOT NULL DEFAULT 0;
+    UPDATE sessions SET updated_ms = MAX(created_ms, COALESCE((SELECT MAX(ts_ms) FROM events WHERE events.session = sessions.id), created_ms));
+    CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_ms DESC);",
 ];
 
 pub struct Store {
@@ -164,6 +172,12 @@ impl Store {
                 serde_json::to_string(&ev.kind)?
             ],
         )?;
+        // Resume orders by last activity, so every append advances the session's
+        // position. `MAX` keeps it monotonic even if a clock steps backwards.
+        tx.execute(
+            "UPDATE sessions SET updated_ms = MAX(updated_ms, ?2) WHERE id = ?1",
+            params![session.to_string(), ev.ts_ms],
+        )?;
         tx.commit()?;
         Ok(ev)
     }
@@ -273,10 +287,15 @@ impl Store {
         Ok(found)
     }
 
+    /// Sessions, most recently active first.
+    ///
+    /// "Active" is the newest event, not the creation time: a session you messaged five
+    /// minutes ago belongs above one created after it but never used. `updated_ms` is
+    /// advanced by every append, so this is exactly the last-message order.
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
         let conn = self.conn.lock().expect("store lock");
         let mut stmt = conn.prepare(
-            "SELECT id, title, created_ms, cwd, schema_version, headless FROM sessions ORDER BY created_ms DESC, id DESC",
+            "SELECT id, title, created_ms, cwd, schema_version, headless, updated_ms FROM sessions ORDER BY updated_ms DESC, created_ms DESC, id DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -286,11 +305,12 @@ impl Store {
                 r.get::<_, String>(3)?,
                 r.get::<_, i64>(4)?,
                 r.get::<_, i64>(5)?,
+                r.get::<_, i64>(6)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, title, created_ms, cwd, schema_version, headless) = row?;
+            let (id, title, created_ms, cwd, schema_version, headless, updated_ms) = row?;
             out.push(SessionMeta {
                 id: EvId::parse_str(&id).map_err(|e| EventsError::MalformedLine {
                     line: 0,
@@ -298,6 +318,12 @@ impl Store {
                 })?,
                 title,
                 created_ms,
+                // Rows written before the column existed fall back to creation time.
+                updated_ms: if updated_ms > 0 {
+                    updated_ms
+                } else {
+                    created_ms
+                },
                 cwd,
                 schema_version: schema_version as u32,
                 headless: headless != 0,
@@ -338,7 +364,7 @@ impl Store {
         let conn = self.conn.lock().expect("store lock");
         let row = conn
             .query_row(
-                "SELECT title, created_ms, cwd, schema_version, headless FROM sessions WHERE id = ?1",
+                "SELECT title, created_ms, cwd, schema_version, headless, updated_ms FROM sessions WHERE id = ?1",
                 params![id.to_string()],
                 |r| {
                     Ok((
@@ -347,15 +373,21 @@ impl Store {
                         r.get::<_, String>(2)?,
                         r.get::<_, i64>(3)?,
                         r.get::<_, i64>(4)?,
+                        r.get::<_, i64>(5)?,
                     ))
                 },
             )
             .optional()?;
         Ok(row.map(
-            |(title, created_ms, cwd, schema_version, headless)| SessionMeta {
+            |(title, created_ms, cwd, schema_version, headless, updated_ms)| SessionMeta {
                 id,
                 title,
                 created_ms,
+                updated_ms: if updated_ms > 0 {
+                    updated_ms
+                } else {
+                    created_ms
+                },
                 cwd,
                 schema_version: schema_version as u32,
                 headless: headless != 0,

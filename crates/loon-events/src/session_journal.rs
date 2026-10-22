@@ -222,6 +222,14 @@ pub fn list_all_sessions(store: &Arc<Store>, sessions_root: &Path) -> Result<Vec
             out.push(m);
         }
     }
-    out.sort_by_key(|m| std::cmp::Reverse(m.id));
+    // Last activity, newest first: the session you just messaged belongs on top, even
+    // if other sessions were created afterwards. Both backends already populate
+    // `updated_ms`, so this is the only ordering step.
+    out.sort_by(|a, b| {
+        b.updated_ms
+            .cmp(&a.updated_ms)
+            .then(b.created_ms.cmp(&a.created_ms))
+            .then(b.id.cmp(&a.id))
+    });
     Ok(out)
 }

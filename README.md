@@ -210,7 +210,15 @@ unfinished todos also prevent the supervisor from accepting completion.
 
 Failures show the actual command and diagnostic, even inside a collapsed group. **Ctrl+O
 expands tool output**; Ctrl+Y copies the last assistant answer. Multiline paste keeps its
-original lines and the input viewport follows the caret. One request-level `t/s` counter
+original lines and the input viewport follows the caret.
+
+File mutations show **what changed**, not just that something happened: `edit`, `fuzzy_edit`,
+`multi_edit` and `write` append a bounded unified diff to their result, and the transcript
+colours it — removals red, additions green, hunk headers yellow, with `+N −M` as the summary
+for a collapsed run. The diff is clipped after 120 changed lines and says so rather than
+truncating silently; a rewrite that changes nothing produces no diff at all. The same
+colouring applies to a diff pasted into an assistant answer, and fenced code blocks render
+as code. One request-level `t/s` counter
 covers thinking, writing and tool arguments together. `~` marks a character-based estimate
 until the provider reports total output/completion tokens. Reasoning tokens are not added
 again. The timer includes request latency, resets on each request/retry and freezes during
@@ -309,15 +317,25 @@ session the same way, so a message-less session cannot leave an orphaned plan or
 From the shell, the same journal is inspectable without the TUI:
 
 ```sh
-loom sessions list                     # newest first, with title and workspace
+loom sessions list                     # most recently used first
 loom sessions export ID                # every event of one session as a list
 loom sessions delete ID                # asks you to type the id prefix to confirm
 loom sessions delete ID --force        # no prompt (scripts)
+loom resume ID "next task"             # continue a saved session headlessly
 ```
+
+Sessions are ordered by **last activity**, not by creation: the session you messaged five
+minutes ago is at the top, even if others were created after it. `sessions list` shows both
+`LAST USED` and `CREATED` so the order is self-explanatory. `/resume` in the TUI uses the
+same order and annotates each entry with its age ("5m ago", "2h ago").
 
 Deleting removes the session row and its events in one transaction. An unknown id is
 reported by name rather than as a file-system error, and the session you are currently in
 cannot be deleted.
+
+`loom resume` accepts a full id or a unique prefix; an ambiguous prefix lists the candidates
+instead of guessing. It reuses the same code path as `loom run`, so prompt files, model
+overrides, output modes and exit codes behave identically.
 
 There are **26 embedded coding workflows**, available without installing files:
 `/implement`, `/debug`, `/review`, `/handoff`, `/refactor`, `/test`, `/optimize`, `/audit`,

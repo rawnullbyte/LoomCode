@@ -4,6 +4,24 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// Human-readable age of a timestamp: "just now", "5m ago", "3h ago", "2d ago".
+///
+/// Session lists show this instead of a raw clock time, because "how long ago" is the
+/// question the user is asking when choosing what to resume.
+pub fn relative_time(ms: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(ms);
+    let delta = (now - ms).max(0) / 1000;
+    match delta {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", delta / 60),
+        3600..=86_399 => format!("{}h ago", delta / 3600),
+        _ => format!("{}d ago", delta / 86_400),
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkState {
     #[serde(default)]
@@ -488,5 +506,33 @@ impl Tool for TodoTool {
             ctx,
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod relative_time_tests {
+    use super::relative_time;
+
+    fn ago(secs: i64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        relative_time(now - secs * 1000)
+    }
+
+    #[test]
+    fn ages_read_as_how_long_ago() {
+        assert_eq!(ago(0), "just now");
+        assert_eq!(ago(30), "just now");
+        assert_eq!(ago(60), "1m ago");
+        assert_eq!(ago(90 * 60), "1h ago");
+        assert_eq!(ago(3 * 86_400), "3d ago");
+    }
+
+    #[test]
+    fn a_future_timestamp_does_not_go_negative() {
+        // Clock skew or a stamp from a machine ahead of this one: "just now", not "-5m".
+        assert_eq!(ago(-600), "just now");
     }
 }

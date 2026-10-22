@@ -538,14 +538,13 @@ impl Agent {
         headless: bool,
     ) -> loon_events::Result<Agent> {
         let session_id = loon_events::EvId::now_v7();
-        let meta = SessionMeta {
-            id: session_id,
-            title: "session".into(),
-            created_ms: chrono_ms(),
-            cwd: cwd.display().to_string(),
-            schema_version: loon_events::SCHEMA_VERSION,
+        let meta = SessionMeta::fresh(
+            session_id,
+            "session",
+            chrono_ms(),
+            cwd.display().to_string(),
             headless,
-        };
+        );
         let store = open_store(paths)?;
         // The session exists only in memory until its first write: no row, no events.
         // Opening the app and quitting without sending anything therefore leaves

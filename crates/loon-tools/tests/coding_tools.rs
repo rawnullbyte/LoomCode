@@ -367,3 +367,77 @@ async fn ui_managed_context7_key_authenticates_without_environment_configuration
         .contains("authorization: bearer fixture-ui-saved-key"));
     assert!(!result.text.contains("fixture-ui-saved-key"));
 }
+
+/// A mutation must report *what changed*, not just that it happened: the transcript
+/// renders the tool result verbatim, so the diff has to come from the tool itself.
+#[tokio::test]
+async fn edit_write_and_multi_edit_report_their_diff() {
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path());
+    std::fs::write(d.path().join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+    let out = call(
+        "edit",
+        json!({"path":"a.txt","old_string":"two","new_string":"TWO"}),
+        &c,
+    )
+    .await;
+    assert!(out.ok);
+    assert!(out.text.contains("--- a.txt"), "diff header: {}", out.text);
+    assert!(out.text.contains("-two"), "removal line: {}", out.text);
+    assert!(out.text.contains("+TWO"), "addition line: {}", out.text);
+    assert!(
+        !out.text.contains("-one"),
+        "unchanged context stays out of the diff: {}",
+        out.text
+    );
+
+    // multi_edit reports one diff for the whole transaction.
+    let out = call(
+        "multi_edit",
+        json!({"path":"a.txt","edits":[
+            {"old_string":"one","new_string":"ONE"},
+            {"old_string":"three","new_string":"THREE"}
+        ]}),
+        &c,
+    )
+    .await;
+    assert!(out.ok);
+    assert!(out.text.contains("+ONE"), "{}", out.text);
+    assert!(out.text.contains("+THREE"), "{}", out.text);
+
+    // A fresh write shows the whole file as additions.
+    let out = call("write", json!({"path":"b.txt","content":"fresh\n"}), &c).await;
+    assert!(out.ok);
+    assert!(out.text.contains("+fresh"), "new file diff: {}", out.text);
+
+    // Rewriting identical content adds no diff noise.
+    let out = call("write", json!({"path":"b.txt","content":"fresh\n"}), &c).await;
+    assert!(out.ok);
+    assert!(
+        !out.text.contains("--- b.txt"),
+        "an unchanged write must not show an empty diff: {}",
+        out.text
+    );
+}
+
+/// `fuzzy_edit` shares the edit implementation, so it must report a diff too — the
+/// README promises all mutating file tools do.
+#[tokio::test]
+async fn fuzzy_edit_reports_its_diff() {
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path());
+    std::fs::write(d.path().join("f.txt"), "let  x   = 1;\nlet y = 2;\n").unwrap();
+    let out = call(
+        "fuzzy_edit",
+        json!({"path":"f.txt","old_string":"let x = 1;","new_string":"let x = 42;"}),
+        &c,
+    )
+    .await;
+    assert!(out.ok, "{}", out.text);
+    assert!(out.text.contains("--- f.txt"), "{}", out.text);
+    // fuzzy_edit normalizes the replacement's whitespace, so the added line is the
+    // normalized form; the point of the assertion is that a diff is present at all.
+    assert!(out.text.contains("+let x = 42;"), "{}", out.text);
+    assert!(out.text.contains("-let  x   = 1;"), "{}", out.text);
+}

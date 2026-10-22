@@ -1,4 +1,4 @@
-use loon_events::journal::{list_sessions, read_events, SessionMeta, SCHEMA_VERSION};
+use loon_events::journal::{list_sessions, read_events, SessionMeta};
 use loon_events::model::EvId;
 use loon_events::model::{EventKind, Usage};
 use std::io::Write;
@@ -11,14 +11,7 @@ fn tmp_root() -> (tempfile::TempDir, std::path::PathBuf) {
 }
 
 fn meta(id: EvId) -> SessionMeta {
-    SessionMeta {
-        id,
-        title: "test".into(),
-        created_ms: 0,
-        cwd: "/tmp".into(),
-        schema_version: SCHEMA_VERSION,
-        headless: false,
-    }
+    SessionMeta::fresh(id, "test", 0, "/tmp", false)
 }
 
 #[test]

@@ -14,9 +14,34 @@ pub struct SessionMeta {
     pub id: EvId,
     pub title: String,
     pub created_ms: i64,
+    /// Timestamp of the newest event (last activity). Resume lists by this, so the
+    /// session you last messaged is at the top. Older records equal `created_ms`.
+    #[serde(default)]
+    pub updated_ms: i64,
     pub cwd: String,
     pub schema_version: u32,
     pub headless: bool,
+}
+
+impl SessionMeta {
+    /// Fresh metadata for a session that does not exist yet.
+    pub fn fresh(
+        id: EvId,
+        title: impl Into<String>,
+        created_ms: i64,
+        cwd: impl Into<String>,
+        headless: bool,
+    ) -> SessionMeta {
+        SessionMeta {
+            id,
+            title: title.into(),
+            created_ms,
+            updated_ms: created_ms,
+            cwd: cwd.into(),
+            schema_version: SCHEMA_VERSION,
+            headless,
+        }
+    }
 }
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -175,7 +200,11 @@ fn line_count(path: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// List sessions sorted newest-first by session id (UUIDv7 ⇒ time-ordered).
+/// List sessions, most recently active first.
+///
+/// The legacy layout has no activity column, so the last event timestamp is read from
+/// each session's `events.jsonl`; a session with no events falls back to its creation
+/// time. Ordering matches the SQLite path so a mixed database looks consistent.
 pub fn list_sessions(sessions_root: &Path) -> Result<Vec<SessionMeta>> {
     let mut out = Vec::new();
     let rd = match fs::read_dir(sessions_root) {
@@ -192,8 +221,26 @@ pub fn list_sessions(sessions_root: &Path) -> Result<Vec<SessionMeta>> {
             }
         }
     }
-    out.sort_by_key(|m| std::cmp::Reverse(m.id));
+    for meta in &mut out {
+        if let Some(last) = last_event_ms(&session_dir(sessions_root, meta.id)) {
+            meta.updated_ms = meta.updated_ms.max(last);
+        } else if meta.updated_ms == 0 {
+            meta.updated_ms = meta.created_ms;
+        }
+    }
+    out.sort_by(|a, b| {
+        b.updated_ms
+            .cmp(&a.updated_ms)
+            .then(b.created_ms.cmp(&a.created_ms))
+            .then(b.id.cmp(&a.id))
+    });
     Ok(out)
+}
+
+/// Timestamp of the newest event in a legacy session directory, if any.
+fn last_event_ms(dir: &Path) -> Option<i64> {
+    let events = read_events(&dir.join("events.jsonl")).ok()?;
+    events.iter().map(|e| e.ts_ms).max()
 }
 
 /// Write bytes atomically: temp file in the same directory, fsync, rename over target.

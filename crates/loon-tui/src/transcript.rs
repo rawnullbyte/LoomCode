@@ -172,10 +172,11 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
     let markdown = style == theme::assistant_fg();
     let mut code = false;
     for para in text.split('\n') {
-        let fence = markdown && para.trim_start().starts_with("```");
+        let trimmed = para.trim_start();
+        let fence = markdown && trimmed.starts_with("```");
         let body_style = if markdown && (fence || code) {
             theme::tool_ok_fg()
-        } else if markdown && para.trim_start().starts_with('#') {
+        } else if markdown && trimmed.starts_with('#') {
             theme::accent_fg().add_modifier(Modifier::BOLD)
         } else {
             style
@@ -191,7 +192,16 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
                 line: Line::from({
                     let mut spans = vec![Span::styled(lead, style)];
                     let text = display(&raw);
-                    if markdown && !code && !fence {
+                    // A diff line is unambiguous whatever the surrounding prose is:
+                    // colour it before any inline-code splitting can hide the prefix.
+                    let diff = if code || fence {
+                        None
+                    } else {
+                        diff_style(&text)
+                    };
+                    if let Some(diff) = diff {
+                        spans.push(Span::styled(text, diff));
+                    } else if markdown && !code && !fence {
                         let mut inline = false;
                         for (i, part) in text.split('`').enumerate() {
                             if i > 0 {
@@ -208,7 +218,10 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
                             ));
                         }
                     } else {
-                        spans.push(Span::styled(text, body_style));
+                        // Fenced code and diff lines inside prose keep their own
+                        // colour: a pasted patch in an answer reads like a patch.
+                        let line_style = diff_style(&text).unwrap_or(body_style);
+                        spans.push(Span::styled(text, line_style));
                     }
                     spans
                 }),
@@ -219,6 +232,73 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
         }
         if fence {
             code = !code;
+        }
+    }
+}
+
+/// Style for one visual line of a diff, or `None` when it is not a diff line.
+fn diff_style(line: &str) -> Option<Style> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("--- ") || trimmed.starts_with("+++ ") {
+        Some(theme::accent_fg().add_modifier(Modifier::BOLD))
+    } else if trimmed.starts_with("@@") && trimmed.contains("@@") {
+        Some(theme::member_fg())
+    } else if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+        Some(theme::tool_ok_fg())
+    } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+        Some(theme::tool_err_fg())
+    } else {
+        None
+    }
+}
+
+/// One excerpt of a *finished* tool call: a bounded diff or code sample, coloured
+/// line by line. Diff lines get red/green/headers, fenced code inside excerpts keeps
+/// its green, and plain output stays in the caller's style.
+fn push_colored_excerpt(
+    rows: &mut Vec<TranscriptRow>,
+    marker: &str,
+    excerpt: &str,
+    style: Style,
+    width: usize,
+) {
+    let prefix_cells = cell_width(marker).min(width.saturating_sub(1));
+    let marker = take_cells(marker, prefix_cells);
+    let indent = " ".repeat(prefix_cells);
+    let avail = width.saturating_sub(prefix_cells).max(1);
+    let lines = clean(excerpt);
+    let mut first = true;
+    let mut in_code = false;
+    for para in lines.split('\n') {
+        let trimmed = para.trim_start();
+        let fence = trimmed.starts_with("```");
+        if fence {
+            in_code = !in_code;
+        }
+        // Diff state is per-paragraph: a blank line between hunks must not carry
+        // the addition colour onto following prose.
+        // Fences and their contents are code; everything else may be a diff line.
+        let body_style = if fence || in_code {
+            theme::tool_ok_fg()
+        } else {
+            diff_style(para).unwrap_or(style)
+        };
+        for (i, raw) in wrap(para, avail).into_iter().enumerate() {
+            let lead = if first {
+                marker.clone()
+            } else {
+                indent.clone()
+            };
+            first = false;
+            rows.push(TranscriptRow {
+                line: Line::from(vec![
+                    Span::styled(lead, style),
+                    Span::styled(display(&raw), body_style),
+                ]),
+                raw,
+                prefix_cells,
+                soft: i > 0,
+            });
         }
     }
 }
@@ -265,6 +345,29 @@ fn total_lines(lines: &[String]) -> Option<usize> {
     })
 }
 
+/// `+12 −3` when the excerpt is a diff, so a collapsed edit still says how big it was.
+/// Counting is done on the raw excerpt (before the `⏎` join is split) so the numbers
+/// match what the tool actually reported.
+fn diff_stat(excerpt: &str) -> Option<String> {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in excerpt.split('\n').flat_map(|l| l.split(" ⏎ ")) {
+        let line = line.trim_start();
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    if added == 0 && removed == 0 {
+        return None;
+    }
+    Some(format!("+{added} −{removed}"))
+}
+
 fn tool_detail(excerpt: &str, ok: bool, pending: bool) -> String {
     let lines = tool_lines(excerpt);
     if pending {
@@ -284,6 +387,10 @@ fn tool_detail(excerpt: &str, ok: bool, pending: bool) -> String {
                 .cloned()
                 .unwrap_or_else(|| "failed (no diagnostic output)".into())
         };
+    }
+    // A diff is more useful as a size than as a line count.
+    if let Some(stat) = diff_stat(excerpt) {
+        return stat;
     }
     if let Some(n) = total_lines(&lines) {
         return format!("{n} lines");
@@ -484,7 +591,9 @@ fn push_calls(
         );
         if !call.ok {
             for line in lines.iter().filter(|l| !metadata_line(l)).skip(1).take(4) {
-                push_text(rows, "       ", line, theme::system_fg(), width);
+                // Failed-call context is an excerpt too: diffs from a refused patch
+                // read the same as diffs from an applied one.
+                push_colored_excerpt(rows, "       ", line, theme::system_fg(), width);
             }
         }
     }
@@ -622,7 +731,7 @@ impl App {
                                 theme::accent_fg(),
                                 width,
                             );
-                            push_text(
+                            push_colored_excerpt(
                                 &mut rows,
                                 "      ",
                                 &call.excerpt,
@@ -817,5 +926,93 @@ mod summary_tests {
         assert_eq!(call_summary(&run), "bash · (no output)");
         let pending = calls(&[("bash", true, true)]);
         assert_eq!(call_summary(&pending), "running bash");
+    }
+}
+
+#[cfg(test)]
+mod diff_rendering_tests {
+    use super::*;
+
+    fn app_with_tool(excerpt: &str) -> crate::App {
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        // Excerpts are shown when tool details are expanded (Ctrl+O).
+        app.show_tool_details = true;
+        app.push_block(crate::Block::Tool {
+            name: "edit".into(),
+            ok: true,
+            excerpt: excerpt.into(),
+            pending: false,
+            detail: "edited a.rs".into(),
+            started: None,
+            elapsed: None,
+        });
+        app
+    }
+
+    /// The style applied to the row that contains `needle`.
+    fn style_of(rows: &[TranscriptRow], needle: &str) -> Option<Style> {
+        rows.iter().find_map(|r| {
+            let text: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if text.contains(needle) {
+                r.line.spans.last().map(|s| s.style)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn diff_lines_are_coloured_by_their_prefix() {
+        let excerpt = "edited a.rs\n--- a.rs\n+++ a.rs\n@@ -1,2 +1,2 @@\n-let a = 1;\n+let a = 2;";
+        let app = app_with_tool(excerpt);
+        let rows = app.transcript_rows(80);
+        assert_eq!(
+            style_of(&rows, "-let a = 1;"),
+            Some(theme::tool_err_fg()),
+            "removals are red"
+        );
+        assert_eq!(
+            style_of(&rows, "+let a = 2;"),
+            Some(theme::tool_ok_fg()),
+            "additions are green"
+        );
+        assert_eq!(
+            style_of(&rows, "@@ -1,2"),
+            Some(theme::member_fg()),
+            "hunk headers stand out"
+        );
+    }
+
+    #[test]
+    fn an_edit_reports_its_size_in_the_summary_line() {
+        // Collapsed tool runs show one phrase per call; for an edit that phrase is the
+        // diff size, so the user sees the scale without expanding anything.
+        let excerpt = "edited a.rs\n--- a.rs\n+++ a.rs\n@@ -1,3 +1,3 @@\n-a\n-b\n+c\n";
+        assert_eq!(diff_stat(excerpt), Some("+1 −2".into()));
+        assert_eq!(diff_stat("read a.rs"), None, "non-diffs have no stat");
+    }
+
+    #[test]
+    fn diff_stats_ignore_file_headers() {
+        // `---`/`+++` are headers, not a removal and an addition.
+        let excerpt = "--- a.rs\n+++ a.rs\n@@ -1 +1 @@\n-x\n+y\n";
+        assert_eq!(diff_stat(excerpt), Some("+1 −1".into()));
+    }
+
+    #[test]
+    fn a_pasted_diff_inside_an_answer_is_coloured() {
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        app.push_block(crate::Block::Assistant(
+            "Here is the change:\n--- a.rs\n+++ a.rs\n-gone\n+kept".into(),
+        ));
+        let rows = app.transcript_rows(80);
+        assert_eq!(
+            style_of(&rows, "+kept"),
+            Some(theme::tool_ok_fg()),
+            "an added line in prose is green too"
+        );
+        assert_eq!(style_of(&rows, "-gone"), Some(theme::tool_err_fg()));
     }
 }

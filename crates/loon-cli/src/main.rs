@@ -59,6 +59,24 @@ enum Command {
         #[command(subcommand)]
         cmd: SessionsCmd,
     },
+    /// Continue a saved session headlessly (scripts, CI).
+    Resume {
+        /// Session id (or a unique prefix).
+        id: String,
+        /// Next task prompt (omit with --prompt-file).
+        prompt: Option<String>,
+        #[arg(long)]
+        prompt_file: Option<PathBuf>,
+        /// Model alias or combo:NAME (overrides config).
+        #[arg(long)]
+        model: Option<String>,
+        /// Output mode: text (default) | jsonl | json.
+        #[arg(long)]
+        output: Option<String>,
+        /// Coding effort; wire reasoning is sent only to opted-in providers.
+        #[arg(long, value_parser = ["low","medium","high","xhigh","ultra"])]
+        effort: Option<String>,
+    },
     Config {
         #[command(subcommand)]
         cmd: ConfigCmd,
@@ -72,7 +90,7 @@ enum Command {
 
 #[derive(Subcommand)]
 enum SessionsCmd {
-    /// List sessions, newest first.
+    /// List sessions, most recently used first.
     List,
     /// Export a session as markdown.
     Export { id: String },
@@ -108,6 +126,7 @@ async fn main() {
     let code = match &cli.cmd {
         None => tui_main().await,
         Some(Command::Run { .. }) => run_headless(cli).await,
+        Some(Command::Resume { .. }) => run_resume(cli).await,
         Some(Command::Sessions { cmd }) => sessions_cmd(cmd),
         Some(Command::Config { cmd }) => config_cmd(cmd),
         Some(Command::Doctor { connect }) => doctor(*connect),
@@ -180,7 +199,39 @@ async fn run_headless(cli: Cli) -> i32 {
     else {
         return 64;
     };
-    let text = match (prompt, prompt_file) {
+    // Same prompt handling as `resume`; the only difference is a fresh session.
+    run_session(
+        None,
+        prompt.clone(),
+        prompt_file.clone(),
+        model.clone(),
+        cwd.clone(),
+        output.clone(),
+        effort.clone(),
+        *ultraloop,
+        supervisor_model.clone(),
+        *ultraloop_limit,
+    )
+    .await
+}
+
+/// Shared headless implementation: `None` starts a session, `Some(id)` resumes it.
+/// Everything else — prompt files, model overrides, printing, exit codes — is
+/// identical, so `loom resume` cannot drift from `loom run`.
+#[allow(clippy::too_many_arguments)]
+async fn run_session(
+    session: Option<loon_events::EvId>,
+    prompt: Option<String>,
+    prompt_file: Option<PathBuf>,
+    model: Option<String>,
+    cwd: Option<PathBuf>,
+    output: Option<String>,
+    effort: Option<String>,
+    ultraloop: bool,
+    supervisor_model: Option<String>,
+    ultraloop_limit: u32,
+) -> i32 {
+    let text = match (&prompt, &prompt_file) {
         (Some(p), None) => p.clone(),
         (None, Some(f)) => match std::fs::read_to_string(f) {
             Ok(t) => t,
@@ -258,23 +309,33 @@ async fn run_headless(cli: Cli) -> i32 {
         Some(loop_registry.clone()),
     )
     .with_extra(mcp_tools);
-    let mut agent =
-        match Agent::new_session(&paths, agent_cfg, registry.clone(), tools, workspace, true) {
-            Ok(mut a) => {
-                a.loops = loop_registry.clone();
-                a
-            }
+    let mut agent = match session {
+        Some(id) => match Agent::resume(&paths, id, agent_cfg, registry.clone(), tools) {
+            Ok(a) => a,
             Err(e) => {
-                eprintln!("loon: session: {e}");
+                eprintln!("loon: resume: {e}");
                 return 1;
             }
-        };
+        },
+        None => {
+            match Agent::new_session(&paths, agent_cfg, registry.clone(), tools, workspace, true) {
+                Ok(mut a) => {
+                    a.loops = loop_registry.clone();
+                    a
+                }
+                Err(e) => {
+                    eprintln!("loon: session: {e}");
+                    return 1;
+                }
+            }
+        }
+    };
 
     if let Some(effort) = effort {
         agent.effort = Some(effort.clone());
     }
-    if *ultraloop {
-        if let Some(model) = supervisor_model {
+    if ultraloop {
+        if let Some(model) = &supervisor_model {
             if let Err(e) = agent.registry.resolve(model) {
                 eprintln!("supervisor model: {e}");
                 return 64;
@@ -285,7 +346,7 @@ async fn run_headless(cli: Cli) -> i32 {
             s.ultraloop = true;
             s.goal = Some(text.clone());
             s.supervisor_model = supervisor_model.clone();
-            s.ultraloop_limit = *ultraloop_limit;
+            s.ultraloop_limit = ultraloop_limit;
             Ok(())
         }) {
             eprintln!("ultraloop: {e}");
@@ -380,8 +441,73 @@ async fn run_headless(cli: Cli) -> i32 {
     }
 }
 
-/// Effective context window for a model reference: the model def's window, a combo's
-/// minimum across members, or a conservative 128k default when unknown.
+/// Continue a saved session headlessly: `/resume`, for scripts and CI.
+async fn run_resume(cli: Cli) -> i32 {
+    let Some(Command::Resume {
+        id,
+        prompt,
+        prompt_file,
+        model,
+        output,
+        effort,
+    }) = &cli.cmd
+    else {
+        return 64;
+    };
+    let session = match resolve_prefix(id) {
+        Ok(s) => s,
+        Err(code) => return code,
+    };
+    // Reuse the run path: same prompt handling, same printing, same exit codes.
+    // The only difference is opening the session instead of starting a new one.
+    run_session(
+        Some(session),
+        prompt.clone(),
+        prompt_file.clone(),
+        model.clone(),
+        None,
+        output.clone(),
+        effort.clone(),
+        false,
+        None,
+        0,
+    )
+    .await
+}
+
+/// Resolve a full session id or a unique prefix, with the same semantics as the
+/// `/resume` and `/delete` pickers: an unknown id names itself, and an ambiguous
+/// prefix lists the candidates instead of guessing.
+fn resolve_prefix(want: &str) -> Result<loon_events::EvId, i32> {
+    let paths = LoonPaths::resolve();
+    let store = match loon_core::open_store(&paths) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("loon: store: {e}");
+            return Err(1);
+        }
+    };
+    let list = loon_events::list_all_sessions(&store, &paths.sessions_dir()).unwrap_or_default();
+    let hits: Vec<_> = list
+        .iter()
+        .filter(|m| m.id.to_string().starts_with(want))
+        .collect();
+    match hits.as_slice() {
+        [meta] => Ok(meta.id),
+        [] => {
+            eprintln!("loon: no session {want} (it may have been deleted, or never had a message)");
+            Err(1)
+        }
+        _ => {
+            eprintln!("loon: `{want}` matches {} sessions:", hits.len());
+            for m in hits.iter().take(10) {
+                eprintln!("  {} · {}", m.id, m.title);
+            }
+            Err(1)
+        }
+    }
+}
+
 fn effective_context_window(cfg: &loon_config::Config, model_ref: &str) -> u64 {
     if let Some(window) = cfg.session.context_window {
         return window;
@@ -480,11 +606,21 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
                 println!("no sessions yet");
                 return 0;
             }
-            println!("{:<38} {:<20} {:<10} TITLE", "SESSION", "CREATED", "CWD");
+            // Last activity leads: the list is ordered by it, so showing creation time
+            // would look like a broken sort. `LAST USED` equals `CREATED` for a session
+            // that has only just been made.
+            println!(
+                "{:<38} {:<20} {:<20} {:<10} TITLE",
+                "SESSION", "LAST USED", "CREATED", "CWD"
+            );
             for s in &list {
+                let used = chrono_fmt(s.updated_ms);
                 let created = chrono_fmt(s.created_ms);
                 let cwd = s.cwd.chars().take(10).collect::<String>();
-                println!("{:<38} {:<20} {:<10} {}", s.id, created, cwd, s.title);
+                println!(
+                    "{:<38} {:<20} {:<20} {:<10} {}",
+                    s.id, used, created, cwd, s.title
+                );
             }
             0
         }

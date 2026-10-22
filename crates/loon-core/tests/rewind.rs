@@ -362,14 +362,7 @@ fn nothing_to_undo_is_a_clean_error() {
     let id = loon_events::model::EvId::now_v7();
     let j = Journal::create_default(
         &store,
-        &loon_events::journal::SessionMeta {
-            id,
-            title: "t".into(),
-            created_ms: 0,
-            cwd: "/".into(),
-            schema_version: 1,
-            headless: true,
-        },
+        &loon_events::journal::SessionMeta::fresh(id, "t", 0, "/", true),
     )
     .unwrap();
     let ws = loon_workspace::Workspace::new(tmp.path(), vec![]).unwrap();

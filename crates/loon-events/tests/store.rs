@@ -13,14 +13,7 @@ fn tmp() -> (Option<tempfile::TempDir>, std::path::PathBuf) {
 }
 
 fn meta(id: EvId) -> SessionMeta {
-    SessionMeta {
-        id,
-        title: "t".into(),
-        created_ms: 0,
-        cwd: "/tmp".into(),
-        schema_version: 1,
-        headless: false,
-    }
+    SessionMeta::fresh(id, "t", 0, "/tmp", false)
 }
 
 #[test]
@@ -175,4 +168,143 @@ fn legacy_and_db_sessions_list_together() {
     assert!(ja.is_db());
     assert!(!jb.is_db());
     assert_eq!(jb.session_id(), b);
+}
+
+/// Regression: resume listed sessions by creation time, so the session you had just
+/// messaged sank below any session created after it. Ordering is by last activity.
+#[test]
+fn sessions_list_by_last_activity_not_creation() {
+    let (_d, path) = tmp();
+    let store = Store::open(&path).unwrap();
+    let first = EvId::now_v7();
+    let second = EvId::now_v7();
+    store.create_session(&meta(first)).unwrap();
+    store.create_session(&meta(second)).unwrap();
+    // `second` is newer by creation, so it leads before anyone writes.
+    let order: Vec<EvId> = store
+        .list_sessions()
+        .unwrap()
+        .iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(order, vec![second, first], "newest created first");
+
+    // Now use `first`: it must jump above `second`.
+    store
+        .append(first, None, &EventKind::UserMessage { text: "hi".into() })
+        .unwrap();
+    let order: Vec<EvId> = store
+        .list_sessions()
+        .unwrap()
+        .iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        order,
+        vec![first, second],
+        "the session that was messaged moves to the top"
+    );
+
+    // Using `second` moves it back above.
+    store
+        .append(second, None, &EventKind::UserMessage { text: "hi".into() })
+        .unwrap();
+    let order: Vec<EvId> = store
+        .list_sessions()
+        .unwrap()
+        .iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(order, vec![second, first], "the most recent message wins");
+}
+
+/// `updated_ms` is exposed so callers can show "last used" without reading events.
+#[test]
+fn session_meta_reports_last_activity() {
+    let (_d, path) = tmp();
+    let store = Store::open(&path).unwrap();
+    let id = EvId::now_v7();
+    store.create_session(&meta(id)).unwrap();
+    let before = store.session_meta(id).unwrap().unwrap();
+    assert_eq!(
+        before.updated_ms, before.created_ms,
+        "fresh: no activity yet"
+    );
+    store
+        .append(id, None, &EventKind::UserMessage { text: "hi".into() })
+        .unwrap();
+    let after = store.session_meta(id).unwrap().unwrap();
+    assert!(
+        after.updated_ms > before.updated_ms,
+        "appending advances the activity stamp"
+    );
+}
+
+/// A database written before the activity column existed must order correctly right
+/// after the upgrade, not only after each session's next message.
+#[test]
+fn upgrade_backfills_activity_from_existing_events() {
+    let (_d, path) = tmp();
+    // Build a v1 database by hand: the sessions table without `updated_ms`.
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_ms INTEGER NOT NULL);
+             CREATE TABLE sessions (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL, created_ms INTEGER NOT NULL,
+                cwd TEXT NOT NULL, schema_version INTEGER NOT NULL, headless INTEGER NOT NULL
+             );
+             CREATE TABLE events (
+                id TEXT PRIMARY KEY, session TEXT NOT NULL REFERENCES sessions(id),
+                parent TEXT, seq INTEGER NOT NULL, ts_ms INTEGER NOT NULL, kind TEXT NOT NULL,
+                UNIQUE(session, seq)
+             );
+             INSERT INTO schema_migrations(version, applied_ms) VALUES (1, 0);",
+        )
+        .unwrap();
+        let old = EvId::now_v7();
+        let recent = EvId::now_v7();
+        conn.execute(
+            "INSERT INTO sessions(id,title,created_ms,cwd,schema_version,headless) VALUES (?1,'old',1,'/tmp',1,0)",
+            rusqlite::params![old.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions(id,title,created_ms,cwd,schema_version,headless) VALUES (?1,'recent',2,'/tmp',1,0)",
+            rusqlite::params![recent.to_string()],
+        )
+        .unwrap();
+        // `old` was created first but messaged last (higher ts).
+        conn.execute(
+            "INSERT INTO events(id,session,parent,seq,ts_ms,kind) VALUES ('e1',?1,NULL,1,50,'{\"kind\":\"user_message\",\"text\":\"x\"}')",
+            rusqlite::params![old.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events(id,session,parent,seq,ts_ms,kind) VALUES ('e2',?1,NULL,1,10,'{\"kind\":\"user_message\",\"text\":\"x\"}')",
+            rusqlite::params![recent.to_string()],
+        )
+        .unwrap();
+        // Remember the ids for the assertions below.
+        std::fs::write(path.with_extension("ids"), format!("{old}\n{recent}")).unwrap();
+    }
+    let ids = std::fs::read_to_string(path.with_extension("ids")).unwrap();
+    let mut lines = ids.lines();
+    let old = EvId::parse_str(lines.next().unwrap()).unwrap();
+    let recent = EvId::parse_str(lines.next().unwrap()).unwrap();
+
+    // Opening the store applies the v2 migration.
+    let store = Store::open(&path).unwrap();
+    let order: Vec<EvId> = store
+        .list_sessions()
+        .unwrap()
+        .iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        order,
+        vec![old, recent],
+        "the backfill must use event timestamps, not creation order"
+    );
+    assert_eq!(store.session_meta(old).unwrap().unwrap().updated_ms, 50);
 }

@@ -993,15 +993,17 @@ impl Agent {
                         });
                         return Ok(String::new());
                     }
-                    let mut out =
-                        String::from("sessions (newest first — /resume <n> to switch):\n");
+                    let mut out = String::from(
+                        "sessions (most recently used first — /resume <n> to switch):\n",
+                    );
                     for (i, meta) in sessions.iter().take(10).enumerate() {
                         out.push_str(&format!(
-                            "  {}: {} · {} · {}\n",
+                            "  {}: {} · {} · {} · {}\n",
                             i + 1,
                             &meta.id.to_string()[..8],
                             meta.title,
-                            meta.cwd
+                            meta.cwd,
+                            crate::worklog::relative_time(meta.updated_ms)
                         ));
                     }
                     return Ok(out);

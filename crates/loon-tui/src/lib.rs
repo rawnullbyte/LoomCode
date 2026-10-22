@@ -626,7 +626,9 @@ impl App {
             .iter()
             .rposition(|b| matches!(b, Block::Tool { pending: true, name: n, .. } if n == name))
         {
-            let first_lines: String = excerpt.lines().take(3).collect::<Vec<_>>().join(" ⏎ ");
+            // Keep enough of the result to show a real diff hunk; a three-line cap
+            // would cut every edit to a header and one line.
+            let first_lines: String = excerpt.lines().take(40).collect::<Vec<_>>().join(" ⏎ ");
             let (detail, elapsed) = match &self.blocks[pos] {
                 Block::Tool {
                     detail, started, ..

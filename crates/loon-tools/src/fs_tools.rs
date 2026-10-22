@@ -142,10 +142,15 @@ impl Tool for WriteTool {
         Ok(ToolOutput {
             ok: true,
             text: format!(
-                "wrote {} ({} bytes) {}",
+                "wrote {} ({} bytes) {}{}",
                 p.display(),
                 content.len(),
-                hash_note(&rec)
+                hash_note(&rec),
+                change_diff(
+                    &file_label(&p),
+                    prior.as_deref().and_then(|b| std::str::from_utf8(b).ok()),
+                    content
+                )
             ),
             full: None,
             truncated: false,
@@ -347,7 +352,7 @@ async fn run_edit(args: Value, ctx: &ToolCtx, multi: bool) -> Result<ToolOutput,
     Ok(ToolOutput {
         ok: true,
         text: format!(
-            "edited {}{} {}",
+            "edited {}{} {}{}",
             p.display(),
             if replace_all {
                 " (replace_all)"
@@ -356,7 +361,8 @@ async fn run_edit(args: Value, ctx: &ToolCtx, multi: bool) -> Result<ToolOutput,
             } else {
                 " (whitespace-normalized match)"
             },
-            hash_note(&rec)
+            hash_note(&rec),
+            change_diff(&file_label(&p), Some(&text), &next)
         ),
         full: None,
         truncated: false,
@@ -366,6 +372,26 @@ async fn run_edit(args: Value, ctx: &ToolCtx, multi: bool) -> Result<ToolOutput,
             after_blob,
         ),
     })
+}
+
+/// The change, rendered as a bounded unified diff for the transcript.
+///
+/// A mutation that only reports "edited <path>" makes the user open the file to learn
+/// what happened. The diff is clipped by [`crate::diff::MAX_DIFF_LINES`], so a large
+/// rewrite cannot flood the chat; the clip is stated rather than silently truncated.
+/// Short name used as the diff label (the full path is already in the message).
+fn file_label(p: &std::path::Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| p.display().to_string())
+}
+
+fn change_diff(label: &str, before: Option<&str>, after: &str) -> String {
+    let before = before.unwrap_or("");
+    match crate::diff::unified(label, before, after) {
+        Some(diff) => format!("\n{diff}"),
+        None => String::new(),
+    }
 }
 
 fn matched_exact_span(text: &str, old: &str) -> bool {
@@ -494,9 +520,10 @@ impl Tool for MultiEditTool {
         Ok(ToolOutput {
             ok: true,
             text: format!(
-                "multi_edit: {applied} replacement(s) applied to {} {}",
+                "multi_edit: {applied} replacement(s) applied to {} {}{}",
                 p.display(),
-                hash_note(&rec)
+                hash_note(&rec),
+                change_diff(&file_label(&p), std::str::from_utf8(&bytes).ok(), &text)
             ),
             full: None,
             truncated: false,
@@ -544,5 +571,31 @@ mod tests {
     fn apply_all_replaces_every_occurrence() {
         let (out, _) = apply_one("a-b-a", "a", "z", true).unwrap();
         assert_eq!(out, "z-b-z");
+    }
+}
+
+#[cfg(test)]
+mod diff_output_tests {
+    use super::*;
+
+    #[test]
+    fn an_edit_result_includes_the_change() {
+        // The transcript shows tool output verbatim, so the diff has to be part of the
+        // tool's own result — not reconstructed by the UI.
+        let d = change_diff("a.rs", Some("one\ntwo\n"), "one\nTWO\n");
+        assert!(d.contains("--- a.rs"), "{d}");
+        assert!(d.contains("-two"), "{d}");
+        assert!(d.contains("+TWO"), "{d}");
+    }
+
+    #[test]
+    fn an_unchanged_write_adds_no_diff() {
+        assert_eq!(change_diff("a.rs", Some("same\n"), "same\n"), "");
+    }
+
+    #[test]
+    fn a_new_file_shows_every_line_as_an_addition() {
+        let d = change_diff("new.rs", None, "fn main() {}\n");
+        assert!(d.contains("+fn main() {}"), "{d}");
     }
 }
