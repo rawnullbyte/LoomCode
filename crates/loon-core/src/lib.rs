@@ -881,7 +881,6 @@ impl Agent {
         self.apply_live_commands();
     }
 
-    /// Rebuild an agent over an existing session (resume). Replays journal into history.
     /// The working directory a session was started in, as recorded by its
     /// `SessionStarted` event. Resuming must run tools in that directory, not in
     /// whichever directory the user happens to invoke `loom` from.
@@ -894,6 +893,7 @@ impl Agent {
         })
     }
 
+    /// Rebuild an agent over an existing session (resume). Replays journal into history.
     pub fn resume(
         paths: &LoonPaths,
         session_id: loon_events::EvId,

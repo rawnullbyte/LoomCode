@@ -273,11 +273,11 @@ async fn run_session(
         Some(id) => loon_core::Agent::session_cwd(&paths, id),
         None => None,
     };
-    let from_session = resumed_cwd.is_some();
-    let workspace = cwd
-        .clone()
-        .or(resumed_cwd)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let (workspace, from_session) = resolve_workspace(
+        cwd.clone(),
+        resumed_cwd,
+        std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    );
     if !workspace.is_dir() {
         // Name the real source: on `resume` the directory comes from the session, so
         // blaming a `--cwd` flag the user never typed sends them looking for one.
@@ -750,6 +750,22 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
     }
 }
 
+/// Which directory a session runs in, in precedence order: an explicit `--cwd`,
+/// then the directory a resumed session was started in, then the invocation
+/// directory. The second element reports whether the session's own directory won,
+/// so the error path can name the real source instead of blaming a flag.
+fn resolve_workspace(
+    explicit: Option<PathBuf>,
+    resumed: Option<PathBuf>,
+    invocation: PathBuf,
+) -> (PathBuf, bool) {
+    match (explicit, resumed) {
+        (Some(c), _) => (c, false),
+        (None, Some(r)) => (r, true),
+        (None, None) => (invocation, false),
+    }
+}
+
 /// Collapse any whitespace run to a single space so stored text cannot forge
 /// extra rows in a one-line-per-record listing.
 fn one_line(text: &str) -> String {
@@ -934,5 +950,49 @@ fn doctor(connect: bool) -> i32 {
         0
     } else {
         1
+    }
+}
+
+#[cfg(test)]
+mod workspace_tests {
+    use super::resolve_workspace;
+    use std::path::PathBuf;
+
+    /// Precedence: --cwd, then the resumed session's own directory, then the
+    /// invocation directory. Getting this backwards silently reopens the wrong
+    /// project, so each arm is pinned.
+    #[test]
+    fn explicit_cwd_wins_over_the_session() {
+        let (dir, from_session) = resolve_workspace(
+            Some(PathBuf::from("/explicit")),
+            Some(PathBuf::from("/session")),
+            PathBuf::from("/invoked"),
+        );
+        assert_eq!(dir, PathBuf::from("/explicit"));
+        assert!(
+            !from_session,
+            "an explicit --cwd must not be reported as coming from the session"
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_uses_its_own_directory() {
+        let (dir, from_session) = resolve_workspace(
+            None,
+            Some(PathBuf::from("/session")),
+            PathBuf::from("/invoked"),
+        );
+        assert_eq!(dir, PathBuf::from("/session"));
+        assert!(
+            from_session,
+            "the error path relies on this to avoid blaming --cwd"
+        );
+    }
+
+    #[test]
+    fn a_fresh_session_uses_the_invocation_directory() {
+        let (dir, from_session) = resolve_workspace(None, None, PathBuf::from("/invoked"));
+        assert_eq!(dir, PathBuf::from("/invoked"));
+        assert!(!from_session);
     }
 }

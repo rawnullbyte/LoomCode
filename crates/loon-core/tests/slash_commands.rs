@@ -501,3 +501,38 @@ async fn resume_listing_flattens_a_stored_multiline_title() {
         "the title should appear flattened, got: {out:?}"
     );
 }
+
+/// `Agent::session_cwd` is what makes `resume` root its tools in the session's own
+/// directory. It must report the recorded workspace, and must not invent one for an
+/// unknown session or for a session that recorded no directory.
+#[tokio::test]
+async fn session_cwd_reports_the_recorded_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut a = agent(tmp.path(), &ws);
+    let id = a.session_id();
+
+    // A pending session has no journal yet, so there is nothing to report.
+    assert_eq!(
+        Agent::session_cwd(&test_paths(tmp.path()), id),
+        None,
+        "a session with no journal must not claim a workspace"
+    );
+
+    a.run_turn("hello").await;
+
+    assert_eq!(
+        Agent::session_cwd(&test_paths(tmp.path()), id),
+        Some(ws.clone()),
+        "the recorded workspace must come back verbatim"
+    );
+    assert_eq!(
+        Agent::session_cwd(
+            &test_paths(tmp.path()),
+            "01a164c1-0000-7000-8000-000000000000".parse().unwrap()
+        ),
+        None,
+        "an unknown session must not report a workspace"
+    );
+}
