@@ -208,12 +208,15 @@ pub fn highlight(line: &str, lang: Lang) -> Vec<Piece> {
         };
     }
 
+    // Comment markers are fixed ASCII prefixes; precompute them as chars so the check
+    // below is an in-place slice comparison. `starts_with` on a `&str` slice would
+    // re-materialize the rest of the line on every character (that was quadratic);
+    // a char-slice prefix test is constant work.
+    let comment: Option<Vec<char>> = lang.comment().map(|m| m.chars().collect());
     while i < chars.len() {
-        let rest: String = chars[i..].iter().collect();
-
         // A comment runs to end of line.
-        if let Some(marker) = lang.comment() {
-            if rest.starts_with(marker) {
+        if let Some(marker) = comment.as_ref() {
+            if chars.len() - i >= marker.len() && chars[i..i + marker.len()] == marker[..] {
                 flush!();
                 let text: String = chars[i..].iter().collect();
                 out.push((text, comment_style()));
@@ -431,5 +434,28 @@ mod tests {
         assert_eq!(Lang::from_tag("toml"), Lang::Toml);
         assert_eq!(Lang::from_tag(""), Lang::Plain);
         assert_eq!(Lang::from_tag("brainfuck"), Lang::Plain);
+    }
+}
+
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+
+    /// `highlight` runs for every visible code row on every frame, so it must stay
+    /// linear. It allocated a fresh `String` of the remaining line on every character
+    /// to test for a comment prefix — quadratic, and enough to stall a large read.
+    #[test]
+    fn highlighting_a_long_line_stays_fast() {
+        let line = "let x = 1; ".repeat(400); // ~4400 chars
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            let pieces = highlight(&line, Lang::Rust);
+            assert!(!pieces.is_empty());
+        }
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "highlighting 20 x 4.4k chars took {elapsed:?}; it must stay linear"
+        );
     }
 }

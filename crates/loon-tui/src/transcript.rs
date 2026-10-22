@@ -1506,3 +1506,94 @@ mod gutter_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod gutter_false_positive_tests {
+
+    fn excerpt_app(tool: &str, detail: &str, excerpt: &str) -> crate::App {
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        app.show_tool_details = true;
+        app.push_block(crate::Block::Tool {
+            name: tool.into(),
+            ok: true,
+            excerpt: excerpt.into(),
+            pending: false,
+            detail: detail.into(),
+            started: None,
+            elapsed: None,
+        });
+        app
+    }
+
+    fn row_for(app: &crate::App, needle: &str) -> Option<String> {
+        app.transcript_rows(90).iter().find_map(|r| {
+            let t: String = r.line.spans.iter().map(|s| s.content.as_ref()).collect();
+            t.contains(needle).then_some(t)
+        })
+    }
+
+    /// `split_gutter` sniffs "spaces, digits, spaces" from the front of a line. Only the
+    /// `read` family actually emits a line-number gutter, so other tools' output that
+    /// happens to start with a number must keep every character.
+    #[test]
+    fn non_read_tool_output_starting_with_a_number_keeps_its_leading_digits() {
+        // bash output of a numbered list: no gutter exists here.
+        let app = excerpt_app("bash", "$ cat list.txt", "  1  first item");
+        let row = row_for(&app, "first item").expect("row must render");
+        assert!(
+            row.contains("1"),
+            "the leading number is content, not a gutter, and must survive: {row:?}"
+        );
+    }
+
+    /// A wrapped continuation row must never be mistaken for a gutter. The split runs on
+    /// the logical line before wrapping, so a continuation that begins with a number is
+    /// untouched.
+    #[test]
+    fn a_wrapped_continuation_starting_with_a_number_is_not_a_gutter() {
+        let long = format!("{}  2  continued", "x".repeat(40));
+        let app = excerpt_app("read", "src/lib.rs", &long);
+        let rows = app.transcript_rows(40);
+        let text: String = rows
+            .iter()
+            .map(|r| {
+                r.line
+                    .spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            text.contains("2") && text.contains("continued"),
+            "a continuation row keeps its number and text: {text:?}"
+        );
+    }
+
+    /// `grep` output is `path:line: text`, and the `detail` is the pattern, not a path
+    /// with an extension — so it never gains a language and never reaches split_gutter
+    /// as code. Even if it did, the prefix is `path:`, not spaces and digits.
+    #[test]
+    fn grep_output_with_a_numeric_match_is_not_mistaken_for_a_gutter() {
+        let app = excerpt_app("grep", "TODO in src", "src/a.rs:7:     3 apples");
+        let row = row_for(&app, "apples").expect("row must render");
+        assert!(
+            row.contains("src/a.rs:7:") && row.contains("3 apples"),
+            "grep's own prefix and the matched text both survive: {row:?}"
+        );
+    }
+
+    /// A read of a file that itself contains a numbered list: the tool gutter is the
+    /// 6-wide field, and the list number inside the content is content.
+    #[test]
+    fn a_numbered_list_inside_a_read_file_keeps_its_own_number() {
+        let app = excerpt_app("read", "notes.md", "     5\t  1  first item");
+        let row = row_for(&app, "first item").expect("row must render");
+        assert!(
+            row.contains("5") && row.contains("1"),
+            "both the gutter and the list number must be visible: {row:?}"
+        );
+    }
+}
