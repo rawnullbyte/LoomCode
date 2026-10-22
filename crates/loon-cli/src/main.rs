@@ -628,7 +628,14 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
                 let cwd = s.cwd.chars().take(10).collect::<String>();
                 println!(
                     "{:<38} {:<20} {:<20} {:<10} {}",
-                    s.id, used, created, cwd, s.title
+                    s.id,
+                    used,
+                    created,
+                    cwd,
+                    // Stored titles can predate the one-line rule (or come from
+                    // /rename), so the table flattens them too rather than letting a
+                    // newline forge an extra row.
+                    one_line(&s.title)
                 );
             }
             0
@@ -723,6 +730,12 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
             }
         }
     }
+}
+
+/// Collapse any whitespace run to a single space so stored text cannot forge
+/// extra rows in a one-line-per-record listing.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn chrono_fmt(ms: i64) -> String {

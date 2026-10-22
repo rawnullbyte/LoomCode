@@ -634,6 +634,12 @@ pub fn help_text() -> String {
     out
 }
 
+/// Titles are stored text and older rows may contain newlines; every surface that
+/// shows one is single-line, so collapse whitespace at render time too.
+fn one_line_title(title: &str) -> String {
+    title.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 impl Agent {
     /// Execute one slash command, returning a human-readable result block.
     /// `/quit` is handled by the caller (it owns the event loop).
@@ -988,7 +994,9 @@ impl Agent {
                         let items = sessions
                             .iter()
                             .map(|m| crate::catalog::MenuItem {
-                                label: m.title.clone(),
+                                // Stored titles can predate the one-line rule, and a
+                                // menu row is one line: flatten instead of trusting it.
+                                label: one_line_title(&m.title),
                                 // Same recency the text listing shows, so the picker
                                 // and `/resume` without a UI agree about the order.
                                 detail: format!(
@@ -1014,7 +1022,7 @@ impl Agent {
                             "  {}: {} · {} · {} · {}\n",
                             i + 1,
                             &meta.id.to_string()[..8],
-                            meta.title,
+                            one_line_title(&meta.title),
                             meta.cwd,
                             crate::worklog::relative_time(meta.updated_ms)
                         ));

@@ -970,13 +970,10 @@ impl Agent {
             self.record_hook_context(&hook.context);
         }
         // Auto-title: the first real prompt names the session (shows in /resume).
+        // Flattened to one line first: a multi-line prompt used to store its newlines,
+        // and `sessions list` then printed the remaining lines as phantom rows.
         if !self.titled.load(std::sync::atomic::Ordering::Relaxed) && !user_text.trim().is_empty() {
-            let title: String = user_text.trim().chars().take(60).collect();
-            let title = if user_text.trim().chars().count() > 60 {
-                format!("{title}…")
-            } else {
-                title
-            };
+            let title = excerpt_text(user_text, 60);
             let _ = self.journal.rename_session(&title);
             self.titled
                 .store(true, std::sync::atomic::Ordering::Relaxed);

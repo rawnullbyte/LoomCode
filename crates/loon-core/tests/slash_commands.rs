@@ -467,3 +467,37 @@ async fn resume_refuses_a_blank_selector_instead_of_matching_everything() {
         "a blank selector must not resume {other}"
     );
 }
+
+/// Titles stored before auto-titling flattened whitespace can still contain
+/// newlines. The `/resume` listing prints them, so it must flatten rather than
+/// let one title forge extra entries.
+#[tokio::test]
+async fn resume_listing_flattens_a_stored_multiline_title() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut a = agent(tmp.path(), &ws);
+
+    // Materialize the session, then write a legacy-style title straight into the
+    // journal, bypassing the parser.
+    a.run_turn("hello").await;
+    let paths = test_paths(tmp.path());
+    let store = loon_core::open_store(&paths).unwrap();
+    let journal = loon_events::Journal::open_default(&store, &paths.sessions_dir(), a.session_id())
+        .unwrap()
+        .0;
+    journal.rename_session("legacy\nsecond line").unwrap();
+
+    let out = a
+        .run_slash(SlashCommand::Resume { target: None })
+        .await
+        .unwrap();
+    assert!(
+        !out.contains("second line\n"),
+        "a stored newline must not become its own line, got: {out:?}"
+    );
+    assert!(
+        out.contains("legacy second line"),
+        "the title should appear flattened, got: {out:?}"
+    );
+}

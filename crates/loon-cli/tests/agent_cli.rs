@@ -445,3 +445,39 @@ fn delete_confirm_uses_the_resolved_ids_prefix_not_the_raw_argument() {
         "the session must actually be gone"
     );
 }
+
+/// A multi-line prompt auto-titles the session with its raw text, so a newline in
+/// the prompt used to emit a phantom row in `sessions list` — the second line looked
+/// like a session with no id. Titles are one line, everywhere they are shown.
+#[test]
+fn a_multiline_prompt_does_not_break_the_sessions_table() {
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    assert!(loom()
+        .args(["run", "first line\nsecond line\nthird line"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let out = loom().args(["sessions", "list"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let rows: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        rows.len(),
+        2,
+        "one header plus one session row, got: {text:?}"
+    );
+    assert!(
+        rows[1].contains("first line"),
+        "the title keeps its first words, got: {rows:1?}"
+    );
+    assert!(
+        !text.contains("second line\nthird line"),
+        "the rest of the prompt must not become table rows, got: {text:?}"
+    );
+}
