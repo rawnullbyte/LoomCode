@@ -272,6 +272,7 @@ arguments, environment and timeout. Saving server changes reconnects the live ca
 | `/sessions`, `/resume` | Search saved session titles, IDs and workspace paths |
 | `/resume ID_OR_PREFIX`, `/resume N` | Restore a session and its transcript; ambiguous prefixes are refused |
 | `/new`, `/clear`, `/rename TITLE` | Start a saved session (`/clear` is an alias) or name the current one |
+| `/delete ID_OR_PREFIX`, `/delete N` | Delete a saved session and its journal; the session you are in is refused |
 | `/todos` | Browse/add/edit tasks and change pending, in-progress, completed or blocked state |
 | `/todos add TEXT`, `/todos start N`, `/todos done N` | Manage a plan directly |
 | `/notes` | Browse/add/edit/remove durable session working notes |
@@ -286,6 +287,23 @@ Plans, notes, the goal, selected model and effort are stored separately from the
 transcript. A bounded working-state excerpt is included in every request. Compaction
 preserves recent exchanges, can shorten a long tool-heavy turn, and retains original history
 if summarization fails, is empty, fails to shrink it or cannot be journaled.
+
+Sessions are created by their first message, not when Loom starts: opening the app and
+quitting without sending anything leaves nothing behind in `/resume`. Work state follows the
+session the same way, so a message-less session cannot leave an orphaned plan or notes file.
+
+From the shell, the same journal is inspectable without the TUI:
+
+```sh
+loom sessions list                     # newest first, with title and workspace
+loom sessions export ID                # every event of one session as a list
+loom sessions delete ID                # asks you to type the id prefix to confirm
+loom sessions delete ID --force        # no prompt (scripts)
+```
+
+Deleting removes the session row and its events in one transaction. An unknown id is
+reported by name rather than as a file-system error, and the session you are currently in
+cannot be deleted.
 
 There are **26 embedded coding workflows**, available without installing files:
 `/implement`, `/debug`, `/review`, `/handoff`, `/refactor`, `/test`, `/optimize`, `/audit`,

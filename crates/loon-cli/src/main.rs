@@ -198,6 +198,10 @@ async fn run_headless(cli: Cli) -> i32 {
             return 64;
         }
     };
+    if text.trim().is_empty() {
+        eprintln!("loon: refusing an empty prompt — nothing to do");
+        return 64;
+    }
 
     let (paths, mut cfg) = match load_env() {
         Ok(x) => x,

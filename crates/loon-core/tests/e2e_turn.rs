@@ -560,3 +560,44 @@ async fn a_failed_journal_write_ends_the_turn_instead_of_panicking() {
         other => panic!("expected a failed turn, got {other:?}"),
     }
 }
+
+/// Regression: an empty or whitespace-only prompt must not create a session. It used to
+/// journal a UserMessage with no text, leaving a `title = "session"` phantom entry in
+/// `/resume` with nothing in it.
+#[tokio::test]
+async fn an_empty_prompt_creates_no_session() {
+    for prompt in ["", "   ", "\n\t "] {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path().join("proj");
+        std::fs::create_dir_all(&ws).unwrap();
+        let paths = test_paths(tmp.path());
+        paths.ensure().unwrap();
+        let registry = Arc::new(ProviderRegistry::with_mock(
+            loon_providers::MockProvider::with_scripts(vec![MockScript::text("unused")]),
+        ));
+        let mut agent = Agent::new_session(
+            &paths,
+            agent_cfg("mock"),
+            registry,
+            ToolRegistry::standard(),
+            ws,
+            false,
+        )
+        .unwrap();
+        let result = agent.run_turn(prompt).await;
+        assert!(
+            matches!(result.status, loon_core::TurnStatus::Failed(_)),
+            "an empty prompt must fail, got {:?}",
+            result.status
+        );
+        assert!(
+            agent.journal.is_pending(),
+            "the session must stay unwritten"
+        );
+        let store = loon_core::open_store(&paths).unwrap();
+        assert!(
+            store.list_sessions().unwrap().is_empty(),
+            "no session may be listed after an empty prompt ({prompt:?})"
+        );
+    }
+}

@@ -921,7 +921,19 @@ impl Agent {
     }
 
     /// Run one user turn to completion, journaling everything.
+    ///
+    /// An empty or whitespace-only prompt is refused up front: journaling it would create
+    /// a session with no user message and a placeholder title, which then shows up in
+    /// `/resume` as a phantom entry.
     pub async fn run_turn(&mut self, user_text: &str) -> TurnResult {
+        if user_text.trim().is_empty() {
+            return TurnResult {
+                status: TurnStatus::Failed("empty prompt; nothing to do".into()),
+                assistant_text: String::new(),
+                steps: 0,
+                usage: Usage::default(),
+            };
+        }
         self.system_prompt = prompt::system_prompt_with_memory(
             self.ctx.ws.root(),
             &memory::MemoryPaths::resolve(&self.data_dir, self.ctx.ws.root()),

@@ -97,3 +97,31 @@ fn sessions_delete_removes_the_session_and_refuses_unknown_ids() {
         "the session must be gone"
     );
 }
+
+#[test]
+fn an_empty_prompt_is_refused_and_creates_no_session() {
+    use std::process::Command;
+    for args in [vec!["run", ""], vec!["run", "   "]] {
+        let home = tempfile::tempdir().unwrap();
+        let out = Command::new(env!("CARGO_BIN_EXE_loom"))
+            .env("LOON_HOME", home.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(64), "usage error for {args:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("empty prompt"),
+            "the reason must be explicit, got: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let list = Command::new(env!("CARGO_BIN_EXE_loom"))
+            .env("LOON_HOME", home.path())
+            .args(["sessions", "list"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&list.stdout).contains("no sessions yet"),
+            "an empty prompt must not create a session"
+        );
+    }
+}
