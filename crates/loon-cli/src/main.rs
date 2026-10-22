@@ -201,6 +201,7 @@ async fn run_headless(cli: Cli) -> i32 {
     };
     // Same prompt handling as `resume`; the only difference is a fresh session.
     run_session(
+        "run",
         None,
         prompt.clone(),
         prompt_file.clone(),
@@ -220,6 +221,7 @@ async fn run_headless(cli: Cli) -> i32 {
 /// identical, so `loom resume` cannot drift from `loom run`.
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
+    command: &str,
     session: Option<loon_events::EvId>,
     prompt: Option<String>,
     prompt_file: Option<PathBuf>,
@@ -245,7 +247,7 @@ async fn run_session(
             return 64;
         }
         (None, None) => {
-            eprintln!("loon: `loon run` needs a prompt or --prompt-file");
+            eprintln!("loon: `loon {command}` needs a prompt or --prompt-file");
             return 64;
         }
     };
@@ -461,6 +463,7 @@ async fn run_resume(cli: Cli) -> i32 {
     // Reuse the run path: same prompt handling, same printing, same exit codes.
     // The only difference is opening the session instead of starting a new one.
     run_session(
+        "resume",
         Some(session),
         prompt.clone(),
         prompt_file.clone(),

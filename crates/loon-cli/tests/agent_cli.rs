@@ -286,3 +286,46 @@ fn resume_refuses_an_empty_selector() {
         "still exactly one session: {text}"
     );
 }
+
+/// `resume` shares `run`'s implementation, so its usage errors must name the command
+/// the user actually typed — not the sibling.
+#[test]
+fn resume_usage_errors_name_resume_not_run() {
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    assert!(loom()
+        .args(["run", "seed"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let list = loom().args(["sessions", "list"]).output().unwrap();
+    let id = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().next().map(str::to_string))
+        .expect("one session exists");
+
+    let no_prompt = loom().args(["resume", &id]).output().unwrap();
+    assert_eq!(no_prompt.status.code(), Some(64));
+    let err = String::from_utf8_lossy(&no_prompt.stderr);
+    assert!(
+        err.contains("loon resume"),
+        "a resume usage error must name resume, got: {err}"
+    );
+    assert!(
+        !err.contains("loon run"),
+        "it must not name the sibling command, got: {err}"
+    );
+
+    let run = loom().args(["run"]).output().unwrap();
+    assert_eq!(run.status.code(), Some(64));
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("loon run"),
+        "and run still names itself"
+    );
+}
