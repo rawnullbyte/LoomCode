@@ -1807,3 +1807,92 @@ mod narrow_width_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod copy_alignment_tests {
+    use super::*;
+
+    fn row(raw: &str, line: Line<'static>, prefix: usize) -> TranscriptRow {
+        TranscriptRow {
+            line,
+            raw: raw.into(),
+            prefix_cells: prefix,
+            soft: false,
+        }
+    }
+
+    /// Copying a selection must return exactly the characters painted in those cells.
+    /// A tab expands to several spaces on screen; if the copy mapped cells to the raw
+    /// text naively it would return the tab's neighbours instead.
+    #[test]
+    fn copying_a_selection_over_a_tab_returns_the_painted_text() {
+        let raw = "a\tbcd";
+        let painted = format!("a{}bcd", " ".repeat(3)); // tab at column 1 → 3 spaces
+        let r = row(raw, Line::styled(painted.clone(), theme::system_fg()), 0);
+        // Select the cells covering "b" and "c" (after the expanded tab).
+        let sel = crate::SelRange {
+            start_line: 0,
+            start_col: 4,
+            end_line: 0,
+            end_col: 6,
+        };
+        let copied = copy(&[r], sel);
+        assert_eq!(
+            copied, "bc",
+            "copying cells 4..6 of {painted:?} must yield the painted characters"
+        );
+    }
+
+    /// A prefix (the `❯ ` marker or an indent) is not part of the selectable text.
+    #[test]
+    fn the_row_prefix_is_excluded_from_the_copy() {
+        let r = row(
+            "hello",
+            Line::styled("❯ hello".to_string(), theme::system_fg()),
+            2,
+        );
+        let sel = crate::SelRange {
+            start_line: 0,
+            start_col: 2,
+            end_line: 0,
+            end_col: 7,
+        };
+        assert_eq!(copy(&[r], sel), "hello");
+    }
+}
+
+#[cfg(test)]
+mod copy_wide_tests {
+    use super::*;
+
+    /// A selection edge landing *inside* a 2-cell glyph: the copy must not emit half a
+    /// character (invalid UTF-8) nor drop the glyph from a selection that visually
+    /// covers it.
+    #[test]
+    fn a_selection_edge_inside_a_wide_glyph_is_handled() {
+        let raw = "a日b";
+        let r = TranscriptRow {
+            line: Line::styled(raw.to_string(), theme::system_fg()),
+            raw: raw.into(),
+            prefix_cells: 0,
+            soft: false,
+        };
+        // Column 2 is the middle of `日` (it occupies cells 1..3).
+        let sel = crate::SelRange {
+            start_line: 0,
+            start_col: 2,
+            end_line: 0,
+            end_col: 4,
+        };
+        let copied = copy(&[r], sel);
+        assert!(
+            copied.chars().all(|c| c.is_ascii() || c == '日'),
+            "the copy must not contain a broken character: {copied:?}"
+        );
+        // Starting mid-glyph must not silently drop the glyph entirely.
+        assert!(
+            copied.contains('日'),
+            "a selection starting inside a wide glyph still includes it: {copied:?}"
+        );
+    }
+}
