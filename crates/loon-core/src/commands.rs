@@ -671,6 +671,39 @@ fn one_line_title(title: &str) -> String {
     title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Keep only the sessions started in `workspace`, most recently active first.
+///
+/// `/resume` used to list every session in the shared store, so a picker opened in one
+/// project offered sessions from unrelated directories — and `Agent::resume` adopts the
+/// *stored* cwd as the workspace root, so choosing one silently moved the agent out of
+/// the tree the user was working in. Scoping the listing to the current path keeps
+/// resume inside the workspace it was started from.
+///
+/// Matching is by path component, not string prefix: `/work/app` must not match a
+/// session from `/work/app-old`. Paths are normalised first, so a stored
+/// `/work/app/` and a current `/work/app/.` are the same workspace.
+fn sessions_in_workspace(
+    mut sessions: Vec<loon_events::SessionMeta>,
+    workspace: &std::path::Path,
+) -> Vec<loon_events::SessionMeta> {
+    sessions.retain(|meta| same_workspace(&meta.cwd, workspace));
+    sessions
+}
+
+/// True when a session's recorded cwd is the workspace directory itself.
+fn same_workspace(stored: &str, workspace: &std::path::Path) -> bool {
+    // The current root is canonical in practice, but resolve both so a symlinked or
+    // relative spelling does not hide the user's own sessions.
+    let current = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+    let recorded = std::path::Path::new(stored);
+    let recorded = recorded
+        .canonicalize()
+        .unwrap_or_else(|_| recorded.to_path_buf());
+    recorded == current
+}
+
 /// Shortest prefix of `id` that no other id in `all` shares, so a displayed id is
 /// always usable as a selector. Session ids are UUIDv7, whose leading 48 bits are a
 /// millisecond timestamp: ids created in the same instant share their first 24
@@ -695,6 +728,22 @@ fn unique_id_prefix(id: loon_events::EvId, all: &[loon_events::EvId]) -> String 
 }
 
 impl Agent {
+    /// What `/resume` says when this workspace has no sessions of its own. The count of
+    /// sessions elsewhere is named rather than hidden: "no sessions yet" would be a lie
+    /// when the store holds a dozen from other projects, and the user would have no idea
+    /// why the list is empty.
+    fn no_sessions_here_message(&self, elsewhere: usize) -> String {
+        let here = self.ctx.ws.root().display();
+        if elsewhere == 0 {
+            "no sessions yet".into()
+        } else {
+            format!(
+                "no sessions in {here} yet — {elsewhere} session(s) from other directories are \
+                 not listed here; run /resume from their workspace"
+            )
+        }
+    }
+
     /// Execute one slash command, returning a human-readable result block.
     /// `/quit` is handled by the caller (it owns the event loop).
     pub async fn run_slash(&mut self, cmd: SlashCommand) -> Result<String, String> {
@@ -1032,7 +1081,14 @@ impl Agent {
                 }
                 let paths = self.loon_paths();
                 let store = crate::open_store(&paths).map_err(|e| e.to_string())?;
-                let sessions = store.list_sessions().map_err(|e| e.to_string())?;
+                let all = store.list_sessions().map_err(|e| e.to_string())?;
+                // Resume is scoped to the workspace this agent runs in: sessions from
+                // other directories are not offered. Picking one used to move the agent
+                // into that session's cwd, so an unrelated project's session could
+                // silently take over the current tree.
+                let workspace = self.ctx.ws.root().to_path_buf();
+                let sessions = sessions_in_workspace(all.clone(), &workspace);
+                let elsewhere = all.len() - sessions.len();
                 // This session may still be pending (nothing sent yet). Asking to resume
                 // the session you are already in must succeed rather than reporting
                 // "no sessions yet" — but it must not force it to be written either.
@@ -1050,7 +1106,7 @@ impl Agent {
                     }
                 }
                 if sessions.is_empty() {
-                    return Ok("no sessions yet".into());
+                    return Ok(self.no_sessions_here_message(elsewhere));
                 }
                 let Some(target) = target else {
                     if self.events.is_some() {
@@ -1081,7 +1137,7 @@ impl Agent {
                         return Ok(String::new());
                     }
                     let mut out = String::from(
-                        "sessions (most recently used first — /resume <n> to switch):\n",
+                        "sessions here (most recently used first — /resume <n> to switch):\n",
                     );
                     for (i, meta) in sessions.iter().take(10).enumerate() {
                         out.push_str(&format!(
@@ -1096,6 +1152,12 @@ impl Agent {
                             crate::worklog::relative_time(meta.updated_ms)
                         ));
                     }
+                    if elsewhere > 0 {
+                        out.push_str(&format!(
+                            "({elsewhere} session(s) from other directories are hidden — \
+                             run /resume there to see them)\n"
+                        ));
+                    }
                     return Ok(out);
                 };
                 let picked = match target.parse::<usize>() {
@@ -1106,7 +1168,23 @@ impl Agent {
                             .filter(|s| s.id.to_string().starts_with(&target))
                             .collect();
                         if found.len() != 1 {
-                            return Err(format!("session id {target} is unknown or ambiguous"));
+                            // Distinguish "belongs to another workspace" from "unknown"
+                            // only when the prefix is unambiguous globally: a bare prefix
+                            // shared by several sessions (UUIDv7 ids created moments
+                            // apart) is still an ambiguity error, not a location hint.
+                            let foreign: Vec<_> = all
+                                .iter()
+                                .filter(|s| s.id.to_string().starts_with(&target))
+                                .collect();
+                            return Err(if foreign.len() == 1 && found.is_empty() {
+                                format!(
+                                    "session {target} belongs to another directory — resume it \
+                                     from {}",
+                                    foreign[0].cwd
+                                )
+                            } else {
+                                format!("session id {target} is unknown or ambiguous")
+                            });
                         }
                         found[0].id
                     }
@@ -1154,7 +1232,11 @@ impl Agent {
                 }
                 let paths = self.loon_paths();
                 let store = crate::open_store(&paths).map_err(|e| e.to_string())?;
-                let sessions = store.list_sessions().map_err(|e| e.to_string())?;
+                // Same scope as the /resume listing: an index must mean the row the user
+                // saw, and an id from another directory is reported as such rather than
+                // as a typo.
+                let all = store.list_sessions().map_err(|e| e.to_string())?;
+                let sessions = sessions_in_workspace(all, self.ctx.ws.root());
                 // Accept an index from the /resume listing or an id/prefix.
                 let picked = match target.parse::<usize>() {
                     Ok(n) if n >= 1 && n <= sessions.len() => sessions[n - 1].id,

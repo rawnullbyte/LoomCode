@@ -846,3 +846,163 @@ async fn a_listed_id_still_resumes_the_saved_session_while_a_pending_one_exists(
         "the displayed id must not be answered with the pending session"
     );
 }
+
+/// `/resume` must only offer sessions started in this workspace. Listing the shared
+/// store meant a picker opened in one project showed sessions from unrelated
+/// directories, and `Agent::resume` adopts the *stored* cwd as the workspace root —
+/// so picking one silently moved the agent out of the tree the user was working in.
+#[tokio::test]
+async fn resume_lists_only_sessions_from_this_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let here = tmp.path().join("proj");
+    let elsewhere = tmp.path().join("other-project");
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    // One real session in another directory, and one here.
+    let foreign = {
+        let mut b = agent(tmp.path(), &elsewhere);
+        b.run_turn("work in the other project").await;
+        b.session_id()
+    };
+    let mut a = agent(tmp.path(), &here);
+    a.run_turn("work in this project").await;
+    let mine = a.session_id();
+    a.run_slash(SlashCommand::New).await.unwrap();
+    let current = a.session_id();
+    assert_ne!(current, mine, "/new switches to a fresh session");
+
+    let listing = a
+        .run_slash(SlashCommand::Resume { target: None })
+        .await
+        .unwrap();
+    assert!(
+        listing.contains("work in this project"),
+        "this directory's session must be listed: {listing}"
+    );
+    assert!(
+        !listing.contains("work in the other project") && !listing.contains(&foreign.to_string()),
+        "a session from another directory must not be offered: {listing}"
+    );
+    assert!(
+        listing.contains("other directories"),
+        "the hidden count must be stated instead of silently dropping rows: {listing}"
+    );
+
+    // Selecting the foreign session by id is refused by name, not as a typo, and the
+    // agent stays in this workspace.
+    let err = a
+        .run_slash(SlashCommand::Resume {
+            target: Some(foreign.to_string()),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        err.contains("another directory") && err.contains(&elsewhere.display().to_string()),
+        "the refusal must name the owning directory, got: {err}"
+    );
+    assert_eq!(
+        a.session_id(),
+        current,
+        "a refused cross-directory resume must not switch sessions"
+    );
+    assert_eq!(
+        a.ctx.ws.root(),
+        here.canonicalize().unwrap(),
+        "the workspace root must not move to the other project"
+    );
+
+    // The session here is still resumable.
+    let out = a
+        .run_slash(SlashCommand::Resume {
+            target: Some(mine.to_string()),
+        })
+        .await
+        .unwrap();
+    assert!(out.contains(&mine.to_string()), "{out}");
+}
+
+/// An index is only meaningful against the listing the user actually saw, so
+/// `/resume 1` must pick this directory's session even when another directory's
+/// session is more recent and would sort first in the global list.
+#[tokio::test]
+async fn resume_numbers_follow_the_scoped_listing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let here = tmp.path().join("proj");
+    let elsewhere = tmp.path().join("other-project");
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    let mut a = agent(tmp.path(), &here);
+    a.run_turn("mine").await;
+    let mine = a.session_id();
+    a.run_slash(SlashCommand::New).await.unwrap();
+    // Created afterwards, so it is the most recent session globally.
+    let foreign = {
+        let mut b = agent(tmp.path(), &elsewhere);
+        b.run_turn("theirs").await;
+        b.session_id()
+    };
+
+    let out = a
+        .run_slash(SlashCommand::Resume {
+            target: Some("1".into()),
+        })
+        .await
+        .unwrap();
+    assert!(out.contains(&mine.to_string()), "{out}");
+    assert_eq!(
+        a.session_id(),
+        mine,
+        "index 1 must be the first row of the scoped listing, not {foreign}"
+    );
+}
+
+/// With nothing here but sessions elsewhere, the message must say so instead of
+/// claiming there are no sessions at all.
+#[tokio::test]
+async fn resume_says_when_sessions_exist_only_elsewhere() {
+    let tmp = tempfile::tempdir().unwrap();
+    let here = tmp.path().join("fresh");
+    let elsewhere = tmp.path().join("other-project");
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    {
+        let mut b = agent(tmp.path(), &elsewhere);
+        b.run_turn("someone else's work").await;
+    }
+    let mut a = agent(tmp.path(), &here);
+    let out = a
+        .run_slash(SlashCommand::Resume { target: None })
+        .await
+        .unwrap();
+    assert_ne!(out.trim(), "no sessions yet", "that would be a lie: {out}");
+    assert!(out.contains("other directories"), "{out}");
+    assert!(out.contains(&here.display().to_string()), "{out}");
+}
+
+/// Sessions whose cwd differs only by a path *suffix* must not match: `/work/app`
+/// is not `/work/app-old`. A plain string prefix check would mix them up.
+#[tokio::test]
+async fn resume_does_not_confuse_a_sibling_directory_with_a_prefix_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let here = tmp.path().join("app");
+    let sibling = tmp.path().join("app-old");
+    std::fs::create_dir_all(&here).unwrap();
+    std::fs::create_dir_all(&sibling).unwrap();
+
+    {
+        let mut b = agent(tmp.path(), &sibling);
+        b.run_turn("sibling session").await;
+    }
+    let mut a = agent(tmp.path(), &here);
+    let listing = a
+        .run_slash(SlashCommand::Resume { target: None })
+        .await
+        .unwrap();
+    assert!(
+        !listing.contains("sibling session"),
+        "app-old is a different workspace from app: {listing}"
+    );
+}

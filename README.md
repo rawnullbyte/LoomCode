@@ -311,8 +311,8 @@ arguments, environment and timeout. Saving server changes reconnects the live ca
 
 | Command | Behavior |
 | --- | --- |
-| `/sessions`, `/resume` | Search saved session titles, IDs and workspace paths |
-| `/resume ID_OR_PREFIX`, `/resume N` | Restore a session and its transcript; ambiguous prefixes are refused |
+| `/sessions`, `/resume` | List and search sessions **started in this directory**; sessions from other workspaces are counted but not offered |
+| `/resume ID_OR_PREFIX`, `/resume N` | Restore a session and its transcript; ambiguous prefixes are refused, and an id from another directory names that directory |
 | `/new`, `/clear`, `/rename TITLE` | Start a saved session (`/clear` is an alias) or name the current one |
 | `/delete ID_OR_PREFIX`, `/delete N` | Delete a saved session and its journal; the session you are in is refused |
 | `/todos` | Browse/add/edit tasks and change pending, in-progress, completed or blocked state |
@@ -355,6 +355,14 @@ Sessions are ordered by **last activity**, not by creation: the session you mess
 minutes ago is at the top, even if others were created after it. `sessions list` shows both
 `LAST USED` and `CREATED` so the order is self-explanatory. `/resume` in the TUI uses the
 same order and annotates each entry with its age ("5m ago", "2h ago").
+
+`/resume` and `/delete` are scoped to the directory the session was started in: the list
+offers only sessions whose recorded workspace is this one, and indexes count only those
+rows. A session from another directory is never offered, because resuming it would move
+the agent into that directory. When sessions exist elsewhere they are counted in the
+listing rather than silently dropped, and selecting one by id names the directory it
+belongs to. `loom sessions list` stays global — it is the cross-project overview and prints
+the `CWD` column for exactly that reason.
 
 Deleting removes the session row and its events in one transaction. An unknown id is
 reported by name rather than as a file-system error, and the session you are currently in
