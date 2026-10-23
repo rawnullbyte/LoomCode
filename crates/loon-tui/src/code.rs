@@ -459,3 +459,48 @@ mod cost_tests {
         );
     }
 }
+
+/// Highlighting must never lose or reorder a character: the transcript's copy and
+/// selection logic reassembles pieces by position, so a dropped char would corrupt
+/// pastes. Fences, tabs, wide glyphs and unterminated comments/strings are exactly
+/// what shifts a char-indexed lexer off the rails.
+#[cfg(test)]
+mod highlight_invariant_tests {
+    use super::*;
+
+    #[test]
+    fn pieces_concatenate_to_the_input_exactly() {
+        let langs = [
+            Lang::Rust,
+            Lang::Python,
+            Lang::Plain,
+            Lang::from_path("a.js"),
+            Lang::from_path("a.json"),
+            Lang::from_path("a.md"),
+        ];
+        let lines = [
+            "fn main() { /* block */ }",
+            "let s = \"a\\\"b\"; // trailing",
+            "x = 'c'  # comment",
+            "# not a comment in rust",
+            "// 日本語 comment",
+            "let 日 = 1; // 日本",
+            "```rust",
+            "    indented // c",
+            "a\tb // tab",
+            "\"unterminated",
+            "/* unterminated",
+            "",
+        ];
+        for lang in langs {
+            for line in lines {
+                let pieces = highlight(line, lang);
+                let joined: String = pieces.iter().map(|(t, _)| t.as_str()).collect();
+                assert_eq!(
+                    joined, line,
+                    "a dropped or reordered char would corrupt copied text: lang={lang:?} line={line:?} pieces={pieces:?}"
+                );
+            }
+        }
+    }
+}
