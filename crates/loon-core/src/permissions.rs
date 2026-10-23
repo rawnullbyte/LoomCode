@@ -162,7 +162,7 @@ impl PermissionEngine {
             "ts_ms": ts,
             "session": session,
             "tool": tool,
-            "args": truncate(args_summary, 200),
+            "args": truncate(&redact(args_summary), 200),
             "decision": match decision {
                 Decision::Allowed => "allowed",
                 Decision::Denied { .. } => "denied",
@@ -279,6 +279,106 @@ fn describe(rule: &PermissionRule) -> String {
     }
 }
 
+/// Mask credentials before anything is written to the durable audit journal.
+/// The journal outlives the session, so a token that reaches it is exposed to
+/// anyone who can read `state/audit.jsonl`.
+///
+/// Only a *key* position is masked: the name must be followed by a separator
+/// (`=`, `:`, `"`), which is what distinguishes `"api_key":"…"` from a value
+/// that merely mentions the word. Matching bare substrings would corrupt the
+/// record — the journal's job is to say what the agent did.
+fn redact(s: &str) -> String {
+    const KEYS: &[&str] = &[
+        "api_key",
+        "apikey",
+        "api-key",
+        "token",
+        "secret",
+        "password",
+        "passwd",
+        "authorization",
+        "access_key",
+        "private_key",
+        "credential",
+    ];
+    let lower = s.to_lowercase();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < s.len() {
+        let hit = KEYS.iter().find_map(|k| {
+            // The key must start a token: preceded by a non-word char or the start.
+            let boundary = i == 0 || {
+                let prev = s[..i].chars().next_back().unwrap_or(' ');
+                !prev.is_alphanumeric() && prev != '_'
+            };
+            if boundary && lower[i..].starts_with(k) {
+                Some(k.len())
+            } else {
+                None
+            }
+        });
+        let Some(klen) = hit else {
+            let c = s[i..].chars().next().unwrap();
+            out.push(c);
+            i += c.len_utf8();
+            continue;
+        };
+        // The key must be followed by a separator, otherwise it is prose or a value.
+        let after = i + klen;
+        let sep_start = after;
+        let mut sep = String::new();
+        let mut j = after;
+        while j < s.len() {
+            let c = s[j..].chars().next().unwrap();
+            if c == ' ' || c == '=' || c == ':' || c == '"' || c == '\'' {
+                sep.push(c);
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if sep.is_empty() || !sep.contains(['=', ':']) {
+            // Not a key/value shape: copy the key and move on.
+            out.push_str(&s[i..sep_start]);
+            i = sep_start;
+            continue;
+        }
+        out.push_str(&s[i..sep_start]);
+        out.push_str(&sep);
+        i = j;
+        // `Authorization: Bearer <token>` — the scheme word is not the secret.
+        let rest = &s[i..];
+        if klen == "authorization".len() && rest.to_lowercase().starts_with("bearer") {
+            out.push_str(&rest[..6]);
+            i += 6;
+            while i < s.len() && s[i..].starts_with(' ') {
+                out.push(' ');
+                i += 1;
+            }
+        }
+        let mut masked = false;
+        while i < s.len() {
+            let c = s[i..].chars().next().unwrap();
+            if c == '"'
+                || c == '\''
+                || c == ','
+                || c == '}'
+                || c == ']'
+                || c == '&'
+                || c.is_whitespace()
+            {
+                break;
+            }
+            if !masked {
+                out.push_str("[redacted]");
+                masked = true;
+            }
+            i += c.len_utf8();
+        }
+    }
+    out
+}
+
 fn truncate(s: &str, n: usize) -> String {
     let t: String = s.chars().take(n).collect();
     if s.chars().count() > n {
@@ -377,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn audit_records_are_redacted_and_truncated() {
+    fn audit_records_are_truncated() {
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("audit.jsonl");
         let mut e = engine(PermissionMode::Bypass, vec![], vec![]);
@@ -387,7 +487,99 @@ mod tests {
         let line = std::fs::read_to_string(&path).unwrap();
         assert!(line.contains("bash"));
         assert!(!line.contains(&"x".repeat(300)), "long args truncated");
-        // the redaction marker is present
         assert!(line.contains("…") || line.len() < 400);
+    }
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::*;
+
+    fn engine_with(path: std::path::PathBuf) -> PermissionEngine {
+        PermissionEngine {
+            mode: PermissionMode::Bypass,
+            allow_rules: Vec::new(),
+            deny_rules: Vec::new(),
+            ask_rules: Vec::new(),
+            audit_path: Some(path),
+            audit_lock: Mutex::new(()),
+        }
+    }
+
+    /// Tool arguments reach the audit journal verbatim. A credential passed to a
+    /// tool must not be written to disk in plaintext — the record is durable and
+    /// outlives the session.
+    #[test]
+    fn a_secret_in_tool_arguments_is_not_written_verbatim() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("audit.jsonl");
+        let e = engine_with(path.clone());
+        let args =
+            r#"{"command":"curl -H 'Authorization: Bearer sk-live-ABCDEF123456' https://x"}"#;
+        e.audit("sess", "bash", args, &Decision::Allowed);
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !line.contains("sk-live-ABCDEF123456"),
+            "a bearer token must not be journaled in plaintext, got: {line}"
+        );
+        assert!(line.contains("bash"), "the tool name is still recorded");
+    }
+
+    /// The same for common key names, which is how most secrets arrive.
+    #[test]
+    fn a_key_value_secret_is_not_written_verbatim() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("audit.jsonl");
+        let e = engine_with(path.clone());
+        let args = r#"{"env":{"API_KEY":"sk-test-9f8e7d6c5b4a"},"password":"hunter2"}"#;
+        e.audit("sess", "bash", args, &Decision::Allowed);
+        let line = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !line.contains("sk-test-9f8e7d6c5b4a"),
+            "an API key must not be journaled in plaintext, got: {line}"
+        );
+        assert!(
+            !line.contains("hunter2"),
+            "a password must not be journaled in plaintext, got: {line}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod redaction_false_positive_tests {
+    use super::redact;
+
+    /// Redaction must not mangle ordinary arguments: the journal is the record of
+    /// what the agent did, and losing that is its own failure.
+    #[test]
+    fn ordinary_arguments_pass_through() {
+        for args in [
+            r#"{"path":"src/main.rs","content":"fn main() {}"}"#,
+            r#"{"command":"cargo test --workspace"}"#,
+            r#"{"pattern":"token","path":"src"}"#,
+            r#"{"query":"how does auth work"}"#,
+        ] {
+            assert_eq!(redact(args), args, "must not alter: {args}");
+        }
+    }
+
+    /// A secret-looking word used as a plain value is not a credential: masking it
+    /// would corrupt the record of what the agent actually did.
+    #[test]
+    fn a_secret_word_used_as_a_value_is_left_alone() {
+        assert_eq!(
+            redact(r#"{"field":"password"}"#),
+            r#"{"field":"password"}"#,
+            "the word alone is not a credential"
+        );
+    }
+
+    /// A key with no separator is prose, not a credential.
+    #[test]
+    fn a_key_word_in_prose_is_left_alone() {
+        assert_eq!(
+            redact(r#"{"note":"rotate the token soon"}"#),
+            r#"{"note":"rotate the token soon"}"#
+        );
     }
 }
