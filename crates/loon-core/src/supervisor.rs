@@ -144,6 +144,18 @@ fn goal_refuses_verification(goal: &str) -> bool {
         "approve",
         "finish",
     ];
+    // Skirts: declining the review without an explicit imperative on the review.
+    const WAIVE: &[&str] = &[
+        "skip verification",
+        "skip the verification",
+        "no verification",
+        "verification is unnecessary",
+        "verification is not needed",
+        "no review needed",
+        "review is unnecessary",
+        "review is not needed",
+        "review not needed",
+    ];
     // Phrases that are a refusal on their own, with no verb to pair against.
     const STANDALONE: &[&str] = &[
         "always decline",
@@ -156,6 +168,13 @@ fn goal_refuses_verification(goal: &str) -> bool {
         "do not stop",
     ];
     if STANDALONE.iter().any(|p| lower.contains(p)) {
+        return true;
+    }
+    // A waive denies the review itself ("no review needed"), so there is no
+    // imperative + verb pair to find — it is a refusal on its own. Ordinary
+    // reports like "no review comments left unaddressed" still pass because
+    // "needed"/"unnecessary"/"not needed"/"skip" is required alongside.
+    if WAIVE.iter().any(|p| lower.contains(p)) {
         return true;
     }
     // "not done yet, keep going" is a status report: it has no imperative, so it is not
@@ -564,6 +583,21 @@ mod tests {
         }
     }
 
+    /// Phrasings that decline the review without matching the current vocabulary.
+    #[test]
+    fn skirting_phrasings_are_recognized_as_refusals() {
+        for goal in [
+            "skip verification and keep going",
+            "no review needed, just continue",
+            "verification is unnecessary",
+        ] {
+            assert!(
+                goal_refuses_verification(goal),
+                "should be a refusal: {goal}"
+            );
+        }
+    }
+
     #[test]
     fn a_plain_progress_report_is_not_a_refusal() {
         for goal in [
@@ -580,6 +614,10 @@ mod tests {
             "assess whether the tests pass",
             "make sure the review passes",
             "add a review step to the pipeline",
+            // And nothing that merely describes ordinary work is caught by the
+            // wider refusal vocabulary below.
+            "skip the slow test and rerun",
+            "no review comments left unaddressed",
         ] {
             assert!(
                 !goal_refuses_verification(goal),
