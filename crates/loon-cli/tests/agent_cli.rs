@@ -834,3 +834,51 @@ fn sessions_list_distinguishes_projects_sharing_a_parent() {
         "the CWD column must distinguish alpha from beta, got: {text}"
     );
 }
+
+/// The CWD column is capped at the short_path bound, so TITLE starts in the
+/// same column on every row. With a fixed {:<10} width and an 18-char cell, a
+/// long path pushed TITLE right — the kind of ragged column a forged extra
+/// row would hide in.
+#[test]
+fn sessions_list_starts_title_in_the_same_column_on_every_row() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let long = root.path().join("averylongdirectoryname1");
+    std::fs::create_dir_all(&long).unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c.current_dir(root.path());
+        c
+    };
+    // One session whose cwd is short enough to fit the column untouched, and one
+    // whose cwd is longer than the column — the pair that exposed the ragged row.
+    let short = root.path().join("s");
+    std::fs::create_dir_all(&short).unwrap();
+    for cwd in [short.to_str().unwrap(), long.to_str().unwrap()] {
+        assert!(loom()
+            .args(["run", "zzzqqqtitle", "--cwd", cwd])
+            .output()
+            .unwrap()
+            .status
+            .success());
+    }
+    let out = loom().args(["sessions", "list"]).output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let rows: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert_eq!(rows.len(), 2, "two sessions, got: {text}");
+    // TITLE is the last field. Compare display columns, not bytes: an elided path
+    // starts with "…", which is one char but three bytes.
+    let offsets: Vec<usize> = rows
+        .iter()
+        .map(|r| r[..r.find("zzzqqqtitle").unwrap()].chars().count())
+        .collect();
+    assert_eq!(
+        offsets[0], offsets[1],
+        "TITLE must start in the same column on both rows, got: {text}"
+    );
+}

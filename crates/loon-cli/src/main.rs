@@ -658,18 +658,26 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
             // Last activity leads: the list is ordered by it, so showing creation time
             // would look like a broken sort. `LAST USED` equals `CREATED` for a session
             // that has only just been made.
+            // The column must be wider than the `short_path` bound, or a path that
+            // fills the bound leaves no gap and shoves TITLE right on that row only.
+            const CWD_BOUND: usize = 18;
+            const CWD_COL: usize = CWD_BOUND + 1;
             println!(
-                "{:<38} {:<20} {:<20} {:<10} TITLE",
-                "SESSION", "LAST USED", "CREATED", "CWD"
+                "{:<38} {:<20} {:<20} {:<w$} TITLE",
+                "SESSION",
+                "LAST USED",
+                "CREATED",
+                "CWD",
+                w = CWD_COL
             );
             for s in &list {
                 let used = chrono_fmt(s.updated_ms);
                 let created = chrono_fmt(s.created_ms);
                 // Keep the TAIL: the leading path is usually a shared parent, so
                 // truncating the front makes two projects look identical.
-                let cwd = short_path(&s.cwd, 18);
+                let cwd = short_path(&s.cwd, CWD_BOUND);
                 println!(
-                    "{:<38} {:<20} {:<20} {:<10} {}",
+                    "{:<38} {:<20} {:<20} {:<w$} {}",
                     s.id,
                     used,
                     created,
@@ -677,7 +685,8 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
                     // Stored titles can predate the one-line rule (or come from
                     // /rename), so the table flattens them too rather than letting a
                     // newline forge an extra row.
-                    one_line(&s.title)
+                    one_line(&s.title),
+                    w = CWD_COL
                 );
             }
             0
