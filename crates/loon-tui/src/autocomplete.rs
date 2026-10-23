@@ -30,8 +30,10 @@ pub fn argument_suggestions(line: &str) -> Vec<Completion> {
     let mut parts = body.split_whitespace();
     let cmd = parts.next().unwrap_or_default();
     let args: Vec<&str> = parts.collect();
-    // A trailing space means "the next argument starts now".
-    let trailing_space = body.ends_with(' ');
+    // Trailing whitespace means "the next argument starts now". Tabs arrive from
+    // pasted input and some terminals, and a trailing tab used to keep suggesting
+    // keys instead of the value for the completed key.
+    let trailing_space = body.ends_with(char::is_whitespace);
     let arg_index = if trailing_space {
         args.len()
     } else {
@@ -208,6 +210,23 @@ mod argument_tests {
         let partial = completions_for("/config theme tr");
         assert_eq!(partial.len(), 1);
         assert_eq!(partial[0].insert, "transparent");
+    }
+
+    /// "The next argument starts now" is signalled by trailing whitespace of any
+    /// kind. Only a literal space was checked, so after `/config tips` + Tab the
+    /// popup kept suggesting *keys* instead of that setting's values — the same
+    /// input with a trailing space behaved correctly.
+    #[test]
+    fn a_trailing_tab_advances_to_value_suggestions() {
+        for line in ["/config tips\t", "/config\ttips\t"] {
+            let vals = completions_for(line);
+            let names: Vec<&str> = vals.iter().map(|c| c.insert.as_str()).collect();
+            assert_eq!(
+                names,
+                vec!["true", "false"],
+                "trailing tab must mean the next argument, got {names:?} for {line:?}"
+            );
+        }
     }
 
     #[test]
