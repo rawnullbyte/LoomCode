@@ -144,6 +144,8 @@ fn goal_refuses_verification(goal: &str) -> bool {
         "approve",
         "finish",
     ];
+    // Targets that make a "stop" unambiguously about the review itself.
+    const REVIEW_TARGET: &[&str] = &["review", "assess", "judge", "grade", "verif", "completion"];
     // Skirts: declining the review without an explicit imperative on the review.
     const WAIVE: &[&str] = &[
         "skip verification",
@@ -167,6 +169,29 @@ fn goal_refuses_verification(goal: &str) -> bool {
         "don't stop",
         "do not stop",
     ];
+    // "stop" is a review verb ("stop reviewing") and also an ordinary task verb
+    // ("don't stop the server"). When the thing being stopped is a process, the
+    // goal is an instruction about the work, not a refusal of the review — and
+    // treating it as a refusal would block completion forever. Checked before the
+    // imperative/verb pairing below so it cannot be re-caught there.
+    const PROCESS_OBJECT: &[&str] = &[
+        "server",
+        "build",
+        "process",
+        "service",
+        "container",
+        "daemon",
+        "watcher",
+        "compile",
+        "job",
+        "worker",
+        "loop process",
+    ];
+    if PROCESS_OBJECT.iter().any(|o| lower.contains(o))
+        && !REVIEW_TARGET.iter().any(|r| lower.contains(r))
+    {
+        return false;
+    }
     if STANDALONE.iter().any(|p| lower.contains(p)) {
         return true;
     }
@@ -594,6 +619,24 @@ mod tests {
             assert!(
                 goal_refuses_verification(goal),
                 "should be a refusal: {goal}"
+            );
+        }
+    }
+
+    /// "stop" is both a review verb and an ordinary engineering verb. A goal that
+    /// tells the agent not to stop a *server* is a task instruction, not a refusal
+    /// of the review — and treating it as one would block completion forever.
+    #[test]
+    fn stopping_a_process_is_not_a_review_refusal() {
+        for goal in [
+            "do not stop the server until the tests pass",
+            "don't stop the build if a test fails",
+            "never stop the dev server during the demo",
+            "do not stop the process before it flushes",
+        ] {
+            assert!(
+                !goal_refuses_verification(goal),
+                "a task instruction, not a refusal: {goal}"
             );
         }
     }
