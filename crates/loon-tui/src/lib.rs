@@ -375,9 +375,14 @@ impl App {
         // "/config tips "), keeping the command and earlier args intact.
         if self.input.trim_start().contains(char::is_whitespace) {
             let trimmed_end = self.input.trim_end().len();
+            // Advance past the separator by its UTF-8 length: an ideographic space
+            // (U+3000, 3 bytes) pasted from a CJK input method would otherwise leave
+            // the cut mid-character and `truncate` panics.
             let cut = self.input[..trimmed_end]
-                .rfind(char::is_whitespace)
-                .map(|i| i + 1)
+                .char_indices()
+                .rev()
+                .find(|(_, c)| c.is_whitespace())
+                .map(|(i, c)| i + c.len_utf8())
                 .unwrap_or(0);
             self.input.truncate(cut);
             self.input.push_str(&insert);
@@ -2113,6 +2118,51 @@ mod prompt_editing_tests {
         };
         handle_mouse(&mut app, click);
         assert_eq!(app.cursor, 2, "a click outside the box is not a caret move");
+    }
+}
+
+/// `accept_completion` rewrites only the argument word being typed. The cut has to
+/// land on a char boundary: a multi-byte separator (ideographic space U+3000, U+00A0,
+/// U+2028) pasted from a CJK input method used to leave the cut mid-character and
+/// `String::truncate` panicked, killing the session mid-edit.
+#[cfg(test)]
+mod completion_boundary_tests {
+    use crate::tests::app_for_test;
+
+    fn completed(input: &str) -> String {
+        let mut app = app_for_test();
+        app.input = input.to_string();
+        app.cursor = app.input.chars().count();
+        app.completion_selected = 0;
+        assert!(
+            app.accept_completion(),
+            "completion should apply for {input:?}"
+        );
+        app.input
+    }
+
+    #[test]
+    fn a_multibyte_separator_does_not_panic() {
+        // The separator itself is kept, exactly as an ASCII space is today
+        // ("/config ti" -> "/config tips "); only the half-typed word is replaced.
+        for sep in ['\u{3000}', '\u{00a0}', '\u{2028}', '\t', ' '] {
+            let input = format!("/config{sep}ti");
+            let out = completed(&input);
+            assert_eq!(
+                out,
+                format!("/config{sep}tips "),
+                "separator {sep:?} ({} bytes) must be stepped over whole, not split mid-character",
+                sep.len_utf8()
+            );
+        }
+    }
+
+    #[test]
+    fn a_multibyte_separator_keeps_earlier_arguments() {
+        // Only the last word is replaced; the command and earlier args survive, and a
+        // multi-byte separator between them is stepped over whole.
+        let out = completed("/config theme\u{3000}tr");
+        assert_eq!(out, "/config theme\u{3000}transparent ");
     }
 }
 
