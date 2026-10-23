@@ -34,6 +34,21 @@ pub fn clean(text: &str) -> String {
                         }
                     }
                 }
+                // String sequences: DCS `P`, SOS `X`, PM `^`, APC `_`. Their payload
+                // is data (a sixel image, a terminal query), not text — dumping it
+                // painted control payload into the transcript as if the command had
+                // printed it. Terminated by ST (`ESC \`) or, in practice, BEL.
+                Some('P' | 'X' | '^' | '_') => {
+                    while let Some(c) = it.next() {
+                        if c == '\x07' {
+                            break;
+                        }
+                        if c == '\x1b' && it.peek() == Some(&'\\') {
+                            it.next();
+                            break;
+                        }
+                    }
+                }
                 _ => {}
             }
             continue;
@@ -1917,5 +1932,39 @@ mod copy_wide_tests {
             copied.contains('日'),
             "a selection starting inside a wide glyph still includes it: {copied:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod escape_sequence_tests {
+    use super::clean;
+
+    /// Tool output is arbitrary bytes. `clean` strips CSI and OSC, but not the
+    /// string sequences (DCS `ESC P`, SOS `ESC X`, PM `ESC ^`, APC `ESC _`), whose
+    /// payload is data — a sixel image or a terminal query — not text. Leaking it
+    /// painted `q#0;0;0;0` into the transcript as if the command had printed it.
+    #[test]
+    fn string_sequence_payloads_do_not_reach_the_transcript() {
+        for (input, leaked) in [
+            ("\x1bPq#0;0;0;0\x1b\\sixel", "q#0;0;0;0"),
+            ("\x1bP1;2;3q data \x1b\\", "q data"),
+            ("\x1bXsos payload\x1b\\", "sos payload"),
+            ("\x1b^pm payload\x1b\\", "pm payload"),
+            ("\x1b_apc payload\x1b\\", "apc payload"),
+        ] {
+            let out = clean(input);
+            assert!(
+                !out.contains(leaked),
+                "the sequence payload must be dropped, got {out:?} from {input:?}"
+            );
+        }
+    }
+
+    /// The text around a sequence is still the command's real output.
+    #[test]
+    fn text_around_a_string_sequence_survives() {
+        assert_eq!(clean("a\x1bPq payload\x1b\\b"), "ab");
+        assert_eq!(clean("\x1b]0;title\x07hello"), "hello");
+        assert_eq!(clean("\x1b[31mred\x1b[0m"), "red");
     }
 }
