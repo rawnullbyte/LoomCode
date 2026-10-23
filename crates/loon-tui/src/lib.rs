@@ -48,6 +48,9 @@ pub enum UiCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiNotice {
     Queue(Vec<String>),
+    QueuePaused(bool),
+    /// Rejected queued text is restored without deleting conversation progress.
+    Draft(String),
     /// A cancelled turn's prompt: put it back in the input bar (Esc restores the draft).
     RestorePrompt(String),
 }
@@ -135,6 +138,7 @@ pub struct App {
     pub turn_started: Option<std::time::Instant>,
     /// Mirrored prompt queue, kept in sync by [`UiNotice::Queue`].
     pub queued: Vec<String>,
+    pub queue_paused: bool,
     /// Esc was pressed once while busy; the next Esc is a hard stop.
     pub cancel_armed: bool,
     /// Selected row in the slash-command popup; reset on input change.
@@ -174,6 +178,22 @@ pub struct App {
     pub tips: bool,
 }
 
+/// One line describing a background subagent's state change.
+fn subagent_update_block(id: u64, label: &str, status: &str, note: &str) -> Block {
+    let line = format!("background #{id} {label}: {status}");
+    Block::System(if note.is_empty() {
+        line
+    } else {
+        format!("{line} — {note}")
+    })
+}
+
+/// A finished background subagent's report, shown in the transcript so the work it did
+/// is visible without asking the model to list its jobs.
+fn subagent_finished_block(id: u64, label: &str, status: &str, text: &str) -> Block {
+    Block::System(format!("background #{id} {label} {status}\n{text}"))
+}
+
 impl App {
     pub fn new(transparent: bool, status: StatusLine) -> App {
         App {
@@ -211,6 +231,7 @@ impl App {
             tick: 0,
             turn_started: None,
             queued: Vec::new(),
+            queue_paused: false,
             cancel_armed: false,
             completion_selected: 0,
             popup_dismissed: false,
@@ -362,7 +383,10 @@ impl App {
         self.visible_completions().len()
     }
 
-    /// Replace the input with the selected completion's command word.
+    /// Insert the selected completion. A command word replaces the whole input
+    /// ("/re" → "/redo "); an argument value replaces only the word being typed
+    /// ("/config ti" → "/config tips "), or is appended to a bare command
+    /// ("/autocompact" → "/autocompact 90% ").
     pub fn accept_completion(&mut self) -> bool {
         let completions = self.visible_completions();
         if completions.is_empty() {
@@ -370,36 +394,89 @@ impl App {
         }
         let idx = self.completion_selected.min(completions.len() - 1);
         let insert = completions[idx].insert.clone();
-        // Command-word completion replaces the whole input ("/re" → "/redo ").
-        // Argument completion replaces only the word being typed ("/config ti" →
-        // "/config tips "), keeping the command and earlier args intact.
-        if self.input.trim_start().contains(char::is_whitespace) {
-            let trimmed_end = self.input.trim_end().len();
-            // Advance past the separator by its UTF-8 length: an ideographic space
-            // (U+3000, 3 bytes) pasted from a CJK input method would otherwise leave
-            // the cut mid-character and `truncate` panics.
-            let cut = self.input[..trimmed_end]
-                .char_indices()
-                .rev()
-                .find(|(_, c)| c.is_whitespace())
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(0);
-            self.input.truncate(cut);
-            self.input.push_str(&insert);
-            self.input.push(' ');
-        } else {
-            self.input = format!("/{insert} ");
+        match completions[idx].kind {
+            autocomplete::Kind::Command => {
+                self.input = format!("/{insert} ");
+            }
+            autocomplete::Kind::Argument => {
+                // "Replace the word being typed" only applies when an argument word
+                // actually exists. `/autocompact ` (trailing space only) has none, and
+                // cutting back to the previous whitespace would eat the command word.
+                let trimmed_end = self.input.trim_end();
+                let has_argument_word = trimmed_end.contains(char::is_whitespace);
+                if has_argument_word {
+                    let trimmed_end_len = trimmed_end.len();
+                    // Advance past the separator by its UTF-8 length: an ideographic space
+                    // (U+3000, 3 bytes) pasted from a CJK input method would otherwise leave
+                    // the cut mid-character and `truncate` panics.
+                    let cut = self.input[..trimmed_end_len]
+                        .char_indices()
+                        .rev()
+                        .find(|(_, c)| c.is_whitespace())
+                        .map(|(i, c)| i + c.len_utf8())
+                        .unwrap_or(0);
+                    self.input.truncate(cut);
+                    self.input.push_str(&insert);
+                    self.input.push(' ');
+                } else {
+                    // The command word is complete but no argument has been typed yet:
+                    // keep the command and add the value after it, normalising any
+                    // trailing whitespace to a single space.
+                    let indent_len = self.input.len() - self.input.trim_start().len();
+                    let indent = self.input[..indent_len].to_string();
+                    let command = trimmed_end.trim_start().trim_start_matches('/').trim_end();
+                    self.input = format!("{indent}/{command} {insert} ");
+                }
+            }
         }
         self.cursor = self.input.chars().count();
         self.input_changed();
         true
     }
 
-    pub fn rewind_conversation(&mut self, blocks: Vec<(String, String)>, prompt: String) {
+    /// Replace the transcript with a loaded session's blocks, keeping the welcome
+    /// banner pinned at the top. A fresh chat (`/new`, empty history, fresh agent) has
+    /// no session title to show, so it says what it is; a resumed session with real
+    /// content shows its banner with no opener.
+    pub fn set_session_blocks(&mut self, blocks: impl Iterator<Item = Block>) {
+        self.blocks.clear();
+        self.streaming = None;
+        self.scroll_from_bottom = Some(usize::MAX); // Show the opening wordmark even in a small terminal.
+        self.selection = None;
+        self.selection_snapshot = None;
+        self.queued.clear();
+        self.queue_paused = false;
+        self.status.busy = false;
+        self.status.member = None;
+        self.cancel_armed = false;
+        self.turn_started = None;
+        self.request_rate = Default::default();
+        self.activity = "Ready".into();
+        if self.welcome_banner {
+            self.blocks.push(Block::Banner);
+        }
+        let mut empty = true;
+        for b in blocks {
+            empty = false;
+            self.blocks.push(b);
+        }
+        if empty {
+            self.push_block(Block::System("new session — ask anything".into()));
+        }
+    }
+
+    pub fn rewind_conversation(
+        &mut self,
+        blocks: Vec<loon_core::replay::VisibleBlock>,
+        prompt: String,
+    ) {
         let kept: Vec<&str> = blocks
             .iter()
-            .filter(|(role, _)| role == "user")
-            .map(|(_, text)| text.as_str())
+            .filter(|b| matches!(b, loon_core::replay::VisibleBlock::User { .. }))
+            .map(|b| match b {
+                loon_core::replay::VisibleBlock::User { text } => text.as_str(),
+                _ => unreachable!("filtered to user rows above"),
+            })
             .collect();
         let live: Vec<(usize, &str)> = self
             .blocks
@@ -425,12 +502,23 @@ impl App {
         } else {
             self.blocks = blocks
                 .into_iter()
-                .map(|(role, text)| {
-                    if role == "user" {
-                        Block::User(text)
-                    } else {
-                        Block::Assistant(text)
-                    }
+                .map(|b| match b {
+                    loon_core::replay::VisibleBlock::User { text } => Block::User(text),
+                    loon_core::replay::VisibleBlock::Assistant { text } => Block::Assistant(text),
+                    loon_core::replay::VisibleBlock::Tool {
+                        name,
+                        detail,
+                        ok,
+                        excerpt,
+                    } => Block::Tool {
+                        name,
+                        ok,
+                        excerpt,
+                        pending: false,
+                        detail,
+                        started: None,
+                        elapsed: None,
+                    },
                 })
                 .collect();
         }
@@ -530,6 +618,17 @@ impl App {
     pub fn apply_notice(&mut self, notice: UiNotice) {
         match notice {
             UiNotice::Queue(items) => self.queued = items,
+            UiNotice::QueuePaused(paused) => self.queue_paused = paused,
+            UiNotice::Draft(text) => {
+                if self.input.is_empty() {
+                    self.input = text;
+                } else {
+                    self.input = format!("{text}\n{}", self.input);
+                }
+                self.cursor = self.input.chars().count();
+                self.input_changed();
+            }
+
             UiNotice::RestorePrompt(text) => {
                 // The cancelled turn was forgotten agent-side, so every transcript row it
                 // produced is stale UI state. Walk back from the tail dropping its rows and
@@ -748,23 +847,28 @@ async fn run_inner(
     cwd: PathBuf,
 ) -> anyhow::Result<()> {
     let loop_registry = std::sync::Arc::new(loon_core::loops::LoopRegistry::new());
+    // Shared with the tools below so a background subagent's report reaches this
+    // agent's turn loop, not a registry nobody reads.
+    let background = loon_core::subagent::BackgroundHub::new();
     let agent = Arc::new(Mutex::new({
         let mut a = Agent::new_session(
             paths,
             cfg.clone(),
             registry.clone(),
-            loon_core::subagent::default_tools(
+            loon_core::subagent::default_tools_with_hub(
                 paths,
                 &cwd,
                 &cfg,
                 registry.clone(),
                 Some(loop_registry.clone()),
+                background.clone(),
             ),
             cwd.clone(),
             false,
         )
         .map_err(|e| anyhow::anyhow!("session init: {e}"))?;
         a.loops = loop_registry.clone();
+        a.background = background;
         a
     }));
     let (ev_tx, mut ev_rx) = mpsc::channel::<AgentEvent>(1024);
@@ -822,7 +926,7 @@ async fn run_inner(
     app.work_state = agent.lock().await.worklog.read().unwrap_or_default();
     app.context_limit = cfg.context_window;
     app.settings_tool_cap = cfg.tool_output_bytes;
-    app.settings_autocompact = cfg.context_window > 0;
+    app.settings_autocompact = agent.lock().await.autocompact;
     app.push_welcome_banner();
 
     let (cmd_tx, cmd_rx) = mpsc::channel::<UiCommand>(32);
@@ -928,21 +1032,31 @@ async fn run_inner(
                     terminal.clear()?;
                 }
                 AgentEvent::SessionLoaded { blocks } => {
-                    app.blocks = blocks
-                        .into_iter()
-                        .map(|(role, text)| {
-                            if role == "user" {
-                                Block::User(text)
-                            } else {
-                                Block::Assistant(text)
-                            }
-                        })
-                        .collect();
+                    app.set_session_blocks(blocks.into_iter().map(|b| match b {
+                        loon_core::replay::VisibleBlock::User { text } => Block::User(text),
+                        loon_core::replay::VisibleBlock::Assistant { text } => {
+                            Block::Assistant(text)
+                        }
+                        loon_core::replay::VisibleBlock::Tool {
+                            name,
+                            detail,
+                            ok,
+                            excerpt,
+                        } => Block::Tool {
+                            name,
+                            ok,
+                            excerpt,
+                            pending: false,
+                            detail,
+                            started: None,
+                            elapsed: None,
+                        },
+                    }));
                     app.streaming = None;
-                    app.scroll_from_bottom = None;
                     app.selection = None;
                     app.selection_snapshot = None;
                     app.navigator = None;
+                    terminal.clear()?;
                 }
                 AgentEvent::WorkStateChanged { state } => app.work_state = state,
                 AgentEvent::TurnStarted => {
@@ -951,6 +1065,13 @@ async fn run_inner(
                     app.begin_turn();
                     app.cancel_hint_shown = false;
                     app.cancel_armed = false;
+                }
+                AgentEvent::QueuedMessagesApplied { messages } => {
+                    app.commit_stream();
+                    for text in messages {
+                        app.push_block(Block::User(text));
+                    }
+                    app.queued.clear();
                 }
                 AgentEvent::RequestStarted => {
                     app.request_rate.start();
@@ -970,6 +1091,7 @@ async fn run_inner(
                     "animations" => app.animations = value == "true",
                     "popup_rows" => app.popup_rows = value.parse().unwrap_or(6),
                     "context_window" => app.context_limit = value.parse().unwrap_or(0),
+                    "autocompact" => app.settings_autocompact = value == "true",
                     "tips" => app.tips = value == "true",
                     "tip_text" => app.tip_text = value,
                     "footer" => app.footer = value == "true",
@@ -1062,23 +1184,14 @@ async fn run_inner(
                     }));
                 }
                 AgentEvent::ClearTranscript => {
-                    let banner = if matches!(
-                        app.blocks.first(),
-                        Some(crate::Block::Rich(_) | crate::Block::Banner)
-                    ) {
-                        app.blocks.first().cloned()
-                    } else {
-                        None
-                    };
-                    app.blocks.clear();
-                    if let Some(b) = banner {
-                        app.blocks.push(b);
-                    }
-                    app.scroll_from_bottom = None;
+                    app.set_session_blocks(std::iter::empty());
+                    terminal.clear()?;
                 }
                 AgentEvent::MemberNote(m) => {
                     if app.status.busy
-                        && (m.starts_with("ultraloop") || m.starts_with("verification"))
+                        && (m.starts_with("ultraloop")
+                            || m.starts_with("verification")
+                            || m.starts_with("Compacting"))
                     {
                         app.activity = m.clone();
                     }
@@ -1092,6 +1205,18 @@ async fn run_inner(
                         "approval requested: {tool} {args_excerpt}"
                     )));
                 }
+                AgentEvent::SubagentUpdate {
+                    id,
+                    label,
+                    status,
+                    note,
+                } => app.push_block(subagent_update_block(id, &label, &status, &note)),
+                AgentEvent::SubagentFinished {
+                    id,
+                    label,
+                    status,
+                    text,
+                } => app.push_block(subagent_finished_block(id, &label, &status, &text)),
                 AgentEvent::Warning(w) => app.push_block(Block::System(format!("warning: {w}"))),
                 AgentEvent::TurnFinished { status } => {
                     app.request_rate.finish();
@@ -1105,10 +1230,9 @@ async fn run_inner(
                     app.commit_stream();
                     match status {
                         TurnStatus::Completed => {}
-                        // Cancelled restores the prompt to the input bar (via a
-                        // RestorePrompt notice), so no "cancelled" marker or status
-                        // text is needed — the turn simply did not happen.
-                        TurnStatus::Cancelled => {}
+                        TurnStatus::Cancelled => {
+                            app.push_block(Block::System("stopped · completed work kept".into()))
+                        }
                         TurnStatus::Failed(e) => {
                             app.push_block(Block::System(format!("failed: {e}")))
                         }
@@ -1177,6 +1301,9 @@ async fn run_inner(
 
 async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiCommand>) {
     if key.kind == crossterm::event::KeyEventKind::Release {
+        return;
+    }
+    if key.code == KeyCode::Esc && key.kind == crossterm::event::KeyEventKind::Repeat {
         return;
     }
     // A double-Esc stop is armed by one Esc and disarmed by anything else.
@@ -1304,6 +1431,12 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             app.cursor = 0;
             app.input_anchor = None;
             if text.is_empty() {
+                if app.queue_paused && !app.queued.is_empty() {
+                    app.queue_paused = false;
+                    app.begin_turn();
+                    app.status.busy = true;
+                    let _ = cmd_tx.send(UiCommand::SendNow(String::new())).await;
+                }
                 return;
             }
             submit(app, cmd_tx, text, false).await;
@@ -1377,12 +1510,9 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         KeyCode::Up
             if app.completion_count() == 0 && app.input.is_empty() && !app.queued.is_empty() =>
         {
-            if let Some(text) = app.queued.pop() {
-                app.input = text;
-                app.cursor = app.input.chars().count();
-                app.input_changed();
-                let _ = cmd_tx.send(UiCommand::TakeLastQueued).await;
-            }
+            // The request loop can consume the queue concurrently: the driver returns
+            // only text it actually removed, preventing duplicate sends after Up.
+            let _ = cmd_tx.send(UiCommand::TakeLastQueued).await;
         }
         KeyCode::Up if app.completion_count() == 0 && app.input.contains('\n') => {
             let (line, col) = app.cursor_line_col();
@@ -1427,7 +1557,7 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         KeyCode::BackTab => {
             let _ = cmd_tx.send(UiCommand::CycleMode).await;
         }
-        KeyCode::Esc if app.completion_count() > 0 => {
+        KeyCode::Esc if app.completion_count() > 0 && !app.status.busy => {
             app.popup_dismissed = true;
             app.cancel_armed = false;
         }
@@ -1439,9 +1569,8 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
                 let _ = cmd_tx.send(UiCommand::Cancel).await;
             } else {
                 app.cancel_armed = true;
-                app.push_block(Block::System(
-                    "esc again to stop · typing continues to be queued".into(),
-                ));
+                app.popup_dismissed = true;
+                app.activity = "Esc again to stop".into();
             }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -1482,7 +1611,7 @@ async fn submit(app: &mut App, cmd_tx: &mpsc::Sender<UiCommand>, text: String, s
     }
     app.cancel_hint_shown = false;
     app.cancel_armed = false;
-    app.push_block(Block::User(text.clone()));
+    app.scroll_from_bottom = None;
     if send_now || !app.status.busy {
         app.begin_turn();
     }
@@ -2164,6 +2293,55 @@ mod completion_boundary_tests {
         let out = completed("/config theme\u{3000}tr");
         assert_eq!(out, "/config theme\u{3000}transparent ");
     }
+
+    /// The reported defect: typing `/autocompact`, picking `90%` and pressing Tab
+    /// replaced the whole input with `/90%`, so the command was lost. Tab must keep
+    /// the command and append the value — with or without a typed space.
+    #[test]
+    fn completing_a_command_argument_never_swallows_the_command() {
+        for (input, expected) in [
+            ("/autocompact", "/autocompact 90% "),
+            ("/autocompact ", "/autocompact 90% "),
+            ("/context", "/context 90% "),
+            ("/context ", "/context 90% "),
+        ] {
+            let mut app = app_for_test();
+            app.input = input.to_string();
+            app.cursor = app.input.chars().count();
+            let idx = app
+                .visible_completions()
+                .iter()
+                .position(|c| c.insert == "90%")
+                .unwrap_or_else(|| panic!("90% must be offered for {input:?}"));
+            app.completion_selected = idx;
+            assert!(app.accept_completion());
+            assert_eq!(app.input, expected, "Tab on {input:?}");
+        }
+    }
+
+    /// Tab must not leave a half-typed command behind, and must not duplicate a
+    /// separator when one was already typed.
+    #[test]
+    fn completing_a_value_keeps_exactly_one_separator() {
+        for input in ["/effort\t", "/effort  "] {
+            let mut app = app_for_test();
+            app.input = input.to_string();
+            app.cursor = app.input.chars().count();
+            app.completion_selected = 0;
+            assert!(app.accept_completion());
+            assert_eq!(app.input, "/effort low ", "Tab on {input:?}");
+        }
+    }
+
+    /// A command word still replaces the input wholesale; that is what makes
+    /// `/re` → `/redo ` work.
+    #[test]
+    fn a_command_completion_still_replaces_the_input() {
+        assert_eq!(completed("/re"), "/redo ");
+        assert_eq!(completed("/und"), "/undo ");
+        // Leading indent is preserved for command completion too.
+        assert_eq!(completed("  /und"), "/undo ");
+    }
 }
 
 #[cfg(test)]
@@ -2344,5 +2522,66 @@ mod modal_contract_tests {
         let (mut app, mut rx) = app_pending();
         handle_key(&mut app, key(KeyCode::Esc, KeyModifiers::NONE), &tx).await;
         assert_eq!(rx.try_recv(), Ok(false), "Esc refuses");
+    }
+}
+
+#[cfg(test)]
+mod stop_regression_tests {
+    use super::*;
+    #[tokio::test]
+    async fn double_escape_stops_even_with_completions_and_repeat_does_not_count() {
+        let mut app = App::new(
+            true,
+            StatusLine {
+                busy: true,
+                ..Default::default()
+            },
+        );
+        app.input = "/mo".into();
+        app.cursor = 3;
+        app.input_changed();
+        assert!(app.completion_count() > 0);
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        )
+        .await;
+        assert!(app.cancel_armed);
+        assert!(rx.try_recv().is_err());
+        let repeat = KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Repeat,
+        );
+        handle_key(&mut app, repeat, &tx).await;
+        assert!(rx.try_recv().is_err());
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &tx,
+        )
+        .await;
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::Cancel)));
+        assert_eq!(
+            app.input, "/mo",
+            "stop must preserve the user's current draft"
+        );
+    }
+    #[tokio::test]
+    async fn enter_resumes_a_paused_queue_without_sending_empty_user_text() {
+        let mut app = App::new(true, StatusLine::default());
+        app.queue_paused = true;
+        app.queued = vec!["pending".into()];
+        let (tx, mut rx) = mpsc::channel(8);
+        handle_key(
+            &mut app,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            &tx,
+        )
+        .await;
+        assert!(matches!(rx.try_recv(),Ok(UiCommand::SendNow(t)) if t.is_empty()));
+        assert!(!app.queue_paused);
     }
 }

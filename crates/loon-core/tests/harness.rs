@@ -1,6 +1,6 @@
 //! Regressions for the interactive harness changes; providers are deterministic.
 use loon_config::{Config, LoonPaths};
-use loon_core::{Agent, AgentConfig, AgentEvent, TurnStatus};
+use loon_core::{replay::VisibleBlock, Agent, AgentConfig, AgentEvent, TurnStatus};
 use loon_providers::{MockProvider, MockScript, MockStep, ProviderRegistry};
 use serde_json::json;
 use std::sync::Arc;
@@ -58,7 +58,9 @@ async fn rewind_restores_multiline_prompt_and_new_branch_survives_resume() {
     while let Ok(event) = rx.try_recv() {
         if let AgentEvent::ConversationRewound { blocks, prompt } = event {
             assert_eq!(prompt, "second\nexact original draft 🦀");
-            assert!(!blocks.iter().any(|(_, s)| s.contains("discarded")));
+            assert!(!blocks.iter().any(
+                |b| matches!(b, VisibleBlock::Assistant { text } if text.contains("discarded"))
+            ));
             assert_eq!(blocks.len(), 2);
             restored = true;
         }
@@ -129,7 +131,7 @@ async fn numeric_auto_compact_persists_and_clamps_to_capacity() {
         .await
         .is_err());
     a.cfg.context_window = 16_000;
-    assert_eq!(a.compaction_trigger_tokens(), 12_800);
+    assert_eq!(a.compaction_trigger_tokens(), 12_000); // reserves completion capacity
 }
 
 #[tokio::test]
@@ -175,7 +177,8 @@ async fn context_size_accepts_shorthand_and_percent_tracks_the_window() {
     assert_eq!(a.autocompact_percent, None);
     assert_eq!(a.compaction_trigger_tokens(), 800_000);
     command(&mut a, "/context off").await;
-    assert_eq!(a.cfg.context_window, 0);
+    assert_eq!(a.cfg.context_window, 1_000_000);
+    assert!(!a.autocompact);
     assert!(!a.should_compact());
 
     // Junk and out-of-range values are refused with usage, not silently accepted.
@@ -494,11 +497,19 @@ async fn visible_rewind_history_retains_original_messages_after_compaction() {
     let mut checked = false;
     while let Ok(event) = rx.try_recv() {
         if let AgentEvent::ConversationRewound { blocks, .. } = event {
-            assert_eq!(blocks.iter().filter(|(r, _)| r == "user").count(), 3);
-            assert!(blocks.iter().any(|(_, t)| t == "answer one"));
-            assert!(!blocks
+            assert_eq!(
+                blocks
+                    .iter()
+                    .filter(|b| matches!(b, VisibleBlock::User { .. }))
+                    .count(),
+                3
+            );
+            assert!(blocks
                 .iter()
-                .any(|(_, t)| t.contains("Earlier conversation summary")));
+                .any(|b| matches!(b, VisibleBlock::Assistant { text } if text == "answer one")));
+            assert!(!blocks.iter().any(
+                |b| matches!(b, VisibleBlock::Assistant { text } if text.contains("Earlier conversation summary"))
+            ));
             checked = true;
         }
     }
@@ -549,5 +560,55 @@ async fn cancelled_turn_is_forgotten_from_history_and_journal() {
     assert!(
         !replay.iter().any(|t| t.contains("drop this one")),
         "resume must not replay the cancelled prompt: {replay:?}"
+    );
+}
+
+/// The prompt rules only matter if they reach the wire. Asserting on `BASE_SYSTEM`
+/// proves the constant; this proves the provider request carries it, which is what the
+/// model actually reads. A rule added to the constant but dropped from
+/// `assemble_messages` would pass the unit test and change nothing.
+#[tokio::test]
+async fn the_system_prompt_rules_reach_the_provider_request() {
+    let d = tempfile::tempdir().unwrap();
+    let paths = paths(d.path());
+    paths.ensure().unwrap();
+    let cwd = d.path().join("project");
+    std::fs::create_dir_all(&cwd).unwrap();
+    // `with_scripts` already returns an Arc, so the mock can be inspected afterwards.
+    let mock = MockProvider::with_scripts(vec![MockScript::text("ok")]);
+    let registry = Arc::new(ProviderRegistry::with_mock(mock.clone()));
+    let mut a = Agent::new_session(
+        &paths,
+        AgentConfig::from(&loon_config::SessionCfg::default()),
+        registry,
+        loon_tools::ToolRegistry::standard(),
+        cwd,
+        true,
+    )
+    .unwrap();
+    let _ = a.run_turn("anything").await;
+
+    let requests = mock.requests();
+    let system = requests
+        .first()
+        .and_then(|r| r.messages.first())
+        .map(|m| m.text.clone())
+        .expect("the first request must lead with a system message");
+    assert_eq!(
+        requests[0].messages[0].role,
+        loon_providers::Role::System,
+        "the rules must arrive as the system message, not somewhere later"
+    );
+    assert!(
+        system.contains("Never guess"),
+        "the no-guessing rule must reach the model: {system:.400}"
+    );
+    assert!(
+        system.contains("path:line"),
+        "the citation requirement must reach the model"
+    );
+    assert!(
+        system.contains("Prefer the dedicated tool over a shell equivalent"),
+        "the tool-preference rule must reach the model"
     );
 }

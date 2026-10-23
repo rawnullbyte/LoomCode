@@ -15,6 +15,8 @@ use unicode_width::UnicodeWidthChar;
 
 /// Most input rows shown before the editor scrolls its own view.
 const MAX_INPUT_LINES: usize = 8;
+/// Most queued prompts previewed above the input; the status bar carries the count.
+const MAX_QUEUE_ROWS: usize = 3;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     draw_inner(f, app);
@@ -44,9 +46,15 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
     };
     let spare = area.height.saturating_sub(footer_h + input_h);
     let transcript_min = spare.min(3);
-    let popup_rows = desired_popup.min(spare.saturating_sub(transcript_min));
-    let [transcript, popup, input, footer] = Layout::vertical([
+    // Queued prompts sit as dim rows directly above the prompt, so what is waiting is
+    // visible instead of hidden behind a counter in the status bar.
+    let queue_rows = (app.queued.len() as u16)
+        .min(MAX_QUEUE_ROWS as u16)
+        .min(spare.saturating_sub(transcript_min));
+    let popup_rows = desired_popup.min(spare.saturating_sub(transcript_min + queue_rows));
+    let [transcript, queue, popup, input, footer] = Layout::vertical([
         Constraint::Min(transcript_min),
+        Constraint::Length(queue_rows),
         Constraint::Length(popup_rows), // borderless [CC]-style list
         Constraint::Length(input_h),
         Constraint::Length(footer_h),
@@ -102,6 +110,24 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
         .collect();
     f.render_widget(Paragraph::new(shown).style(theme.base()), transcript);
 
+    // ── queued prompts, dim, directly above the prompt bar ──────────────────────
+    // Oldest at the top, newest nearest the input: Up on an empty input pulls back
+    // exactly the row sitting against the prompt.
+    if queue_rows > 0 && queue.height > 0 {
+        let skip = app.queued.len().saturating_sub(queue_rows as usize);
+        let rows: Vec<Line> = app
+            .queued
+            .iter()
+            .skip(skip)
+            .map(|text| {
+                let first = text.lines().next().unwrap_or("");
+                let more = if text.lines().count() > 1 { " …" } else { "" };
+                Line::from(Span::styled(format!("↳ {first}{more}"), theme.dim()))
+            })
+            .collect();
+        f.render_widget(Paragraph::new(rows).style(theme.base()), queue);
+    }
+
     // ── slash-command popup, directly above the input ───────────────────────────
     // [CC] style: borderless list, "❯ " marker on the hovered/selected row, name
     // column padded to a common width, description dimmed beside it. Hovering
@@ -123,14 +149,19 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
         // Shared name-column width, capped so descriptions still have room.
         let name_w = visible
             .iter()
-            .map(|c| c.display.chars().count() + 1) // leading '/'
+            .map(|c| c.display.chars().count() + 1) // leading '/' (or indent)
             .max()
             .unwrap_or(0)
             .min((popup.width as usize / 2).max(8));
         let mut rows: Vec<Line> = Vec::new();
         for (i, c) in visible.iter().enumerate() {
             let idx = start + i;
-            let full_name = format!("/{}", c.display);
+            // Only command rows are slash commands: an argument value is shown as the
+            // value itself, indented under the command column, never as "/90%".
+            let full_name = match c.kind {
+                crate::autocomplete::Kind::Command => format!("/{}", c.display),
+                crate::autocomplete::Kind::Argument => format!(" {}", c.display),
+            };
             let name = if full_name.chars().count() > name_w {
                 full_name
                     .chars()
@@ -472,7 +503,11 @@ fn draw_status(f: &mut Frame, app: &App, theme: &theme::Theme, area: ratatui::la
     let queue = if app.queued.is_empty() {
         String::new()
     } else {
-        format!(" · {} queued", app.queued.len())
+        if app.queue_paused {
+            format!(" · {} paused (↑ edit, Enter resume)", app.queued.len())
+        } else {
+            format!(" · {} next request", app.queued.len())
+        }
     };
     let text = if app.status.busy {
         format!(
@@ -490,11 +525,21 @@ fn draw_status(f: &mut Frame, app: &App, theme: &theme::Theme, area: ratatui::la
     );
 }
 
+/// Elapsed time in the status bar, coarsening as it grows so a long session still
+/// reads at a glance: `45s`, `3m07s`, `2h05m`, `3d04h`. Seconds are dropped once
+/// hours appear and minutes once days do — the bar is a glance, not a stopwatch.
 fn format_elapsed(secs: u64) -> String {
-    if secs < 60 {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    if secs < MINUTE {
         format!("{secs}s")
+    } else if secs < HOUR {
+        format!("{}m{:02}s", secs / MINUTE, secs % MINUTE)
+    } else if secs < DAY {
+        format!("{}h{:02}m", secs / HOUR, (secs % HOUR) / MINUTE)
     } else {
-        format!("{}m{:02}s", secs / 60, secs % 60)
+        format!("{}d{:02}h", secs / DAY, (secs % DAY) / HOUR)
     }
 }
 

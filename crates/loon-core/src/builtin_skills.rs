@@ -1,5 +1,15 @@
 //! Embedded coding workflows, available without installing a plugin or files.
 pub const SKILLS: &[(&str, &str)] = &[
+    ("design", include_str!("../skills/design.md")),
+    ("ui-audit", include_str!("../skills/ui-audit.md")),
+    (
+        "frontend-design",
+        include_str!("../skills/frontend-design.md"),
+    ),
+    (
+        "long-running-tools",
+        include_str!("../skills/long-running-tools.md"),
+    ),
     ("implement", include_str!("../skills/implement.md")),
     ("debug", include_str!("../skills/debug.md")),
     ("review", include_str!("../skills/review.md")),

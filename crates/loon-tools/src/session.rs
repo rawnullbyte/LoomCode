@@ -46,6 +46,8 @@ impl Default for ShellSessionTool {
 
 struct Session {
     child: tokio::process::Child,
+    group: crate::exec::ProcessGroup,
+    in_flight: bool,
     stdin: tokio::process::ChildStdin,
     /// Accumulated stdout+stderr. Shared with the pump task.
     buf: Arc<Mutex<Buffer>>,
@@ -59,6 +61,7 @@ impl Drop for Session {
     fn drop(&mut self) {
         // Dropping the child kills it (`kill_on_drop` was set at spawn), so a polite
         // `exit` write is unnecessary and cannot be awaited here anyway.
+        self.group.terminate();
         let _ = self.child.start_kill();
     }
 }
@@ -140,6 +143,14 @@ impl ShellSessionTool {
             )));
         }
         let mut sessions = self.sessions.lock().await;
+        let stale = sessions.get_mut(name).is_some_and(|s| {
+            s.in_flight
+                || s.buf.lock().unwrap().closed
+                || s.child.try_wait().ok().flatten().is_some()
+        });
+        if stale {
+            sessions.remove(name);
+        }
         if let Some(existing) = sessions.get(name) {
             // Reuse: starting an existing session reports it instead of leaking a second
             // shell process under the same name.
@@ -210,6 +221,8 @@ impl ShellSessionTool {
             name.to_string(),
             Session {
                 child,
+                group: crate::exec::ProcessGroup::new(pid),
+                in_flight: false,
                 stdin,
                 buf,
                 cwd: cwd.display().to_string(),
@@ -255,7 +268,7 @@ impl ShellSessionTool {
                 "no session `{name}`; call action=start first (or action=list)"
             ))
         })?;
-        if session.buf.lock().unwrap().closed {
+        if session.in_flight || session.buf.lock().unwrap().closed {
             sessions.remove(name);
             return Err(ToolError::Other(format!(
                 "session `{name}` exited; start it again"
@@ -268,7 +281,14 @@ impl ShellSessionTool {
             std::process::id(),
             self.counter.fetch_add(1, Ordering::Relaxed)
         );
-        let script = format!("{command}\n__loon_status=$?\necho {token} $__loon_status\n");
+        // eval one quoted unit: incomplete syntax reports an error instead of swallowing
+        // the sentinel. Merge stderr in the shell so it cannot arrive after the marker.
+        let quoted = format!("'{}'", command.replace('\'', "'\\''"));
+        let script = format!(
+            "eval {quoted} 2>&1\n__loon_status=$?\nprintf '\n{token} %s\n' \"$__loon_status\"\n"
+        );
+        session.in_flight = true;
+        let mut command_group = crate::exec::ProcessGroup::new(session.child.id());
         // Discard anything already buffered (a previous call's tail, shell startup noise).
         session.buf.lock().unwrap().text.clear();
         if let Err(e) = session.stdin.write_all(script.as_bytes()).await {
@@ -290,6 +310,9 @@ impl ShellSessionTool {
             if let Some(found) = take_until_marker(&session.buf, &token) {
                 break Some(found);
             }
+            if session.buf.lock().unwrap().closed {
+                break None;
+            }
             let now = tokio::time::Instant::now();
             if now >= deadline {
                 break None;
@@ -307,23 +330,28 @@ impl ShellSessionTool {
                 // Unsynchronised output cannot be safely reused: retire the session and
                 // say so, instead of returning another call's bytes later.
                 let cancelled = *ctx.cancel.borrow();
+                let exited = session.buf.lock().unwrap().closed;
                 sessions.remove(name);
                 let mut text = if cancelled {
                     format!("[CANCELLED after {:?}: session `{name}` closed]\n", timeout)
+                } else if exited {
+                    format!("[EXITED: session `{name}` closed before its command marker]\n")
                 } else {
                     format!("[TIMEOUT after {:?}: session `{name}` closed]\n", timeout)
                 };
-                text.push_str("the command may still be running; start the session again\n");
+                text.push_str("session process group terminated; start the session again\n");
                 return Ok(ToolOutput {
                     ok: false,
                     text,
                     full: None,
                     truncated: false,
-                    structured: json!({"name": name, "timed_out": !cancelled, "cancelled": cancelled, "closed": true}),
+                    structured: json!({"name": name, "timed_out": !cancelled && !exited, "exited": exited, "cancelled": cancelled, "closed": true}),
                 });
             }
         };
 
+        session.in_flight = false;
+        command_group.disarm();
         session.calls += 1;
         // `cd` must be reflected, because the shell's cwd is the session's state.
         let cwd = session_cwd(session)
@@ -407,7 +435,7 @@ async fn session_cwd(session: &mut Session) -> Option<String> {
     session.buf.lock().unwrap().text.clear();
     session
         .stdin
-        .write_all(format!("pwd\necho {token}\n").as_bytes())
+        .write_all(format!("command pwd\nprintf '{token} 0\n'\n").as_bytes())
         .await
         .ok()?;
     session.stdin.flush().await.ok()?;
@@ -436,7 +464,8 @@ fn take_until_marker(buf: &Arc<Mutex<Buffer>>, token: &str) -> Option<(String, i
     let mut guard = buf.lock().unwrap();
     let at = guard.text.find(token)?;
     let after = at + token.len();
-    let rest = guard.text[after..].to_string();
+    let newline = guard.text[after..].find('\n')?;
+    let rest = guard.text[after..after + newline].to_string();
     // The status follows the token on the same line: "<token> <status>".
     let status_text = rest.lines().next().unwrap_or("").trim().to_string();
     let exit = status_text.parse::<i32>().unwrap_or(-1);
@@ -460,9 +489,6 @@ fn shell_command(shell: &str, cwd: &std::path::Path, ctx: &ToolCtx) -> tokio::pr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    for (k, v) in ctx.child_env.iter() {
-        cmd.env(k, v);
-    }
     // The same filtered development environment one-shot `bash` gets.
     for k in [
         "PATH",
@@ -501,6 +527,9 @@ fn shell_command(shell: &str, cwd: &std::path::Path, ctx: &ToolCtx) -> tokio::pr
             cmd.env(k, v);
         }
     }
+    for (k, v) in ctx.child_env.iter() {
+        cmd.env(k, v);
+    }
     cmd.env("PAGER", "cat").env("GIT_PAGER", "cat");
     cmd.env("GIT_TERMINAL_PROMPT", "0");
     #[cfg(unix)]
@@ -508,4 +537,22 @@ fn shell_command(shell: &str, cwd: &std::path::Path, ctx: &ToolCtx) -> tokio::pr
         cmd.process_group(0);
     }
     cmd
+}
+
+#[cfg(test)]
+mod marker_tests {
+    use super::*;
+    #[test]
+    fn incomplete_marker_waits_for_status_and_newline() {
+        let buf = Arc::new(Mutex::new(Buffer::default()));
+        buf.lock().unwrap().add(b"output\nTOKEN");
+        assert!(take_until_marker(&buf, "TOKEN").is_none());
+        buf.lock().unwrap().add(b" 2");
+        assert!(take_until_marker(&buf, "TOKEN").is_none());
+        buf.lock().unwrap().add(b"\n");
+        assert_eq!(
+            take_until_marker(&buf, "TOKEN"),
+            Some(("output\n".into(), 2))
+        );
+    }
 }

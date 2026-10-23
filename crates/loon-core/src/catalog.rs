@@ -880,14 +880,46 @@ impl Agent {
             .filter_map(|s| self.tools.get(&s.name))
             .collect();
         if self.tools.get("delegate").is_some() {
-            self.tools = self.tools.clone().without(&["delegate"]).with_extra(vec![
-                crate::subagent::delegate_tool(
-                    self.loon_paths(),
-                    self.cfg.clone(),
-                    self.registry.clone(),
-                    self.ctx.ws.root().to_path_buf(),
-                ),
-            ]);
+            // Rebuild delegation against the CURRENT config, but keep the background
+            // hub: it owns the running children, so a fresh one would orphan them and
+            // hide their reports from background_list.
+            let spec = crate::subagent::ChildSpec {
+                paths: self.loon_paths(),
+                cfg: self.cfg.clone(),
+                registry: self.registry.clone(),
+                cwd: self.ctx.ws.root().to_path_buf(),
+            };
+            self.tools = self
+                .tools
+                .clone()
+                .without(&[
+                    "delegate",
+                    "background_spawn",
+                    "background_list",
+                    "background_message",
+                    "background_kill",
+                ])
+                .with_extra(vec![
+                    crate::subagent::delegate_tool(
+                        spec.paths.clone(),
+                        spec.cfg.clone(),
+                        spec.registry.clone(),
+                        spec.cwd.clone(),
+                    ),
+                    std::sync::Arc::new(crate::subagent::BackgroundSpawnTool {
+                        spec,
+                        hub: self.background.clone(),
+                    }),
+                    std::sync::Arc::new(crate::subagent::BackgroundListTool {
+                        hub: self.background.clone(),
+                    }),
+                    std::sync::Arc::new(crate::subagent::BackgroundMessageTool {
+                        hub: self.background.clone(),
+                    }),
+                    std::sync::Arc::new(crate::subagent::BackgroundKillTool {
+                        hub: self.background.clone(),
+                    }),
+                ]);
         }
     }
     pub(crate) async fn refresh_catalogs(&mut self, names: Vec<String>) {

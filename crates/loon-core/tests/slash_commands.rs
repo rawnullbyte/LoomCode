@@ -536,3 +536,313 @@ async fn session_cwd_reports_the_recorded_workspace() {
         "an unknown session must not report a workspace"
     );
 }
+
+/// Session ids are UUIDv7, so the leading characters are a timestamp: two sessions
+/// started in the same instant share their first 24 hex chars, and any two started
+/// within ~65s share the first 8. The `/resume` listing used to print a fixed 8-char
+/// slice, so it showed two DIFFERENT sessions under the SAME id — and typing that id
+/// back hit the "you are already in this session" shortcut, reporting success while
+/// silently staying put. A displayed id must therefore be both unique and usable.
+#[tokio::test]
+async fn every_listed_session_id_is_unique_and_selects_that_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![
+            MockScript::text("answer alpha"),
+            MockScript::text("answer beta"),
+            MockScript::text("answer gamma"),
+        ]),
+    ));
+    let mut a = Agent::new_session(
+        &paths,
+        loon_core::AgentConfig {
+            model_ref: "mock".into(),
+            tool_output_bytes: 4096,
+            max_retries: 0,
+            allow_retry_after_partial_stream: false,
+            check_command: None,
+            ultra_rounds: 0,
+            permissions: Default::default(),
+            context_window: 128_000,
+            extra_tools: Vec::new(),
+        },
+        registry,
+        loon_tools::ToolRegistry::standard(),
+        ws,
+        true,
+    )
+    .unwrap();
+
+    // Three sessions created back to back: exactly the shape that collides.
+    for (prompt, title) in [
+        ("session alpha about parsing", "alpha"),
+        ("session beta about lexing", "beta"),
+        ("session gamma about parsing", "gamma"),
+    ] {
+        let _ = a.run_turn(prompt).await;
+        assert!(
+            a.run_slash(SlashCommand::New).await.is_ok(),
+            "each /new must succeed"
+        );
+        let _ = title;
+    }
+
+    let listing = a
+        .run_slash(SlashCommand::Resume { target: None })
+        .await
+        .unwrap();
+
+    // Collect the id shown on each row: "  N: <id> · <title> · ...".
+    let shown: Vec<String> = listing
+        .lines()
+        .filter_map(|line| line.split(": ").nth(1))
+        .filter_map(|rest| rest.split(" · ").next())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(shown.len(), 3, "three sessions must be listed: {listing}");
+
+    let unique: std::collections::HashSet<&String> = shown.iter().collect();
+    assert_eq!(
+        unique.len(),
+        shown.len(),
+        "each listed id must identify exactly one session, got {shown:?}\n{listing}"
+    );
+
+    // Every displayed id must actually select the session it labels.
+    for id in &shown {
+        let out = a
+            .run_slash(SlashCommand::Resume {
+                target: Some(id.clone()),
+            })
+            .await
+            .unwrap_or_else(|e| panic!("the listed id {id} must be a usable selector: {e}"));
+        assert!(
+            out.starts_with(&format!("resumed session {id}")),
+            "resuming by the displayed id {id} must land on THAT session, got: {out}"
+        );
+    }
+}
+
+/// The complement of the listing fix: a user may type a short prefix by hand. When
+/// that prefix also matches a *different* saved session it is ambiguous, and it must
+/// not be answered with "resumed the session you are already in" — that reports
+/// success while ignoring the session the user asked to switch to.
+#[tokio::test]
+async fn a_prefix_shared_with_another_session_is_not_taken_as_the_current_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![
+            MockScript::text("answer alpha"),
+            MockScript::text("answer beta"),
+        ]),
+    ));
+    let mut a = Agent::new_session(
+        &paths,
+        loon_core::AgentConfig {
+            model_ref: "mock".into(),
+            tool_output_bytes: 4096,
+            max_retries: 0,
+            allow_retry_after_partial_stream: false,
+            check_command: None,
+            ultra_rounds: 0,
+            permissions: Default::default(),
+            context_window: 128_000,
+            extra_tools: Vec::new(),
+        },
+        registry,
+        loon_tools::ToolRegistry::standard(),
+        ws,
+        true,
+    )
+    .unwrap();
+
+    // Two sessions back to back: they share the leading 8 hex chars.
+    let _ = a.run_turn("session alpha about parsing").await;
+    let _ = a.run_slash(SlashCommand::New).await;
+    let _ = a.run_turn("session beta about lexing").await;
+
+    let current = a.session_id().to_string();
+    let short: String = current.chars().take(8).collect();
+
+    // That bare prefix matches the other session too, so it cannot identify this one.
+    let result = a
+        .run_slash(SlashCommand::Resume {
+            target: Some(short.clone()),
+        })
+        .await;
+    match result {
+        Err(e) => assert!(
+            e.contains("ambiguous") || e.contains("unknown"),
+            "an ambiguous prefix must be refused by name, got: {e}"
+        ),
+        Ok(out) => panic!(
+            "the bare prefix {short} also matches another session and must not be \
+             accepted as the current one, got: {out}"
+        ),
+    }
+
+    // The full id is unambiguous and must still resume the session we are in.
+    let out = a
+        .run_slash(SlashCommand::Resume {
+            target: Some(current.clone()),
+        })
+        .await
+        .expect("the full id must resume the current session");
+    assert!(out.starts_with("resumed session"), "{out}");
+}
+
+/// `/export` with no path writes `loon-session-<id>.md` into the cwd and
+/// `export_markdown` overwrites without asking. With a short id slice, two sessions
+/// started within ~65s produced the SAME default filename, so the second export
+/// silently destroyed the first. A filename has no width budget, so it uses the full id.
+#[tokio::test]
+async fn a_default_export_from_one_session_does_not_overwrite_another() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![
+            MockScript::text("alpha answer"),
+            MockScript::text("beta answer"),
+        ]),
+    ));
+    let mut a = Agent::new_session(
+        &paths,
+        loon_core::AgentConfig {
+            model_ref: "mock".into(),
+            tool_output_bytes: 4096,
+            max_retries: 0,
+            allow_retry_after_partial_stream: false,
+            check_command: None,
+            ultra_rounds: 0,
+            permissions: Default::default(),
+            context_window: 128_000,
+            extra_tools: Vec::new(),
+        },
+        registry,
+        loon_tools::ToolRegistry::standard(),
+        ws,
+        true,
+    )
+    .unwrap();
+
+    let _ = a.run_turn("session alpha about parsing").await;
+    let first = a
+        .run_slash(SlashCommand::Export { path: None })
+        .await
+        .unwrap();
+
+    let _ = a.run_slash(SlashCommand::New).await;
+    let _ = a.run_turn("session beta about lexing").await;
+    let second = a
+        .run_slash(SlashCommand::Export { path: None })
+        .await
+        .unwrap();
+
+    assert_ne!(
+        first, second,
+        "two sessions must not export to the same default file"
+    );
+    // The earlier export must still hold the earlier session's content.
+    let first_path = first.trim_start_matches("exported to ").trim();
+    let kept = std::fs::read_to_string(first_path)
+        .unwrap_or_else(|e| panic!("the first export must survive: {e}"));
+    assert!(
+        kept.contains("alpha"),
+        "the first export was overwritten; it now holds: {kept:.200}"
+    );
+
+    // The default path is cwd-relative, so both files land beside the test binary's
+    // working directory: remove them rather than littering the crate.
+    for out in [&first, &second] {
+        let _ = std::fs::remove_file(out.trim_start_matches("exported to ").trim());
+    }
+}
+
+/// A `/new` session that has sent nothing yet lives only in memory, so it is absent
+/// from the store listing the display prefix is computed against. It still shares the
+/// leading hex chars with saved sessions created moments earlier. Resuming a LISTED
+/// session by its displayed id must therefore reach that saved session, not be caught
+/// by the "you are already in this session" shortcut on the pending one.
+#[tokio::test]
+async fn a_listed_id_still_resumes_the_saved_session_while_a_pending_one_exists() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![MockScript::text("alpha answer")]),
+    ));
+    let mut a = Agent::new_session(
+        &paths,
+        loon_core::AgentConfig {
+            model_ref: "mock".into(),
+            tool_output_bytes: 4096,
+            max_retries: 0,
+            allow_retry_after_partial_stream: false,
+            check_command: None,
+            ultra_rounds: 0,
+            permissions: Default::default(),
+            context_window: 128_000,
+            extra_tools: Vec::new(),
+        },
+        registry,
+        loon_tools::ToolRegistry::standard(),
+        ws,
+        true,
+    )
+    .unwrap();
+
+    // One saved session.
+    let _ = a.run_turn("session alpha about parsing").await;
+    let saved = a.session_id();
+
+    // A new session that has sent nothing: pending, so not in the listing.
+    let _ = a.run_slash(SlashCommand::New).await;
+    let pending = a.session_id();
+    assert_ne!(pending, saved);
+
+    let listing = a
+        .run_slash(SlashCommand::Resume { target: None })
+        .await
+        .unwrap();
+    let shown: Vec<String> = listing
+        .lines()
+        .skip(1)
+        .filter_map(|l| l.split(": ").nth(1))
+        .filter_map(|r| r.split(" · ").next())
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        shown.len(),
+        1,
+        "only the saved session is listed: {listing}"
+    );
+
+    let out = a
+        .run_slash(SlashCommand::Resume {
+            target: Some(shown[0].clone()),
+        })
+        .await
+        .expect("the listed id must resume the saved session");
+    assert!(
+        out.contains(&saved.to_string()),
+        "must land on the saved session {saved}, got: {out}"
+    );
+    assert_eq!(
+        a.session_id(),
+        saved,
+        "the displayed id must not be answered with the pending session"
+    );
+}

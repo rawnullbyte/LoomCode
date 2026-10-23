@@ -344,3 +344,60 @@ fn persistent_tools_are_registered_with_useful_specs() {
         assert!(spec.parameters["properties"]["action"]["enum"].is_array());
     }
 }
+
+#[tokio::test]
+async fn aborted_shell_command_is_retired_and_syntax_errors_do_not_desync_it() {
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path());
+    let reg = ToolRegistry::standard();
+    let shell = reg.get("shell_session").unwrap();
+    shell
+        .run(json!({"action":"start","name":"abort"}), &c)
+        .await
+        .unwrap();
+    let out = shell
+        .run(
+            json!({"action":"run","name":"abort","command":"echo 'unterminated"}),
+            &c,
+        )
+        .await
+        .unwrap();
+    assert!(!out.ok);
+    let out = shell
+        .run(
+            json!({"action":"run","name":"abort","command":"echo recovered"}),
+            &c,
+        )
+        .await
+        .unwrap();
+    assert!(out.ok && out.text.contains("recovered"));
+    let handle = {
+        let tool = shell.clone();
+        let c = c.clone();
+        tokio::spawn(async move {
+            tool.run(
+                json!({"action":"run","name":"abort","command":"echo started > started; sleep 20"}),
+                &c,
+            )
+            .await
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while !d.path().join("started").exists() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.abort();
+    let _ = handle.await;
+    assert!(shell
+        .run(
+            json!({"action":"run","name":"abort","command":"echo must-not-run"}),
+            &c
+        )
+        .await
+        .is_err());
+    let out = shell.run(json!({"action":"list"}), &c).await.unwrap();
+    assert!(out.text.contains("no sessions"));
+}

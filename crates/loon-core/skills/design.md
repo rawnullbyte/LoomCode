@@ -1,0 +1,6 @@
+---
+description: Design and build a coherent interface from requirements, references and existing assets.
+---
+Start by inspecting the actual screen, components, style tokens, assets and user feedback. Preserve explicit constraints (especially asset-only requirements). Translate the task into the main user action, information hierarchy, density and navigation needs. If a reference is provided, describe the reusable visual rules, not its exact layout.
+Choose a clear visual direction grounded in the product: type scale, spacing rhythm, contrast, surfaces, borders, focus states and restrained motion. Reuse the existing design system. Avoid generic gradient cards, decorative dashboards, placeholder metrics and invented assets. Make original layout decisions with a practical reason.
+Build the requested working interface. Include loading, empty, error, disabled and keyboard states where relevant. Use realistic copy, responsive layouts and accessible labels. Verify real component behavior and inspect at desktop and narrow sizes using available tools. Check alignment, clipping, contrast, scrolling and focus. Iterate on evidence. Report what was built and verified; do not stop at design advice. {{args}}

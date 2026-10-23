@@ -764,6 +764,8 @@ impl Agent {
         self.set_permission_mode(effective.permissions.mode);
         self.effort = effective.session.effort.clone();
         self.autocompact_tokens = effective.session.autocompact_tokens;
+        self.autocompact_percent = effective.session.autocompact_percent;
+        self.autocompact = effective.session.autocompact;
         self.tips = effective.ui.tips;
         self.cfg.model_ref = effective.session.model.clone();
         self.cfg.context_window = match self.registry.resolve(&effective.session.model)? {
@@ -812,6 +814,7 @@ impl Agent {
             ("animations", effective.ui.animations.to_string()),
             ("popup_rows", effective.ui.popup_rows.to_string()),
             ("context_window", self.cfg.context_window.to_string()),
+            ("autocompact", self.autocompact.to_string()),
             ("tips", effective.ui.tips.to_string()),
             ("tip_text", effective.ui.tip_text.clone()),
             ("footer", effective.ui.footer.to_string()),

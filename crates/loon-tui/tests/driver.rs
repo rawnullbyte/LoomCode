@@ -138,7 +138,7 @@ fn serde_for_wait() -> serde_json::Value {
 /// Esc while the first request is still streaming: the prompt must come back to the
 /// input bar (via UiNotice::RestorePrompt) instead of being lost.
 #[tokio::test]
-async fn cancelling_an_in_flight_prompt_hands_it_back_for_editing() {
+async fn cancelling_preserves_the_prompt_and_does_not_restore_or_rewind_it() {
     let temp = tempfile::tempdir().unwrap();
     let p = temp.path();
     let paths = loon_config::LoonPaths {
@@ -173,7 +173,7 @@ async fn cancelling_an_in_flight_prompt_hands_it_back_for_editing() {
     let (out, _results) = mpsc::channel(8);
     let (notices, mut notice_rx) = mpsc::channel(8);
     let driver = tokio::spawn(loon_tui::driver::run(
-        a,
+        a.clone(),
         rx,
         tx,
         notices,
@@ -196,19 +196,28 @@ async fn cancelling_an_in_flight_prompt_hands_it_back_for_editing() {
     .unwrap();
     cmd.send(UiCommand::Cancel).await.unwrap();
 
-    // The exact prompt text is handed back for the input bar.
-    let restored = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            match notice_rx.recv().await {
-                Some(loon_tui::UiNotice::RestorePrompt(text)) => break Some(text),
-                Some(_) => continue,
-                None => break None,
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            if let AgentEvent::TurnFinished { status } = event {
+                assert_eq!(status, loon_core::TurnStatus::Cancelled);
+                break;
             }
         }
     })
     .await
     .unwrap();
-    assert_eq!(restored.as_deref(), Some(prompt));
+    while let Ok(notice) = notice_rx.try_recv() {
+        assert!(!matches!(notice, loon_tui::UiNotice::RestorePrompt(_)));
+    }
+    let guard = a.lock().await;
+    assert!(guard.history.iter().any(|m| m.text == prompt));
+    assert!(!guard
+        .journal
+        .events()
+        .unwrap()
+        .iter()
+        .any(|e| matches!(e.kind, loon_events::model::EventKind::Rewound { .. })));
+    drop(guard);
 
     drop(cmd);
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;

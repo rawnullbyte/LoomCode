@@ -17,6 +17,8 @@ pub enum Lang {
     Shell,
     Json,
     Toml,
+    Sql,
+    Diff,
     Plain,
 }
 
@@ -24,14 +26,22 @@ impl Lang {
     /// Map a fence tag (`rust`, `rs`, `py`, …) to a family. Unknown tags are `Plain`,
     /// which still gets comment and string colouring via the C-like default.
     pub fn from_tag(tag: &str) -> Lang {
-        match tag.trim().to_ascii_lowercase().as_str() {
+        let tag = tag
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|c| matches!(c, '{' | '}' | '.'));
+        match tag.to_ascii_lowercase().as_str() {
             "rust" | "rs" => Lang::Rust,
             "python" | "py" | "python3" => Lang::Python,
-            "javascript" | "js" | "jsx" | "typescript" | "ts" | "tsx" | "c" | "cpp" | "c++"
-            | "java" | "go" | "kotlin" | "swift" | "scala" => Lang::JavaScript,
+            "javascript" | "js" | "jsx" | "typescript" | "ts" | "tsx" | "scala" => Lang::JavaScript,
             "bash" | "sh" | "shell" | "zsh" | "console" => Lang::Shell,
             "json" | "jsonc" => Lang::Json,
-            "toml" => Lang::Toml,
+            "toml" | "yaml" | "yml" | "dockerfile" => Lang::Toml,
+            "c" | "h" | "cpp" | "c++" | "cc" | "csharp" | "c#" | "cs" | "java" | "kotlin"
+            | "kt" | "go" | "golang" | "swift" | "css" | "scss" => Lang::JavaScript,
+            "sql" => Lang::Sql,
+            "diff" | "patch" => Lang::Diff,
             _ => Lang::Plain,
         }
     }
@@ -51,7 +61,9 @@ impl Lang {
             | "h" | "cc" | "cpp" | "hpp" | "cs" | "scala" => Lang::JavaScript,
             "sh" | "bash" | "zsh" | "fish" => Lang::Shell,
             "json" | "jsonc" => Lang::Json,
-            "toml" => Lang::Toml,
+            "toml" | "yaml" | "yml" => Lang::Toml,
+            "sql" => Lang::Sql,
+            "diff" | "patch" => Lang::Diff,
             _ => Lang::Plain,
         }
     }
@@ -106,12 +118,77 @@ impl Lang {
                 "implements",
                 "public",
                 "private",
+                "package",
+                "func",
+                "defer",
+                "go",
+                "chan",
+                "range",
+                "map",
+                "make",
+                "nil",
+                "struct",
+                "enum",
+                "typedef",
+                "union",
+                "sizeof",
+                "void",
+                "int",
+                "char",
+                "float",
+                "double",
+                "bool",
+                "static",
+                "unsigned",
+                "signed",
+                "include",
+                "switch",
+                "case",
+                "break",
+                "continue",
+                "protected",
+                "final",
+                "val",
+                "fun",
+                "override",
             ],
             Lang::Shell => &[
                 "if", "then", "else", "elif", "fi", "for", "while", "do", "done", "case", "esac",
                 "function", "return", "export", "local", "set", "unset", "source", "cd", "echo",
             ],
-            Lang::Json | Lang::Toml | Lang::Plain => &["true", "false", "null"],
+            Lang::Sql => &[
+                "select",
+                "from",
+                "where",
+                "insert",
+                "into",
+                "update",
+                "delete",
+                "create",
+                "table",
+                "join",
+                "left",
+                "right",
+                "on",
+                "as",
+                "and",
+                "or",
+                "not",
+                "null",
+                "values",
+                "set",
+                "order",
+                "by",
+                "group",
+                "limit",
+                "having",
+                "drop",
+                "alter",
+                "primary",
+                "key",
+                "references",
+            ],
+            Lang::Json | Lang::Toml | Lang::Diff | Lang::Plain => &["true", "false", "null"],
         }
     }
 
@@ -120,7 +197,8 @@ impl Lang {
         match self {
             Lang::Rust | Lang::JavaScript => Some("//"),
             Lang::Python | Lang::Shell | Lang::Toml => Some("#"),
-            Lang::Json | Lang::Plain => None,
+            Lang::Sql => Some("--"),
+            Lang::Json | Lang::Diff | Lang::Plain => None,
         }
     }
 
@@ -132,7 +210,7 @@ impl Lang {
             Lang::JavaScript | Lang::Json => &['"', '\'', '`'],
             Lang::Shell => &['"', '\''],
             Lang::Toml => &['"', '\''],
-            Lang::Plain => &['"', '\''],
+            Lang::Sql | Lang::Diff | Lang::Plain => &['"', '\''],
         }
     }
 }
@@ -194,6 +272,18 @@ pub fn split_gutter(line: &str) -> Option<(&str, &str)> {
 /// concatenation equals `line` exactly — the transcript's copy/selection logic depends
 /// on that, so dropping or reordering characters would corrupt copied text.
 pub fn highlight(line: &str, lang: Lang) -> Vec<Piece> {
+    if lang == Lang::Diff {
+        let style = if line.starts_with("@@") || line.starts_with("diff ") {
+            keyword_style()
+        } else if line.starts_with('+') {
+            string_style()
+        } else if line.starts_with('-') {
+            Style::default().fg(Color::Red)
+        } else {
+            plain_style()
+        };
+        return vec![(line.into(), style)];
+    }
     let chars: Vec<char> = line.chars().collect();
     let mut out: Vec<Piece> = Vec::new();
     let mut i = 0usize;
@@ -268,7 +358,12 @@ pub fn highlight(line: &str, lang: Lang) -> Vec<Piece> {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
-            if lang.keywords().contains(&word.as_str()) {
+            if lang.keywords().contains(&word.as_str())
+                || (lang == Lang::Sql
+                    && lang
+                        .keywords()
+                        .contains(&word.to_ascii_lowercase().as_str()))
+            {
                 flush!();
                 out.push((word, keyword_style()));
             } else {
@@ -282,6 +377,21 @@ pub fn highlight(line: &str, lang: Lang) -> Vec<Piece> {
     }
     flush!();
     coalesce(out)
+}
+
+pub fn slice(pieces: &[Piece], start: usize, len: usize) -> Vec<Piece> {
+    let mut offset = 0;
+    let mut out = Vec::new();
+    for (text, style) in pieces {
+        let count = text.chars().count();
+        let lo = start.saturating_sub(offset).min(count);
+        let hi = (start + len).saturating_sub(offset).min(count);
+        if hi > lo {
+            out.push((text.chars().skip(lo).take(hi - lo).collect(), *style));
+        }
+        offset += count;
+    }
+    out
 }
 
 fn is_word(c: char) -> bool {

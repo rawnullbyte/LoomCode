@@ -88,7 +88,17 @@ Inspect the supplied task and relevant code. Report verified defects and evidenc
 
 The model uses `delegate` with `{"agent":"reviewer","task":"..."}`. Profiles can set `isolation: worktree` to create a detached Git worktree. Worktrees are retained for review; the report includes their path and the child session ID. Inspect/cherry-pick needed changes and remove the worktree with Git when finished. A worktree starts from committed HEAD and does not include uncommitted parent changes.
 
-Children have separate histories and journals, inherit the parent's permission rules, receive only the task text, and cannot recursively delegate. MCP tools may be inherited; profile tool restrictions still apply. `maxTurns` limits model requests, with a visible incomplete result on exhaustion. Parent cancellation propagates. Profiles execute in the foreground; concurrent background agents, arbitrary parent-history forks and messaging teams are not implemented.
+Children have separate histories and journals, inherit the parent's permission rules, receive only the task text, and cannot recursively delegate. MCP tools may be inherited; profile tool restrictions still apply. `maxTurns` limits model requests, with a visible incomplete result on exhaustion. Parent cancellation propagates.
+
+`delegate` blocks until the child answers. `background_spawn` returns an id immediately and the child runs concurrently; the parent keeps working and collects the result later.
+
+- `background_list` reports each agent's status and, once finished, the report it produced.
+- `background_message` steers a running child. The message is applied at the child's next step boundary, through the same channel as user steering, so a long task can be redirected without restarting it. Sending to a finished agent fails rather than silently doing nothing.
+- `background_kill` cancels a running child cooperatively: it stops at its next step boundary and is journaled as cancelled. Aborting the task outright would skip that bookkeeping.
+
+A finished child reports twice: the parent's turn loop drains pending reports at each step boundary and records them as context, so the model sees what its agents did on its next request; and `AgentEvent::SubagentFinished` reaches the UI, which renders the status and the report in the transcript. A report that arrives after the parent's last step is still collected by the next turn.
+
+`background_spawn` fails the tool call when the task cannot be built (unknown profile, bad `cwd`, unresolvable model) instead of surfacing it later as a background failure. Children still cannot recursively delegate, and they inherit the parent's cancellation.
 
 ## Lifecycle hooks
 

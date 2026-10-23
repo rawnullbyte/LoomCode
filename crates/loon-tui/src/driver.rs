@@ -10,9 +10,6 @@ struct Job {
     task: JoinHandle<()>,
     /// False for slash commands: only a cancelled turn gets a synthetic finish.
     turn: bool,
-    /// The exact prompt this job is running, so cancelling it can hand the text back
-    /// to the input bar instead of losing it.
-    prompt: Option<String>,
 }
 
 impl Drop for Job {
@@ -31,6 +28,7 @@ fn slash_job(
     agent: Arc<Mutex<Agent>>,
     command: loon_core::commands::SlashCommand,
     results: mpsc::Sender<String>,
+    events: mpsc::Sender<AgentEvent>,
 ) -> Job {
     let is_turn = matches!(
         &command,
@@ -38,12 +36,29 @@ fn slash_job(
             | loon_core::commands::SlashCommand::UltraCode { .. }
             | loon_core::commands::SlashCommand::UltraLoop { .. }
     );
+    let operation = matches!(
+        &command,
+        loon_core::commands::SlashCommand::Shell { .. }
+            | loon_core::commands::SlashCommand::Monitors { .. }
+            | loon_core::commands::SlashCommand::Jobs { .. }
+            | loon_core::commands::SlashCommand::Compact
+            | loon_core::commands::SlashCommand::Recap
+    );
     Job {
-        turn: is_turn,
-        prompt: None,
+        turn: is_turn || operation,
         task: tokio::spawn(async move {
             let mut agent = agent.lock().await;
+            if operation {
+                let _ = events.send(AgentEvent::TurnStarted).await;
+            }
             let output = agent.run_slash(command).await;
+            if operation {
+                let status = output
+                    .as_ref()
+                    .map(|_| TurnStatus::Completed)
+                    .unwrap_or_else(|e| TurnStatus::Failed(e.clone()));
+                let _ = events.send(AgentEvent::TurnFinished { status }).await;
+            }
             let _ = results
                 .send(output.unwrap_or_else(|e| format!("Error: {e}")))
                 .await;
@@ -55,14 +70,11 @@ fn publish(queue: &PromptQueue, notices: &mpsc::Sender<UiNotice>) {
     let _ = notices.try_send(UiNotice::Queue(queue.snapshot()));
 }
 
-/// Hard stop: signal the lock-free cancel handle and abort the task. Aborting drops
-/// the tokio Mutex guard, so the next turn can take the agent immediately. Returns
-/// true when a synthetic `TurnFinished(Cancelled)` is needed (the task had not
-/// already finished and emitted its own), plus the prompt that was cancelled so the
-/// UI can put it back in the input bar.
-async fn stop(running: &mut Option<Job>, cancel: &watch::Sender<bool>) -> (bool, Option<String>) {
+/// Stop drops the running future and its process guards. Conversation repair is
+/// performed by the caller after the agent mutex has been released.
+async fn stop(running: &mut Option<Job>, cancel: &watch::Sender<bool>) -> bool {
     let Some(mut job) = running.take() else {
-        return (false, None);
+        return false;
     };
     let _ = cancel.send(true);
     let finished = job.task.is_finished();
@@ -70,15 +82,7 @@ async fn stop(running: &mut Option<Job>, cancel: &watch::Sender<bool>) -> (bool,
         job.task.abort();
     }
     let _ = (&mut job.task).await;
-    // Only an aborted turn hands its prompt back: a turn that had already finished
-    // produced its answer, so its text is history, not a draft. Slash commands never
-    // own prompt text.
-    let restore = if job.turn && !finished {
-        job.prompt.take()
-    } else {
-        None
-    };
-    (job.turn && !finished, restore)
+    job.turn && !finished
 }
 
 pub async fn run(
@@ -89,15 +93,26 @@ pub async fn run(
     results: mpsc::Sender<String>,
     loops: Arc<loon_core::loops::LoopRegistry>,
 ) {
-    let (mut cancel, mut live_worklog) = {
+    let (mut cancel, mut live_worklog, mut live_tx, mut queue) = {
         let a = agent.lock().await;
-        (a.cancel_handle(), a.worklog.clone())
+        (
+            a.cancel_handle(),
+            a.worklog.clone(),
+            a.live_command_sender(),
+            a.inbox.clone(),
+        )
     };
-    let mut queue = PromptQueue::new(16);
     publish(&queue, &notices);
     let mut running: Option<Job> = None;
+    let mut queue_paused = false;
+    let (mut status_tools, mut status_ctx, mut status_permissions) = {
+        let a = agent.lock().await;
+        (a.tools.clone(), a.ctx.clone(), a.cfg.permissions.clone())
+    };
+    let mut queries = tokio::task::JoinSet::new();
+    let mut published = Vec::new();
     let mut settings_queue = std::collections::VecDeque::new();
-    let mut timer = tokio::time::interval(std::time::Duration::from_millis(250));
+    let mut timer = tokio::time::interval(std::time::Duration::from_millis(50));
     loop {
         if running
             .as_ref()
@@ -115,18 +130,31 @@ pub async fn run(
                 let a = agent.lock().await;
                 cancel = a.cancel_handle();
                 live_worklog = a.worklog.clone();
+                live_tx = a.live_command_sender();
+                queue = a.inbox.clone();
+                status_tools = a.tools.clone();
+                status_ctx = a.ctx.clone();
+                status_permissions = a.cfg.permissions.clone();
             }
             if let Some(command) = settings_queue.pop_front() {
-                running = Some(slash_job(agent.clone(), command, results.clone()));
-            } else if !queue.is_empty() {
+                running = Some(slash_job(
+                    agent.clone(),
+                    command,
+                    results.clone(),
+                    events.clone(),
+                ));
+            } else if !queue_paused && !queue.is_empty() {
                 // All prompts typed while the turn ran ship with the NEXT request, not
                 // one per turn boundary. Order is preserved, newest last.
-                let combined = queue.drain_all().join("\n\n");
+                let prompts = queue.drain_all();
+                let combined = prompts.join("\n\n");
+                let _ = events
+                    .send(AgentEvent::QueuedMessagesApplied { messages: prompts })
+                    .await;
                 publish(&queue, &notices);
                 running = Some(Job {
                     task: turn(agent.clone(), combined.clone()),
                     turn: true,
-                    prompt: Some(combined),
                 });
             }
         }
@@ -141,6 +169,9 @@ pub async fn run(
                 running=None;
                 if let Err(e)=done {let _=results.send(format!("operation failed: {e}")).await;}
             }
+            result = queries.join_next(), if !queries.is_empty() => {
+                if let Some(Ok(output)) = result { let _ = results.send(output).await; }
+            }
             command=commands.recv()=>{
                 let Some(command)=command else{break;};
                 // A TurnFinished event may have reached the UI a few instructions before
@@ -152,21 +183,12 @@ pub async fn run(
                 }
                 match command {
                     UiCommand::Cancel=>{
-                        let (finished, prompt) = stop(&mut running, &cancel).await;
-                        // Forget the cancelled turn in the agent too: its user message and
-                        // anything it journaled are dropped, so the prompt is not left in
-                        // the conversation and a resume will not replay it.
-                        let mut forgotten = None;
+                        let finished = stop(&mut running, &cancel).await;
+                        queue_paused = true;
+                        let _ = notices.send(UiNotice::QueuePaused(true)).await;
                         if finished {
-                            forgotten = agent.lock().await.forget_cancelled_turn();
-                        }
-                        if finished {
+                            agent.lock().await.seal_cancelled_turn();
                             let _=events.send(AgentEvent::TurnFinished{status:TurnStatus::Cancelled}).await;
-                        }
-                        // Hand the prompt back to the input bar; prefer the text the agent
-                        // actually recorded, falling back to what this job was running.
-                        if let Some(text) = forgotten.or(prompt) {
-                            let _ = notices.send(UiNotice::RestorePrompt(text)).await;
                         }
                     }
                     // Send now: the old turn is aborted and this prompt runs as the
@@ -175,36 +197,45 @@ pub async fn run(
                     // with everything already queued appended. An empty prompt just
                     // stops the turn so the queue can drain.
                     UiCommand::SendNow(text)=>{
-                        let (finished, previous) = stop(&mut running, &cancel).await;
+                        let finished = stop(&mut running, &cancel).await;
+                        queue_paused = false;
+                        let _ = notices.send(UiNotice::QueuePaused(false)).await;
                         if finished {
                             let _=events.send(AgentEvent::TurnFinished{status:TurnStatus::Cancelled}).await;
                         }
-                        // A replaced in-flight prompt is still the user's text: keep it.
-                        if let Some(kept) = previous {
-                            let _ = notices.send(UiNotice::RestorePrompt(kept)).await;
-                        }
+                        if finished { agent.lock().await.seal_cancelled_turn(); }
                         cancel=agent.lock().await.cancel_handle();
                         if text.trim().is_empty() {
                             running=None;
                         } else {
                             let mut prompts = queue.drain_all();
-                            prompts.insert(0, text);
+                            prompts.push(text);
                             let combined = prompts.join("\n\n");
+                            let _ = events.send(AgentEvent::QueuedMessagesApplied { messages: prompts }).await;
                             publish(&queue,&notices);
-                            running=Some(Job{task:turn(agent.clone(),combined.clone()),turn:true,prompt:Some(combined)});
+                            running=Some(Job{task:turn(agent.clone(),combined.clone()),turn:true});
                         }
                     }
                     UiCommand::TakeLastQueued=>{
-                        queue.remove_last();
+                        if let Some(text) = queue.remove_last() { let _ = notices.send(UiNotice::Draft(text)).await; }
                         publish(&queue, &notices);
                     }
                     UiCommand::Submit(text)=>{
-                        if running.is_none() {
-                            running=Some(Job{task:turn(agent.clone(),text.clone()),turn:true,prompt:Some(text)});
-                        } else {match queue.push(text) {
-                            Ok(n)=>{publish(&queue,&notices);let _=results.send(format!("queued {n} prompt(s); current operation is still running")).await;},
-                            Err(e)=>{let _=results.send(e).await;}
-                        }}
+                        queue_paused = false;
+                        let _ = notices.send(UiNotice::QueuePaused(false)).await;
+                        if running.is_none() && queue.is_empty() {
+                            let _ = events.send(AgentEvent::QueuedMessagesApplied { messages: vec![text.clone()] }).await;
+                            running=Some(Job{task:turn(agent.clone(),text.clone()),turn:true});
+                        } else {
+                            let backup = text.clone();
+                            match queue.push(text) {
+                                Ok(_) => publish(&queue, &notices),
+                                Err(e) => {
+                                    let _ = notices.send(UiNotice::Draft(backup)).await;
+                                    let _ = results.send(e).await;
+                                }
+                            }
+                        }
                     }
                     UiCommand::CycleMode=>{
                         if running.is_some(){let _=results.send("change permissions after the current operation finishes".into()).await;continue;}
@@ -213,6 +244,51 @@ pub async fn run(
                         let _=events.send(AgentEvent::ModeChanged {mode:format!("{mode:?}").to_lowercase()}).await;
                     }
                     UiCommand::Slash(command)=>{
+                        if running.is_some() {
+                            if let Some((name, args)) = observation(&command) {
+                                if queries.len() >= 8 { let _ = results.send("too many pending status queries".into()).await; continue; }
+                                let tool = status_tools.get(name);
+                                let ctx = status_ctx.clone();
+                                let permissions = status_permissions.clone();
+                                queries.spawn(async move {
+                                    let Some(tool) = tool else { return format!("{name} is unavailable"); };
+                                    let policy = loon_core::permissions::PermissionEngine::new(&permissions, None);
+                                    let decision = policy.evaluate_call(name, &args, ctx.ws.root(), false);
+                                    if !decision.is_allowed() { return format!("status query refused by permissions: {decision:?}"); }
+                                    if let Err(e) = loon_tools::validate_args(&tool.spec(), &args) { return e.to_string(); }
+                                    match tokio::time::timeout(std::time::Duration::from_secs(10), tool.run(args, &ctx)).await {
+                                        Ok(Ok(output)) => output.text,
+                                        Ok(Err(e)) => e.to_string(),
+                                        Err(_) => "status query timed out; the operation is still running".into(),
+                                    }
+                                });
+                                continue;
+                            }
+                        }
+
+                        let live = matches!(&command,
+                            loon_core::commands::SlashCommand::Effort { .. }
+                            | loon_core::commands::SlashCommand::AutoCompact { .. }
+                            | loon_core::commands::SlashCommand::Context { size: Some(_) }
+                            | loon_core::commands::SlashCommand::Model { reference: Some(_) }) || live_config(&command);
+                        if running.is_some() && live {
+                            let _ = live_tx.send(command).await;
+                            let _ = results.send("applies to the next request".into()).await;
+                            continue;
+                        }
+                        // /new and /resume are explicit session switches, also while busy.
+                        if running.is_some() && matches!(&command, loon_core::commands::SlashCommand::New | loon_core::commands::SlashCommand::Resume { target: Some(_) }) {
+                            let finished = stop(&mut running, &cancel).await;
+                            if finished {
+                                agent.lock().await.seal_cancelled_turn();
+                                let _ = events.send(AgentEvent::TurnFinished { status: TurnStatus::Cancelled }).await;
+                            }
+                            queue.drain_all();
+                            queue_paused = false;
+                        let _ = notices.send(UiNotice::QueuePaused(false)).await;
+                            publish(&queue, &notices);
+                        }
+
                         let setting_key=match &command {loon_core::commands::SlashCommand::Config {args} if args.first().is_some_and(|s|s=="menu-set")=>args.get(1).cloned(),_=>None};
                         let browser_change=matches!(&command,loon_core::commands::SlashCommand::Config {args} if args.first().is_some_and(|s|s=="ui"));
                         if running.is_some() && browser_change { settings_queue.push_back(command);continue; }
@@ -236,30 +312,17 @@ pub async fn run(
                             }
                         }
                         if running.is_some(){let _=results.send("current operation is still running; Esc cancels it".into()).await;continue;}
-                        let cmd = command.clone();
-                        // Settings that only touch the next request's context go live
-                        // immediately: they ride the agent's lock-free queue and apply at
-                        // the next request boundary instead of after the turn ends.
-                        {
-                            let guard = agent.lock().await;
-                            let live_tx = guard.live_command_sender();
-                            let live = matches!(&cmd,
-                                loon_core::commands::SlashCommand::Effort { .. }
-                                | loon_core::commands::SlashCommand::AutoCompact { .. }
-                                | loon_core::commands::SlashCommand::Context { .. }
-                                | loon_core::commands::SlashCommand::Config { .. });
-                            if running.is_some() && live {
-                                drop(guard);
-                                let _ = live_tx.send(cmd).await;
-                                let _ = results.send("applies to the next request".into()).await;
-                                continue;
-                            }
-                        }
-                        running=Some(slash_job(agent.clone(),command,results.clone()));
+                        running=Some(slash_job(agent.clone(),command,results.clone(),events.clone()));
                     }
                 }
             }
             _=timer.tick()=>{
+                let snapshot = queue.snapshot();
+                if snapshot != published {
+                    published = snapshot;
+                    publish(&queue, &notices);
+                }
+
                 let mut changed=false;
                 for (_,prompt) in loops.take_due(){
                     match queue.push(prompt){Ok(_)=>changed=true,Err(e)=>{let _=results.send(e).await;}}
@@ -274,4 +337,65 @@ pub async fn run(
         let _ = (&mut job.task).await;
     }
     agent.lock().await.finish_session().await;
+}
+
+/// Only observation actions may bypass the busy agent lock. Commands that mutate
+/// resources still go through the agent's ordinary permission and journal path.
+fn observation(
+    command: &loon_core::commands::SlashCommand,
+) -> Option<(&'static str, serde_json::Value)> {
+    use loon_core::commands::SlashCommand;
+    use serde_json::json;
+    let (name, args, key) = match command {
+        SlashCommand::Shell { args } => ("shell_session", args, "name"),
+        SlashCommand::Monitors { args } => ("monitor", args, "monitor_id"),
+        SlashCommand::Jobs { args } => ("process", args, "job_id"),
+        _ => return None,
+    };
+    let action = args.first().map(String::as_str).unwrap_or("list");
+    let allowed = match name {
+        "shell_session" => ["list", "cwd"].contains(&action),
+        "monitor" => ["list", "logs", "poll"].contains(&action),
+        _ => ["list", "poll"].contains(&action),
+    };
+    if !allowed {
+        return None;
+    }
+    let mut value = json!({"action": action});
+    if action != "list" {
+        value[key] = if key == "name" {
+            json!(args.get(1).map(String::as_str).unwrap_or("main"))
+        } else {
+            json!(args.get(1)?.parse::<u64>().ok()?)
+        };
+    }
+    Some((name, value))
+}
+
+fn live_config(command: &loon_core::commands::SlashCommand) -> bool {
+    let loon_core::commands::SlashCommand::Config { args } = command else {
+        return false;
+    };
+    let index = usize::from(
+        args.first()
+            .is_some_and(|a| matches!(a.as_str(), "set" | "menu-set")),
+    );
+    let Some(key) = args.get(index) else {
+        return false;
+    };
+    let key = key.split('=').next().unwrap_or("");
+    matches!(
+        key,
+        "effort"
+            | "context_window"
+            | "autocompact"
+            | "autocompact_tokens"
+            | "autocompact_percent"
+            | "permission_mode"
+            | "tool_output_bytes"
+            | "max_retries"
+            | "ultra_rounds"
+            | "plan_mode"
+            | "session_goal"
+    )
 }

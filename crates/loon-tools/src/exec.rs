@@ -235,6 +235,10 @@ fn kill_process_group(pid: Option<u32>) {
 // RAII also handles a TUI hard stop dropping the running future.
 pub struct ProcessGroup(Option<u32>);
 impl ProcessGroup {
+    /// Successful persistent-shell calls release ownership without killing the group.
+    pub fn disarm(&mut self) {
+        self.0 = None;
+    }
     pub fn new(pid: Option<u32>) -> Self {
         Self(pid)
     }

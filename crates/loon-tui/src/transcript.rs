@@ -191,12 +191,12 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
     let mut lang = crate::code::Lang::Plain;
     for para in text.split('\n') {
         let trimmed = para.trim_start();
-        let fence = markdown && trimmed.starts_with("```");
+        let fence = markdown && (trimmed.starts_with("```") || trimmed.starts_with("~~~"));
         if fence {
             lang = if code {
                 crate::code::Lang::Plain
             } else {
-                crate::code::Lang::from_tag(trimmed.trim_start_matches("```"))
+                crate::code::Lang::from_tag(trimmed.trim_start_matches(['`', '~']))
             };
         }
         let body_style = if markdown && (fence || code) {
@@ -206,6 +206,8 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
         } else {
             style
         };
+        let highlighted = (code && !fence).then(|| crate::code::highlight(para, lang));
+        let mut code_offset = 0;
         for (i, raw) in wrap(para, avail).into_iter().enumerate() {
             let lead = if first {
                 marker.clone()
@@ -242,12 +244,27 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
                                 },
                             ));
                         }
-                    } else if code {
+                    } else if code && !fence {
                         // Real syntax highlighting inside a fenced block: keywords,
                         // strings, numbers and comments are separated by language, so
                         // a Rust block does not read like a wall of one colour.
-                        for (piece, style) in crate::code::highlight(&text, lang) {
-                            spans.push(Span::styled(piece, style));
+                        let mut column = 0;
+                        for (piece, style) in crate::code::slice(
+                            highlighted.as_ref().unwrap(),
+                            code_offset,
+                            raw.chars().count(),
+                        ) {
+                            let mut shown = String::new();
+                            for ch in piece.chars() {
+                                let n = cells(ch, column);
+                                if ch == '\t' {
+                                    shown.push_str(&" ".repeat(n));
+                                } else {
+                                    shown.push(ch);
+                                }
+                                column += n;
+                            }
+                            spans.push(Span::styled(shown, style));
                         }
                     } else {
                         // Diff lines inside prose keep their own colour: a pasted patch
@@ -261,6 +278,7 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
                 prefix_cells,
                 soft: i > 0,
             });
+            code_offset += rows.last().unwrap().raw.chars().count();
         }
         if fence {
             code = !code;

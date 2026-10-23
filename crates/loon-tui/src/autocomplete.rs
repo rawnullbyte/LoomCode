@@ -4,13 +4,45 @@
 
 use loon_core::commands::{command_list, settings_registry};
 
+/// What kind of thing a completion replaces. Tab's behaviour differs: a command word
+/// replaces the whole input (`/re` → `/redo `), while an argument value replaces only
+/// the word being typed (`/config ti` → `/config tips `). Deriving that from the input
+/// text instead of from the completion is what turned `/autocompact` + Tab into `/90% `.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Command,
+    Argument,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Completion {
     /// Text shown in the popup (command with its argument hint, or a suggested value).
+    /// Only [`Kind::Command`] rows carry the leading `/`, which the popup adds itself.
     pub display: String,
     /// What Tab inserts (the command word, or the argument value).
     pub insert: String,
     pub description: String,
+    pub kind: Kind,
+}
+
+impl Completion {
+    fn command(name: &str, description: &str) -> Completion {
+        Completion {
+            display: name.to_string(),
+            insert: name.split(' ').next().unwrap_or(name).to_string(),
+            description: description.to_string(),
+            kind: Kind::Command,
+        }
+    }
+
+    fn argument(value: &str) -> Completion {
+        Completion {
+            display: value.to_string(),
+            insert: value.to_string(),
+            description: String::new(),
+            kind: Kind::Argument,
+        }
+    }
 }
 
 /// True when the popup should show: a `/word` being typed, or a command whose
@@ -20,7 +52,7 @@ pub fn popup_active(input: &str) -> bool {
     if !line.starts_with('/') {
         return false;
     }
-    !argument_suggestions(line).is_empty() || !line.contains(char::is_whitespace)
+    !completions_for(line).is_empty()
 }
 
 /// Suggested argument values for the partially-typed argument of `line`
@@ -34,6 +66,14 @@ pub fn argument_suggestions(line: &str) -> Vec<Completion> {
     // pasted input and some terminals, and a trailing tab used to keep suggesting
     // keys instead of the value for the completed key.
     let trailing_space = body.ends_with(char::is_whitespace);
+    // With no whitespace yet the command word is still being typed: `/auto` is a
+    // command prefix, not the command `auto` with an empty first argument. Treating
+    // every bare word as "argument 0" made `/autocompact` offer `90%`, and Tab then
+    // replaced the command with the value. Only an exact command name opens its
+    // argument list, and then Tab appends the value after the command.
+    if args.is_empty() && !trailing_space && !is_exact_command(cmd) {
+        return Vec::new();
+    }
     let arg_index = if trailing_space {
         args.len()
     } else {
@@ -52,6 +92,7 @@ pub fn argument_suggestions(line: &str) -> Vec<Completion> {
                 display: format!("{}  {}", d.key, d.description),
                 insert: d.key.to_string(),
                 description: d.description.to_string(),
+                kind: Kind::Argument,
             })
             .collect(),
         ("config", 1) => {
@@ -61,32 +102,20 @@ pub fn argument_suggestions(line: &str) -> Vec<Completion> {
                 .unwrap_or_default()
                 .into_iter()
                 .filter(|v| v.starts_with(partial))
-                .map(|v| Completion {
-                    display: v.clone(),
-                    insert: v.clone(),
-                    description: String::new(),
-                })
+                .map(|v| Completion::argument(&v))
                 .collect()
         }
         ("effort", 0) => ["low", "medium", "high", "xhigh", "ultra"]
             .into_iter()
             .filter(|v| v.starts_with(partial))
-            .map(|v| Completion {
-                display: v.to_string(),
-                insert: v.to_string(),
-                description: String::new(),
-            })
+            .map(Completion::argument)
             .collect(),
         ("theme", 0) => [
             "terminal", "dark", "light", "ocean", "violet", "ember", "graphite",
         ]
         .into_iter()
         .filter(|v| v.starts_with(partial))
-        .map(|v| Completion {
-            display: v.to_string(),
-            insert: v.to_string(),
-            description: String::new(),
-        })
+        .map(Completion::argument)
         .collect(),
         // Token sizes accept shorthand (`1m`, `100k`) and percentages for /autocompact.
         ("autocompact", 0) => [
@@ -94,23 +123,24 @@ pub fn argument_suggestions(line: &str) -> Vec<Completion> {
         ]
         .into_iter()
         .filter(|v| v.starts_with(partial))
-        .map(|v| Completion {
-            display: v.to_string(),
-            insert: v.to_string(),
-            description: String::new(),
-        })
+        .map(Completion::argument)
         .collect(),
         ("context", 0) => ["1m", "200k", "100k", "50k", "90%", "80%", "off", "auto"]
             .into_iter()
             .filter(|v| v.starts_with(partial))
-            .map(|v| Completion {
-                display: v.to_string(),
-                insert: v.to_string(),
-                description: String::new(),
-            })
+            .map(Completion::argument)
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// True when `word` is a command name in the canonical table (its first word, since
+/// table rows carry an argument hint: `autocompact [1m|200k|90%|on|off|auto]`).
+fn is_exact_command(word: &str) -> bool {
+    !word.is_empty()
+        && command_list()
+            .iter()
+            .any(|(name, _)| name.split(' ').next() == Some(word))
 }
 
 /// Completions for the current input, in table order. `/` alone lists everything.
@@ -123,18 +153,25 @@ pub fn completions_for(input: &str) -> Vec<Completion> {
     if !args.is_empty() {
         return args;
     }
+    let typed = line.trim_start_matches('/');
+    let typed = typed.split(char::is_whitespace).next().unwrap_or_default();
+    if typed.is_empty() {
+        return command_list()
+            .into_iter()
+            .map(|(name, desc)| Completion::command(name, desc))
+            .collect();
+    }
+    // Command-word rows only complete the bare word being typed. Once whitespace
+    // appears the argument list owns the popup (`/undo 2` shows nothing); an exact
+    // command name like `/autocompact` already returned its values above, so Tab
+    // appends `90%` instead of swapping the command for the value.
     if line.contains(char::is_whitespace) {
         return Vec::new();
     }
-    let typed = line.trim_start_matches('/');
     command_list()
         .into_iter()
         .filter(|(name, _)| name.split(' ').next().unwrap_or(name).starts_with(typed))
-        .map(|(name, desc)| Completion {
-            display: name.to_string(),
-            insert: name.split(' ').next().unwrap_or(name).to_string(),
-            description: desc.to_string(),
-        })
+        .map(|(name, desc)| Completion::command(name, desc))
         .collect()
 }
 
@@ -182,6 +219,60 @@ mod tests {
     fn no_space_after_slash_is_needed_for_list() {
         assert!(completions_for("/undo 2").is_empty());
         assert!(completions_for("/und").len() == 1);
+    }
+
+    /// A bare word that is *not* a command must not be read as "command X with an
+    /// empty first argument". `/auto` is a prefix of `/autocompact`, so it lists
+    /// commands — never `90%`/`off`/`auto` as if the command were already chosen.
+    #[test]
+    fn a_command_prefix_offers_commands_not_argument_values() {
+        for typed in ["/auto", "/aut", "/au"] {
+            let c = completions_for(typed);
+            assert!(
+                c.iter().all(|x| x.kind == Kind::Command),
+                "{typed:?} must offer command rows, got {c:?}"
+            );
+            assert!(
+                c.iter().any(|x| x.insert == "autocompact"),
+                "{typed:?} should still complete the command name, got {c:?}"
+            );
+            assert!(
+                !c.iter().any(|x| x.insert == "90%"),
+                "{typed:?} must not offer argument values, got {c:?}"
+            );
+        }
+    }
+
+    /// The command word completed with a space opens its argument list, and those
+    /// rows are values (no slash), so the popup shows `90%`, not `/90%`.
+    #[test]
+    fn a_complete_command_offers_its_arguments_as_values() {
+        for line in ["/autocompact", "/autocompact ", "/context", "/context "] {
+            let c = completions_for(line);
+            assert!(
+                c.iter().all(|x| x.kind == Kind::Argument),
+                "{line:?} must offer argument rows, got {c:?}"
+            );
+            let names: Vec<&str> = c.iter().map(|x| x.insert.as_str()).collect();
+            assert!(
+                names.contains(&"90%"),
+                "{line:?} should offer 90%: {names:?}"
+            );
+            assert!(
+                c.iter().all(|x| !x.display.starts_with('/')),
+                "argument values must not carry a slash: {c:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_rows_are_slashed_and_argument_rows_are_not() {
+        let cmd = &completions_for("/und")[0];
+        assert_eq!(cmd.kind, Kind::Command);
+        assert_eq!(cmd.display, "undo");
+        let arg = &completions_for("/effort ")[0];
+        assert_eq!(arg.kind, Kind::Argument);
+        assert_eq!(arg.display, "low");
     }
 }
 

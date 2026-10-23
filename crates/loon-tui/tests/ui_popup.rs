@@ -88,6 +88,93 @@ fn prefix_narrows_and_selection_renders_highlighted() {
     );
 }
 
+/// Argument values are not slash commands. The popup used to prefix every row with
+/// `/`, so `/autocompact` offered `/90%` and Tab looked like it had replaced the
+/// command with a value.
+#[test]
+fn argument_values_are_shown_without_a_slash() {
+    let mut a = app();
+    a.input = "/autocompact".into();
+    let t = draw(&mut a);
+    let screen = (0..24)
+        .map(|y| row_text(&t, y, 80))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        screen.contains("90%"),
+        "the value must be offered: {screen}"
+    );
+    assert!(
+        !screen.contains("/90%"),
+        "an argument value must never render as a slash command: {screen}"
+    );
+    // Tab keeps the command and appends the value.
+    let idx = a
+        .visible_completions()
+        .iter()
+        .position(|c| c.insert == "90%")
+        .expect("90% is offered for /autocompact");
+    a.completion_selected = idx;
+    assert!(a.accept_completion());
+    assert_eq!(a.input, "/autocompact 90% ");
+}
+
+/// A queued prompt is shown as a dim row above the prompt bar, so what is waiting is
+/// visible rather than only counted in the status bar.
+#[test]
+fn a_queued_prompt_is_previewed_above_the_input() {
+    let mut a = app();
+    a.queued.push("summarize the diff".into());
+    let t = draw(&mut a);
+    let screen = (0..24)
+        .map(|y| row_text(&t, y, 80))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        screen.contains("summarize the diff"),
+        "the queued prompt must be visible: {screen}"
+    );
+    // It sits above the prompt bar, not inside the transcript.
+    let (_, input_y) = a.input_rect.expect("the input row is recorded");
+    let queue_row = (0..input_y)
+        .find(|y| row_text(&t, *y, 80).contains("summarize the diff"))
+        .expect("a row above the input holds the queued prompt");
+    assert!(
+        queue_row < input_y,
+        "queue preview must sit above the input"
+    );
+    // Dim, not the normal prompt colour.
+    let buf = t.backend().buffer();
+    let painted: Vec<ratatui::style::Color> = (0..80)
+        .map(|x| buf.cell((x, queue_row)).unwrap().fg)
+        .filter(|c| *c != ratatui::style::Color::Reset)
+        .collect();
+    assert!(
+        !painted.is_empty(),
+        "the queue row must be painted in the dim colour"
+    );
+}
+
+#[test]
+fn only_the_newest_queued_prompts_fit_and_older_ones_scroll_off() {
+    let mut a = app();
+    for n in 1..=5 {
+        a.queued.push(format!("queued {n}"));
+    }
+    let t = draw(&mut a);
+    let screen = (0..24)
+        .map(|y| row_text(&t, y, 80))
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The newest rows stay adjacent to the prompt; the oldest is dropped.
+    assert!(screen.contains("queued 5"), "{screen}");
+    assert!(screen.contains("queued 4"), "{screen}");
+    assert!(
+        !screen.contains("queued 1"),
+        "oldest must be windowed out: {screen}"
+    );
+}
+
 #[test]
 fn spinner_glyph_animates_across_ticks_and_styled_accent_while_busy() {
     let mut a = app();

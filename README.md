@@ -124,7 +124,7 @@ unfinished plan items and failing required verification prevent it.
 ```
 
 Reviews are unlimited by default (`limit 0`). Set a positive review limit to bound a run.
-**Esc cancels the current turn**; `/ultraloop off` disables further reviews, including while
+**Esc twice stops the current turn**; `/ultraloop off` disables further reviews, including while
 a turn runs. `on` enables review for the next/current task. `model default` returns to the
 main model with a separate context. State survives `/resume`; `/new` starts fresh.
 
@@ -206,6 +206,16 @@ verification evidence, blockers and next actions belong in durable notes. Compac
 preserves this working state. These are model instructions backed by persistent tools;
 unfinished todos also prevent the supervisor from accepting completion.
 
+Two further rules constrain how the agent answers. It must not guess or assume what it can
+check: it reads the code, runs the command, or says the fact is unknown and names what would
+settle it. When explaining why something happened it must find the line that explains it and
+cite it as `path:line`, or quote the command and the output line, rather than offering a
+plausible cause it never located. It also prefers the dedicated tool — `write`, `edit`,
+`read`, `grep`, `glob`, the `git_*` tools — over a shell equivalent, keeping `bash` for
+running commands rather than writing or printing files. The prompt text lives in
+`crates/loon-core/src/prompt.rs` and its length is capped by a test, so every rule has to earn
+its bytes.
+
 ### Terminal interface
 
 Failures show the actual command and diagnostic, even inside a collapsed group. **Ctrl+O
@@ -222,7 +232,7 @@ diff line keeps its own row, so colouring stays per-line no matter how large the
 The same colouring applies to a diff pasted into an assistant answer.
 
 Fenced code blocks are **syntax highlighted** by their fence tag — Rust, Python,
-JavaScript/TypeScript/Go/Java, shell, JSON and TOML — with keywords, strings, numbers and
+JavaScript/TypeScript/C/C++/C#/Go/Java/Kotlin/Swift, shell, JSON, TOML/YAML, SQL and diffs — with keywords, strings, numbers and
 comments styled separately. The highlighter is a tolerant lexer rather than a parser: an
 excerpt cut mid-string still renders, and highlighting never changes the underlying text,
 so copying a command out of the transcript yields exactly what was shown. An unknown fence
@@ -311,7 +321,10 @@ arguments, environment and timeout. Saving server changes reconnects the live ca
 | `/notes add TEXT`, `/notes remove N` | Manage notes directly |
 | `/goal TEXT` | Set a persistent session objective; `/goal clear` removes it |
 | `/memory [global\|workspace] [TEXT]` | Cross-session facts and preferences |
-| `/compact`, `/autocompact 50k\|on\|off\|auto`, `/context` | Context management and usage estimates |
+| `/compact`, `/autocompact 50k\|on\|off\|auto`, `/context` | Context management and usage estimates; on/off preserves model capacity |
+| `/shell list\|start NAME\|run NAME COMMAND\|cwd NAME\|close NAME` | Persistent named shell sessions |
+| `/monitors list\|start COMMAND\|logs ID\|poll ID\|stop ID\|remove ID` | Background servers, watchers and logs |
+| `/jobs list\|poll ID\|stop ID` | Existing background process management |
 | `/skills`, `/workflows` | Reload/list bundled and custom workflows |
 | `/mcp` | Manage MCP servers: add, edit, reconnect, remove, inspect tools |
 
@@ -364,7 +377,9 @@ slash-command arguments. The agent's `load_skill` tool reads workflows on demand
 ## Agent tools and effort
 
 The agent can inspect/search files, make hash-protected edits, run commands, use MCP tools,
-delegate scoped subtasks, maintain its checklist with `todo_read`/`todo_write` (sharing state
+delegate scoped subtasks (blocking) or start them in the background with `background_spawn`
+and manage them with `background_list`, `background_message` and `background_kill`, maintain
+its checklist with `todo_read`/`todo_write` (sharing state
 with `update_plan`), track dependent tasks with `task`, write working notes with `note`, and
 persist facts with `memory`. Independent consecutive read-only tools run concurrently (up to
 six); mutating operations remain ordered. Truncated full output has a blob hash and can be
@@ -417,7 +432,10 @@ and leaves falling through it — so it scrolls away as the conversation grows i
 occupying a fixed row. The status bar along the bottom leads with the colour-coded permission
 mode (bypass in red, auto in yellow, ask in green, allowlist in cyan), then the model, the
 live activity, the elapsed time of the current prompt and the current request's combined
-throughput in tokens per second, plus the queue depth. Reasoning events show thinking
+throughput in tokens per second, plus the queue depth. Elapsed time coarsens with the
+session (`45s`, `3m07s`, `2h05m`, `3d04h`) so a long turn still reads at a glance, and the
+context estimate refreshes at every step boundary, not only when the turn ends — a running
+turn shows the size it has actually grown to. Reasoning events show thinking
 activity when the provider supplies them; waiting, writing and tool execution are
 distinguished. The UI does not invent progress percentages.
 
@@ -425,11 +443,13 @@ distinguished. The UI does not invent progress percentages.
 
 - **Enter** sends, **Shift+Enter** starts a new line, **Ctrl+Enter** cancels the running request and sends immediately. **Ctrl+Backspace** deletes the previous word. These need the terminal's progressive keyboard protocol; Loom enables it automatically when supported.
 - In the prompt, **Ctrl+Left/Right** moves by a word (the same boundaries Ctrl+Backspace deletes), **Shift+arrows** select text, and **Ctrl+Shift+arrows** select a word at a time. Typing or Backspace replaces the selection, and **Ctrl+C** copies it. Clicking anywhere in a multi-line prompt puts the caret on that line and column.
-- **Esc** twice stops the running turn immediately; a prompt typed while a turn runs is queued, and **Up** on an empty input pulls the newest queued prompt back for editing.
+- **Esc** twice stops immediately and preserves completed edits, tool results and conversation. Pending messages pause; **Enter** on an empty input resumes them. A held Escape key does not count as two presses.
+- Messages submitted during a turn enter the **next inference request**, in order. **Up** on an empty input retrieves the newest pending message only if it has not already been sent. **Ctrl+Enter** interrupts and submits pending messages plus the new text immediately.
+- `/new` and `/resume ID` work during a turn. A fresh session clears selection/stream state and shows its title again, including in short terminals.
 - Drag a transcript selection to copy; the selected cells are highlighted with a grey background. **Ctrl+Y** copies the last assistant block directly from its source text.
 - Copy preserves source indentation/newlines and Unicode; visual wraps, prompt labels, ANSI escapes and the streaming caret are excluded. The selection uses a stable snapshot while output streams.
 - Native clipboard helpers are attempted first with closed stdin and bounded waits; OSC 52 is the fallback for remote terminals. Clipboard behavior still depends on terminal/desktop support.
-- Escape or Ctrl+C cancels an active operation. Page Up/Down and the wheel scroll the transcript outside management lists. **Shift+Tab** cycles permission modes; explicit denies always apply.
+- Esc twice or Ctrl+C stops an active operation. Page Up/Down and the wheel scroll the transcript outside management lists. **Shift+Tab** cycles permission modes; explicit denies always apply.
 - Permission modes are `bypass`, `auto`, `ask`, `allowlist`. Changing a mode updates the actual gate. The original default, `bypass`, is retained.
 
 ## Validation
@@ -488,3 +508,13 @@ text for editing.
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+### Request boundaries and built-in design workflows
+
+Follow-ups typed while the agent is streaming or running tools are editable until the next inference request begins. They do not wait for the whole task to finish. Effort, context, automatic compaction, model selection and supported session settings also apply at the next request boundary. Provider and other configuration changes that require rebuilding services wait for idle.
+
+Automatic compaction has an independent `session.autocompact` boolean in configuration and in the settings UI. `/autocompact off` leaves the model window intact. Thresholds reserve completion capacity; unsuccessful or non-shrinking summaries back off instead of retrying on every step. Recent tool-call/result batches stay paired, and the current user's goal is retained during compaction of a long single turn. Token counts are estimates.
+
+Thirty bundled workflows include `design`, `frontend-design`, `ui-audit` and `long-running-tools`. Use `/skills` to browse or let the agent load them through `load_skill`. Design workflows inspect the existing product and references, respect asset constraints, implement working states, and check responsive behavior and keyboard access.
+
+Use `/shell start main`, then `/shell run main cd subdir` to retain working directory and environment. `/monitors start npm run dev` starts a background watcher; inspect its ID with `/monitors logs ID`, then stop/remove it when finished. List/poll/log status queries remain available while the agent works. Shells are pipe-based; interactive full-screen programs and terminal password prompts require an external terminal.

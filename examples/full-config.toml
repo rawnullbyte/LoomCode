@@ -18,6 +18,7 @@ allowed_hosts = []          # empty = unrestricted (future enforcement milestone
 model = "combo:daily-driver"   # a [models] alias or combo:NAME
 tool_output_bytes = 65536
 max_retries = 2
+autocompact = true             # independent of the model context window
 autocompact_tokens = 50000      # optional; defaults to 80% of capacity
 allow_retry_after_partial_stream = false   # opt-in: restart after a partially streamed answer
 

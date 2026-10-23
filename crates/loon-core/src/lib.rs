@@ -12,6 +12,7 @@ pub mod config_ui;
 pub mod est;
 pub mod guidance;
 pub mod hooks;
+pub mod inbox;
 pub mod index;
 pub mod loops;
 pub mod mcp;
@@ -51,6 +52,10 @@ pub enum AgentEvent {
         note: String,
     },
     ReasoningDelta(String),
+    /// User follow-ups have entered model history, in FIFO order.
+    QueuedMessagesApplied {
+        messages: Vec<String>,
+    },
     RequestStarted,
     RequestFinished,
     RequestUsage {
@@ -113,10 +118,10 @@ pub enum AgentEvent {
         level: String,
     },
     SessionLoaded {
-        blocks: Vec<(String, String)>,
+        blocks: Vec<crate::replay::VisibleBlock>,
     },
     ConversationRewound {
-        blocks: Vec<(String, String)>,
+        blocks: Vec<crate::replay::VisibleBlock>,
         prompt: String,
     },
     WorkStateChanged {
@@ -142,6 +147,23 @@ pub enum AgentEvent {
     /// Legacy event kept for UI compatibility; `/clear` now starts a new session.
     ClearTranscript,
     Warning(String),
+    /// A background subagent changed state. Carried on the parent's sink so the UI can
+    /// show what the agents it started are doing; the parent model reads the same
+    /// information through the `background_list` tool.
+    SubagentUpdate {
+        id: u64,
+        label: String,
+        status: String,
+        note: String,
+    },
+    /// A background subagent finished and reported. `text` is the report the child
+    /// produced; `text` is already bounded by the tool output limit.
+    SubagentFinished {
+        id: u64,
+        label: String,
+        status: String,
+        text: String,
+    },
     TurnFinished {
         status: TurnStatus,
     },
@@ -237,6 +259,8 @@ pub struct Agent {
     /// Steering messages queued while a turn runs; applied at safe boundaries.
     steering_rx: mpsc::Receiver<String>,
     pub steering_tx: mpsc::Sender<String>,
+    /// Follow-ups waiting for the next inference request, editable without the agent lock.
+    pub inbox: inbox::PromptQueue,
     /// Live event sink for UIs/headless output; None when nobody listens.
     events: Option<mpsc::Sender<AgentEvent>>,
     /// Permission policy + redacted audit trail.
@@ -261,11 +285,14 @@ pub struct Agent {
     /// Loop tasks (recurring prompts). The host scheduler polls `take_due`; the agent
     /// cancels through the same registry via the loop_cancel tool.
     pub loops: Arc<loops::LoopRegistry>,
+    /// Background subagents this session started; shared with the `background_*` tools.
+    pub background: subagent::BackgroundHub,
     /// /effort: requested output budget per request (max_output_tokens).
     pub effort: Option<String>,
     pub autocompact_tokens: Option<u64>,
     /// Compact at this percentage of the window; follows the window when the model changes.
     pub autocompact_percent: Option<u8>,
+    pub autocompact: bool,
     /// Set after a failed compaction: (when to retry, why it failed). Automatic
     /// compaction honours it; `/compact` ignores it.
     pub compaction_backoff: Option<(Instant, String)>,
@@ -290,8 +317,11 @@ pub struct Agent {
 }
 
 impl Agent {
-    /// Attach a live event sink (TUI or headless JSONL writer).
+    /// Attach a live event sink (TUI or headless JSONL writer). The background hub
+    /// shares it so a subagent's report surfaces the moment it lands, not only when
+    /// someone calls `background_list`.
     pub fn set_event_sink(&mut self, tx: mpsc::Sender<AgentEvent>) {
+        self.background.set_sink(tx.clone());
         self.events = Some(tx);
     }
 
@@ -495,11 +525,13 @@ impl Agent {
             cancel_rx,
             steering_rx,
             steering_tx,
+            inbox: Default::default(),
             events: None,
             approval_hook: None,
             summarizer: None,
             stop_reviewer: None,
             loops: Arc::new(loops::LoopRegistry::new()),
+            background: subagent::BackgroundHub::new(),
             effort: worklog
                 .read()
                 .ok()
@@ -509,6 +541,10 @@ impl Agent {
             autocompact_tokens: saved.as_ref().and_then(|c| c.session.autocompact_tokens),
             autocompact_percent: saved.as_ref().and_then(|c| c.session.autocompact_percent),
             compaction_backoff: None,
+            autocompact: saved
+                .as_ref()
+                .map(|c| c.session.autocompact)
+                .unwrap_or(true),
             live_cmds_tx,
             live_cmds_rx,
             worklog,
@@ -601,6 +637,7 @@ impl Agent {
     /// Replace this agent wholesale (/new, /resume): the replacement keeps THIS
     /// agent's event sink, approval hook and summarizer so the UI keeps streaming.
     pub fn replace_with(&mut self, mut other: Agent) {
+        other.background = self.background.clone();
         other.events = self.events.take();
         other.approval_hook = self.approval_hook.take();
         other.summarizer = self.summarizer.take();
@@ -778,6 +815,68 @@ impl Agent {
         dropped_prompt
     }
 
+    /// Persist and apply follow-ups only at a provider-request boundary.
+    async fn apply_pending_prompts(&mut self) {
+        let messages = self.inbox.drain_all();
+        for text in &messages {
+            let _ = self
+                .journal
+                .append(None, EventKind::UserMessage { text: text.clone() });
+            self.history
+                .push(loon_providers::ChatMessage::user(text.clone()));
+        }
+        if !messages.is_empty() {
+            self.emit_async(AgentEvent::QueuedMessagesApplied { messages })
+                .await;
+        }
+    }
+
+    /// Seal an interrupted turn without rewinding edits, prompts or completed tools.
+    /// Unanswered calls receive explicit cancelled results so continuation/resume is valid.
+    pub fn seal_cancelled_turn(&mut self) {
+        let Ok(events) = self.journal.events() else {
+            return;
+        };
+        let active = crate::replay::active_events(&events, None);
+        let mut pending = std::collections::BTreeMap::new();
+        let mut turn = None;
+        for event in active {
+            match &event.kind {
+                EventKind::TurnStarted { turn: id } => turn = Some(*id),
+                EventKind::TurnFinished { .. } => turn = None,
+                EventKind::ToolCallObserved { call, name, .. } => {
+                    pending.insert(*call, name.clone());
+                }
+                EventKind::ToolExecutionFinished { call, .. } => {
+                    pending.remove(call);
+                }
+                EventKind::ToolCallRejected { request, .. } => {
+                    pending.remove(request);
+                }
+                EventKind::ContextCompacted { .. } => pending.clear(),
+                _ => {}
+            }
+        }
+        for (call, name) in pending {
+            let _ = self.journal.append(Some(call), EventKind::ToolExecutionFinished {
+                call, name, ok: false, excerpt: "Cancelled by user; execution may have been interrupted. Inspect state before retrying.".into(),
+                blob: None, duration_ms: 0,
+            });
+        }
+        if let Some(turn) = turn {
+            let _ = self.journal.append(
+                None,
+                EventKind::TurnFinished {
+                    turn,
+                    reason: "Cancelled".into(),
+                },
+            );
+        }
+        if let Ok(events) = self.journal.events() {
+            self.history = crate::replay::replay_history(&events, None);
+        }
+    }
+
     /// Queue a steering message; consumed at the next safe boundary.
     pub fn steer(&self, text: String) {
         let _ = self.steering_tx.try_send(text);
@@ -789,6 +888,30 @@ impl Agent {
         self.live_cmds_tx.clone()
     }
 
+    /// Bound a background subagent's report for the parent's context, mirroring
+    /// [`loon_tools::ToolCtx::bound`]: over the configured limit the model gets an excerpt
+    /// plus a marker, and the full text is kept as a content-addressed blob. Without this
+    /// the drain path was the one tool-result-shaped surface with no limit at all, so a
+    /// chatty child could fill the parent's window in a single step.
+    fn bound_report(&self, text: &str) -> String {
+        let limit = self.cfg.tool_output_bytes;
+        if text.len() <= limit {
+            return text.to_string();
+        }
+        let mut cut = limit;
+        while cut > 0 && !text.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        let marker = match self.journal.put_blob(text.as_bytes()) {
+            Ok(blob) => format!(
+                "[truncated: full report {} bytes stored as blob {}]",
+                blob.bytes, blob.sha256
+            ),
+            Err(_) => format!("[truncated: full report {} bytes]", text.len()),
+        };
+        format!("{}\n{marker}", &text[..cut])
+    }
+
     /// Apply settings commands queued while the turn was running. Called at the request
     /// boundary; only session-live settings are honoured, everything else is reported.
     fn apply_live_commands(&mut self) {
@@ -797,37 +920,55 @@ impl Agent {
                 commands::SlashCommand::Effort { level } if !level.is_empty() => {
                     ("effort".to_string(), level.clone())
                 }
-                commands::SlashCommand::AutoCompact { setting } if setting != "toggle" => {
-                    match loon_config::tokens::parse_token_spec(setting) {
-                        Some(loon_config::tokens::TokenSpec::Percent(p)) => {
-                            ("autocompact_percent".to_string(), p.to_string())
+                commands::SlashCommand::AutoCompact { setting } => {
+                    let result = match setting.as_str() {
+                        "off" | "on" => self.config_apply("autocompact", setting),
+                        "toggle" => {
+                            let value = if self.autocompact { "off" } else { "on" };
+                            self.config_apply("autocompact", value)
                         }
-                        Some(loon_config::tokens::TokenSpec::Tokens(n)) => {
-                            ("autocompact_tokens".to_string(), n.to_string())
-                        }
-                        None if setting == "off" => ("context_window".to_string(), "0".to_string()),
-                        None if setting == "on" => {
-                            ("context_window".to_string(), "128k".to_string())
-                        }
-                        None => continue,
+                        "auto" => self
+                            .config_apply("autocompact_percent", "0")
+                            .and_then(|_| self.config_apply("autocompact_tokens", "0"))
+                            .and_then(|_| self.config_apply("autocompact", "on")),
+                        _ => match loon_config::tokens::parse_token_spec(setting) {
+                            Some(loon_config::tokens::TokenSpec::Percent(p)) => self
+                                .config_apply("autocompact_percent", &p.to_string())
+                                .and_then(|_| self.config_apply("autocompact", "on")),
+                            Some(loon_config::tokens::TokenSpec::Tokens(n)) => self
+                                .config_apply("autocompact_tokens", &n.to_string())
+                                .and_then(|_| self.config_apply("autocompact", "on")),
+                            None => Err("invalid autocompact setting".into()),
+                        },
+                    };
+                    match result {
+                        Ok(report) => self.emit(AgentEvent::MemberNote(format!(
+                            "applied at this request: {report}"
+                        ))),
+                        Err(e) => self.emit(AgentEvent::Warning(e)),
                     }
+                    continue;
                 }
                 commands::SlashCommand::Context { size: Some(size) } => {
-                    match loon_config::tokens::parse_token_spec(size) {
-                        Some(loon_config::tokens::TokenSpec::Percent(p)) => {
-                            ("autocompact_percent".to_string(), p.to_string())
-                        }
-                        Some(loon_config::tokens::TokenSpec::Tokens(n)) => {
-                            ("context_window".to_string(), n.to_string())
-                        }
-                        None => continue,
+                    match self.set_context_size(size) {
+                        Ok(report) => self.emit(AgentEvent::MemberNote(format!(
+                            "applied at this request: {report}"
+                        ))),
+                        Err(e) => self.emit(AgentEvent::Warning(e)),
                     }
+                    continue;
                 }
+                commands::SlashCommand::Model {
+                    reference: Some(reference),
+                } => ("model".to_string(), reference.clone()),
                 commands::SlashCommand::Config { args } => {
                     let args: Vec<&str> = args
                         .iter()
                         .map(String::as_str)
-                        .filter(|a| !matches!(*a, "set" | "menu-set"))
+                        .skip(usize::from(
+                            args.first()
+                                .is_some_and(|a| matches!(a.as_str(), "set" | "menu-set")),
+                        ))
                         .collect();
                     let Some(first) = args.first() else { continue };
                     let (key, inline) = match first.split_once('=') {
@@ -849,7 +990,7 @@ impl Agent {
                             | "session_goal"
                     ) {
                         self.emit(crate::AgentEvent::Warning(format!(
-                            "/config {key} needs the idle session; it applies after this turn"
+                            "/config {key} needs the idle session; retry it after this turn"
                         )));
                         continue;
                     }
@@ -1062,6 +1203,98 @@ impl Agent {
                     "[steering] {msg}"
                 )));
             }
+            // Background subagents report here, so their results are part of this
+            // turn's context instead of waiting for the next one.
+            let (reports, dropped) = self.background.drain_reports();
+            // The hub bounds how many reports it announces, so a flood of tiny children
+            // cannot cost a header each. Say which outcomes were dropped instead of
+            // letting them vanish — and say only what is true: the text bound can release
+            // a report at the same moment its announcement is dropped, so promising
+            // "call background_list to read them" for those would send the model after a
+            // report that reads back as released.
+            if !dropped.is_empty() {
+                let readable_all: Vec<u64> = dropped
+                    .iter()
+                    .filter(|(_, kept)| *kept)
+                    .map(|(id, _)| *id)
+                    .collect();
+                let released = dropped.len() - readable_all.len();
+                // This notice is the one injected surface that is not a child's report, so
+                // it has to bound itself: naming every dropped id made it grow with the
+                // number of children rather than with the step. Measured 400 tiny children
+                // -> a 2 224-byte note naming ~368 ids, ~6 bytes each; the entry bound's own
+                // rationale cites an 8 000-report flood, where the same shape is ~44 KB of
+                // pure bookkeeping in a step the bound exists to keep small. The count and
+                // the released tally stay exact — only the enumeration is capped, and the
+                // recovery call is named so nothing is lost.
+                let shown = readable_all.len().min(DROPPED_NOTICE_IDS);
+                // Newest first: those are the outcomes the parent is most likely to act on
+                // next, matching `background_list`'s ordering and the retention bound's
+                // newest-survives rule. Rendered oldest-to-newest for readability.
+                let mut readable: Vec<u64> = readable_all[readable_all.len() - shown..].to_vec();
+                readable.sort_unstable();
+                let hidden = readable_all.len() - shown;
+                let mut note = format!(
+                    "[background {} report(s) were not announced individually to keep this \
+                     step small",
+                    dropped.len()
+                );
+                if !readable.is_empty() {
+                    let ids: Vec<String> = readable.iter().map(|id| format!("#{id}")).collect();
+                    note.push_str(&format!(
+                        "; call background_list with id {} to read them",
+                        ids.join(", ")
+                    ));
+                    if hidden > 0 {
+                        // The hidden ids must NOT be promised via an unfiltered
+                        // `background_list`: that listing is bounded too and renders
+                        // newest-first, so the output cut removes exactly the older
+                        // reports this cap hid. Measured with 120 children (104 readable
+                        // ids beyond the 16 named here): only 19 of them appeared in the
+                        // unfiltered listing — the other 85 were unreachable by the call
+                        // the notice recommended, the same "promise a recovery that does
+                        // not work" defect this notice already had once. A named read
+                        // bypasses the listing clip entirely, so that is what to name.
+                        note.push_str(&format!(
+                            ", and {hidden} further readable report(s) are reachable with \
+                             background_list with id <N> (an unfiltered listing is truncated \
+                             before it reaches the oldest)"
+                        ));
+                    }
+                }
+                if released > 0 {
+                    note.push_str(&format!(
+                        "; {released} of them were also released to keep memory bounded, so \
+                         their text is no longer readable"
+                    ));
+                }
+                note.push(']');
+                let _ = self
+                    .journal
+                    .append(None, EventKind::UserMessage { text: note.clone() });
+                self.history.push(loon_providers::ChatMessage::user(note));
+            }
+            for (id, label, status, text) in reports {
+                // Bound the report exactly like any other tool output: a chatty child must
+                // not be able to fill the context window in one step, and the full text is
+                // kept as a blob so nothing is lost. `delegate` and `background_list` go
+                // through `ToolCtx::bound`; this path has no ToolCtx, so it repeats the
+                // same rule here rather than handing the model raw kilobytes.
+                // A queued report with no text was released by the hub's retention
+                // bound. Injecting it as a bare header would read exactly like a child
+                // that finished and produced nothing, so say what happened — the same
+                // rule `background_list` follows for the same reason.
+                let text = if text.is_empty() {
+                    "(report released to keep memory bounded; it is no longer readable)".to_string()
+                } else {
+                    self.bound_report(&text)
+                };
+                let note = format!("[background #{id} {label} {status}]\n{text}");
+                let _ = self
+                    .journal
+                    .append(None, EventKind::UserMessage { text: note.clone() });
+                self.history.push(loon_providers::ChatMessage::user(note));
+            }
             // Settings typed while the turn ran apply to this request, not the next turn.
             self.apply_live_commands();
 
@@ -1069,6 +1302,15 @@ impl Agent {
             // Context guard first: summarize older exchanges if the next request would
             // cross the compaction threshold.
             self.maybe_compact().await;
+            self.apply_live_commands();
+            self.apply_pending_prompts().await;
+            // Refresh the status bar now, not only when the turn ends: the window
+            // grew with the previous step's tool results (and may have shrunk from
+            // compaction), so a long turn must not display the size it started with.
+            self.emit_async(AgentEvent::ContextUpdated {
+                tokens: self.estimated_context_tokens(),
+            })
+            .await;
             let request_id = loon_events::EvId::now_v7();
             let effort = loon_config::Effort::parse(self.effort.as_deref().unwrap_or("medium"))
                 .unwrap_or_default();
@@ -1293,6 +1535,11 @@ impl Agent {
                 tool_call_id: None,
             });
             if tool_calls.is_empty() {
+                // A follow-up typed during this stream must get its own next request,
+                // rather than waiting for stop hooks/reviews of the obsolete answer.
+                if !self.inbox.is_empty() {
+                    continue;
+                }
                 let hook = self
                     .run_hooks(
                         "Stop",
@@ -1336,6 +1583,9 @@ impl Agent {
                         status = TurnStatus::Failed(e);
                     }
                     Ok(false) => {}
+                }
+                if !self.inbox.is_empty() {
+                    continue;
                 }
                 break;
             }
@@ -2061,9 +2311,22 @@ impl Agent {
 /// How many times one identical invalid call may be rejected before the turn stops.
 const MAX_IDENTICAL_REJECTIONS: u32 = 4;
 
+/// How many dropped-report ids the "not announced individually" notice may name inline.
+///
+/// That notice is the one injected surface that is not itself a child's report, so it is
+/// the one that has to bound its own size: naming every dropped id made it grow with the
+/// number of children rather than with the step, which is exactly what the hub's entry
+/// bound exists to prevent. Measured before the cap: 400 tiny children produced a
+/// 2 224-byte note naming ~368 ids (~6 bytes each), and the entry bound's own rationale
+/// cites an 8 000-report flood — the same shape at ~44 KB of bookkeeping. Sixteen keeps
+/// the note near a hundred bytes while still naming the most recent outcomes the parent
+/// is likely to act on; the exact count and released tally stay in the text, and the
+/// remaining ids stay reachable through an unfiltered `background_list`.
+const DROPPED_NOTICE_IDS: usize = 16;
+
 /// One line describing what a tool call is doing, for the transcript header:
 /// `$ cargo test` for shell, the path for file tools, the pattern for searches.
-fn tool_detail(name: &str, args: &serde_json::Value) -> String {
+pub(crate) fn tool_detail(name: &str, args: &serde_json::Value) -> String {
     let s = |k: &str| {
         args.get(k)
             .and_then(serde_json::Value::as_str)

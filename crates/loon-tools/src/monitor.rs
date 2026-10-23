@@ -77,7 +77,7 @@ impl Tool for MonitorTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string", "enum": ["start", "poll", "wait_for", "logs", "stop", "list"]},
+                    "action": {"type": "string", "enum": ["start", "poll", "wait_for", "logs", "stop", "remove", "list"]},
                     "command": {"type": "string", "minLength": 1, "description": "start: shell command to run and watch."},
                     "label": {"type": "string", "description": "start: human-readable name (defaults to the command)."},
                     "cwd": {"type": "string"},
@@ -102,6 +102,17 @@ impl Tool for MonitorTool {
             "logs" => self.read(&args, ctx, true),
             "wait_for" => self.wait_for(&args, ctx).await,
             "stop" => self.stop(&args),
+            "remove" => {
+                let id = monitor_id(&args)?;
+                self.monitors
+                    .lock()
+                    .unwrap()
+                    .remove(&id)
+                    .ok_or_else(|| ToolError::Other(format!("unknown monitor {id}")))?;
+                Ok(ToolOutput::ok(format!(
+                    "monitor {id} removed (stopped if running)"
+                )))
+            }
             "list" => Ok(self.list()),
             other => Err(ToolError::InvalidArgs(format!(
                 "action must be start/poll/wait_for/logs/stop/list, got `{other}`"
@@ -244,6 +255,9 @@ impl MonitorTool {
         let mut end = (start + max).min(log.text.len());
         while !log.text.is_char_boundary(end) {
             end -= 1;
+        }
+        if end == start && start < log.text.len() {
+            end = start + log.text[start..].chars().next().unwrap().len_utf8();
         }
         let body = &log.text[start..end];
         let text = format!(

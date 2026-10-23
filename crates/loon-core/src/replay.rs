@@ -225,27 +225,143 @@ pub fn replay_history(events: &[Event], upto_seq: Option<u64>) -> Vec<ChatMessag
         }
     }
     flush_text(&mut history, &mut assistant_text);
+    for (_, batch) in pending_calls {
+        if !batch.is_empty() {
+            history.push(ChatMessage {
+                role: Role::Assistant,
+                text: String::new(),
+                tool_calls: batch,
+                tool_call_id: None,
+            });
+        }
+    }
     history
+}
+
+/// One row of the user's chat view, rebuilt from the journal.
+///
+/// This is what a resumed session (and a rewind) hands to the UI, so it has to carry
+/// everything the live transcript showed. It used to be `(role, text)` pairs, which
+/// silently dropped every tool call: `replay_history` keeps them as `Role::Tool`
+/// messages for the model, but the old filter only passed user/assistant *text*, so a
+/// resumed conversation read as bare prose with all of its commands, reads and MCP
+/// calls missing. Tool rows therefore have their own variant carrying the same fields
+/// the live `Block::Tool` row renders.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "role", rename_all = "snake_case")]
+pub enum VisibleBlock {
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    Tool {
+        name: String,
+        /// Human-facing command/path (`$ cargo test`), as the live row shows it.
+        detail: String,
+        ok: bool,
+        excerpt: String,
+    },
 }
 
 /// The visible transcript retains original exchanges even after model compaction.
 /// Compaction snapshots affect provider history only, never the user's chat view.
-pub fn visible_blocks(events: &[Event], upto_seq: Option<u64>) -> Vec<(String, String)> {
-    let visible: Vec<Event> = active_events(events, upto_seq)
-        .into_iter()
-        .filter(|e| !matches!(e.kind, EventKind::ContextCompacted { .. }))
-        .cloned()
-        .collect();
-    replay_history(&visible, None)
-        .into_iter()
-        .filter_map(|m| match m.role {
-            Role::User if crate::rewind::visible_user_prompt(&m.text) => {
-                Some(("user".into(), m.text))
+///
+/// Rebuilt from the event stream rather than from `replay_history`, because the wire
+/// history keeps a tool result's text but discards the `ok` flag and the call arguments
+/// that make a tool row readable.
+pub fn visible_blocks(events: &[Event], upto_seq: Option<u64>) -> Vec<VisibleBlock> {
+    let mut out: Vec<VisibleBlock> = Vec::new();
+    let mut assistant_text = String::new();
+    // A call is announced by `ToolCallObserved` (which carries the arguments that make
+    // `detail`) and completed by `ToolExecutionFinished` (which carries `ok`). Remember
+    // the announcement so the finished row can be rendered the way the live one was.
+    let mut announced: HashMap<loon_events::EvId, (String, String)> = HashMap::new();
+    let mut finished: std::collections::HashSet<loon_events::EvId> =
+        std::collections::HashSet::new();
+
+    let flush_text = |out: &mut Vec<VisibleBlock>, text: &mut String| {
+        if !text.is_empty() {
+            out.push(VisibleBlock::Assistant {
+                text: std::mem::take(text),
+            });
+        }
+    };
+
+    for e in active_events(events, upto_seq) {
+        match &e.kind {
+            // Compaction changes what the model sees, never the user's chat view.
+            EventKind::ContextCompacted { .. } => {}
+            EventKind::UserMessage { text } => {
+                flush_text(&mut out, &mut assistant_text);
+                // Harness prompts (`[ultraloop …]`, summaries, hook context) are not the
+                // user's words and were never shown as user rows.
+                if crate::rewind::visible_user_prompt(text) {
+                    out.push(VisibleBlock::User { text: text.clone() });
+                }
             }
-            Role::Assistant if !m.text.is_empty() => Some(("assistant".into(), m.text)),
-            _ => None,
-        })
-        .collect()
+            EventKind::TextDelta { text, .. } => assistant_text.push_str(text),
+            EventKind::ToolCallObserved {
+                call,
+                name,
+                arguments_json,
+                ..
+            } => {
+                let detail = match serde_json::from_str::<serde_json::Value>(arguments_json) {
+                    Ok(args) => crate::tool_detail(name, &args),
+                    Err(_) => String::new(),
+                };
+                announced.insert(*call, (name.clone(), detail));
+            }
+            EventKind::ToolExecutionFinished {
+                call,
+                name,
+                ok,
+                excerpt,
+                ..
+            } => {
+                flush_text(&mut out, &mut assistant_text);
+                finished.insert(*call);
+                let detail = announced
+                    .remove(call)
+                    .map(|(_, detail)| detail)
+                    .unwrap_or_default();
+                out.push(VisibleBlock::Tool {
+                    name: name.clone(),
+                    detail,
+                    ok: *ok,
+                    excerpt: excerpt.clone(),
+                });
+            }
+            EventKind::ToolCallRejected { name, reason, .. } => {
+                flush_text(&mut out, &mut assistant_text);
+                out.push(VisibleBlock::Tool {
+                    name: name.clone(),
+                    detail: String::new(),
+                    ok: false,
+                    excerpt: format!("rejected: {reason}"),
+                });
+            }
+            // A request that ended with text and no further deltas still needs flushing;
+            // `TurnFinished` below covers the ordinary case.
+            _ => {}
+        }
+    }
+    flush_text(&mut out, &mut assistant_text);
+    // A call that was announced but never finished (cancelled turn, dropped stream) was
+    // shown as running and then as cancelled. Report it rather than losing it silently.
+    for (call, (name, detail)) in announced {
+        if !finished.contains(&call) {
+            out.push(VisibleBlock::Tool {
+                name,
+                detail,
+                ok: false,
+                excerpt: "cancelled — no result arrived".into(),
+            });
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -317,12 +317,16 @@ async fn run_session(
         );
     }
     let loop_registry = std::sync::Arc::new(loon_core::loops::LoopRegistry::new());
-    let tools = loon_core::subagent::default_tools(
+    // One hub for the tools and the agent: the tools start background subagents and
+    // the agent's turn loop collects their reports, so they must be the same registry.
+    let background = loon_core::subagent::BackgroundHub::new();
+    let tools = loon_core::subagent::default_tools_with_hub(
         &paths,
         &workspace,
         &agent_cfg,
         registry.clone(),
         Some(loop_registry.clone()),
+        background.clone(),
     )
     .with_extra(mcp_tools);
     let mut agent = match session {
@@ -347,6 +351,7 @@ async fn run_session(
         }
     };
 
+    agent.background = background;
     if let Some(effort) = effort {
         agent.effort = Some(effort.clone());
     }
@@ -616,6 +621,8 @@ fn event_type(ev: &AgentEvent) -> &'static str {
         AgentEvent::ToolStarted { .. } => "tool_started",
         AgentEvent::ToolFinished { .. } => "tool_finished",
         AgentEvent::MemberNote(_) => "member_note",
+        AgentEvent::SubagentUpdate { .. } => "subagent_update",
+        AgentEvent::SubagentFinished { .. } => "subagent_finished",
         AgentEvent::ApprovalRequested { .. } => "approval_requested",
         AgentEvent::ModeChanged { .. } => "mode_changed",
         AgentEvent::ToggleTheme => "toggle_theme",
@@ -624,6 +631,7 @@ fn event_type(ev: &AgentEvent) -> &'static str {
         AgentEvent::OpenModelPicker { .. } => "open_model_picker",
         AgentEvent::OpenEffortPicker => "open_effort_picker",
         AgentEvent::OpenProviderForm => "open_provider_form",
+        AgentEvent::QueuedMessagesApplied { .. } => "queued_messages_applied",
         AgentEvent::ClearTranscript => "clear_transcript",
         AgentEvent::Warning(_) => "warning",
         AgentEvent::TurnFinished { .. } => "turn_finished",

@@ -8,6 +8,15 @@ use crate::Agent;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SlashCommand {
     Help,
+    Shell {
+        args: Vec<String>,
+    },
+    Monitors {
+        args: Vec<String>,
+    },
+    Jobs {
+        args: Vec<String>,
+    },
     UltraLoop {
         args: Vec<String>,
     },
@@ -173,6 +182,15 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
     let args: Vec<&str> = parts.collect();
     let cmd = match name {
         "help" => SlashCommand::Help,
+        "shell" | "shells" => SlashCommand::Shell {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
+        "monitor" | "monitors" => SlashCommand::Monitors {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
+        "jobs" => SlashCommand::Jobs {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
         "ultraloop" => SlashCommand::UltraLoop {
             args: args.iter().map(|s| s.to_string()).collect(),
         },
@@ -586,6 +604,15 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
         ("sessions", "search and resume saved sessions"),
         ("resume [ID|n]", "open session browser or resume a session"),
         ("new", "start a new session; keep this one saved"),
+        (
+            "shell [list|start NAME|run NAME COMMAND|close NAME]",
+            "persistent named shells",
+        ),
+        (
+            "monitors [list|start COMMAND|logs ID|stop ID|remove ID]",
+            "watch servers and logs",
+        ),
+        ("jobs [list|poll ID|stop ID]", "manage background processes"),
         ("delete <id|n>", "delete a saved session and its journal"),
         ("clear", "start a new session (alias for /new)"),
         ("rename TITLE", "rename the current session"),
@@ -644,11 +671,37 @@ fn one_line_title(title: &str) -> String {
     title.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Shortest prefix of `id` that no other id in `all` shares, so a displayed id is
+/// always usable as a selector. Session ids are UUIDv7, whose leading 48 bits are a
+/// millisecond timestamp: ids created in the same instant share their first 24
+/// characters, and every id created within ~65s shares the first 8. A fixed 8-char
+/// prefix therefore collides for any two sessions started moments apart, and the
+/// listing would print two different sessions under one id.
+fn unique_id_prefix(id: loon_events::EvId, all: &[loon_events::EvId]) -> String {
+    let full = id.to_string();
+    // Hex chars only: byte and char boundaries coincide, so slicing is safe.
+    for len in 8..=full.len() {
+        let candidate = &full[..len];
+        if all
+            .iter()
+            .filter(|other| other.to_string().starts_with(candidate))
+            .count()
+            == 1
+        {
+            return candidate.to_string();
+        }
+    }
+    full
+}
+
 impl Agent {
     /// Execute one slash command, returning a human-readable result block.
     /// `/quit` is handled by the caller (it owns the event loop).
     pub async fn run_slash(&mut self, cmd: SlashCommand) -> Result<String, String> {
         match cmd {
+            SlashCommand::Shell { args } => self.run_terminal_command("shell_session", args).await,
+            SlashCommand::Monitors { args } => self.run_terminal_command("monitor", args).await,
+            SlashCommand::Jobs { args } => self.run_terminal_command("process", args).await,
             SlashCommand::Help => Ok(help_text()),
             SlashCommand::Undo => {
                 let events = self.journal.events().map_err(|e| format!("journal: {e}"))?;
@@ -979,17 +1032,23 @@ impl Agent {
                 }
                 let paths = self.loon_paths();
                 let store = crate::open_store(&paths).map_err(|e| e.to_string())?;
+                let sessions = store.list_sessions().map_err(|e| e.to_string())?;
                 // This session may still be pending (nothing sent yet). Asking to resume
                 // the session you are already in must succeed rather than reporting
                 // "no sessions yet" — but it must not force it to be written either.
-                if target.as_deref() == Some(&self.session_id().to_string()[..8])
-                    || target
-                        .as_deref()
-                        .is_some_and(|t| self.session_id().to_string().starts_with(t))
-                {
-                    return Ok(format!("resumed session {}", self.session_id()));
+                // A prefix shared with another session is NOT a match: UUIDv7 ids
+                // created moments apart share their leading characters, so treating a
+                // bare prefix as "this session" would silently keep the user where they
+                // are and report success for the session they asked to leave.
+                if let Some(want) = target.as_deref() {
+                    let current = self.session_id().to_string();
+                    let others = sessions.iter().any(|s| {
+                        s.id != self.session_id() && s.id.to_string().starts_with(want)
+                    });
+                    if !others && (want == current || current.starts_with(want)) {
+                        return Ok(format!("resumed session {current}"));
+                    }
                 }
-                let sessions = store.list_sessions().map_err(|e| e.to_string())?;
                 if sessions.is_empty() {
                     return Ok("no sessions yet".into());
                 }
@@ -1005,7 +1064,10 @@ impl Agent {
                                 // and `/resume` without a UI agree about the order.
                                 detail: format!(
                                     "{} · {} · {}",
-                                    &m.id.to_string()[..8],
+                                    unique_id_prefix(
+                                        m.id,
+                                        &sessions.iter().map(|s| s.id).collect::<Vec<_>>()
+                                    ),
                                     crate::worklog::relative_time(m.updated_ms),
                                     m.cwd
                                 ),
@@ -1025,7 +1087,10 @@ impl Agent {
                         out.push_str(&format!(
                             "  {}: {} · {} · {} · {}\n",
                             i + 1,
-                            &meta.id.to_string()[..8],
+                            unique_id_prefix(
+                                meta.id,
+                                &sessions.iter().map(|s| s.id).collect::<Vec<_>>()
+                            ),
                             one_line_title(&meta.title),
                             meta.cwd,
                             crate::worklog::relative_time(meta.updated_ms)
@@ -1149,7 +1214,11 @@ impl Agent {
             SlashCommand::Combo { args } => self.combo_command(args),
             SlashCommand::Export { path } => {
                 let path = path.unwrap_or_else(|| {
-                    format!("loon-session-{}.md", &self.session_id.to_string()[..8])
+                    // The full id, not a short slice: `export_markdown` overwrites
+                    // without asking, and a fixed 8-char prefix is shared by every
+                    // session started within ~65s — so two exports would silently
+                    // destroy each other. A filename has no width budget.
+                    format!("loon-session-{}.md", self.session_id)
                 });
                 let written = self.export_markdown(std::path::Path::new(&path))?;
                 Ok(format!("exported to {written}"))
@@ -1295,7 +1364,12 @@ impl Agent {
                             if text.to_lowercase().contains(&needle) {
                                 hits.push(format!(
                                     "  {} · {} · {}",
-                                    &meta.id.to_string()[..8],
+                                    // Same uniqueness rule as /resume: a fixed 8-char
+                                    // slice collides for sessions started moments apart.
+                                    unique_id_prefix(
+                                        meta.id,
+                                        &sessions.iter().map(|s| s.id).collect::<Vec<_>>()
+                                    ),
                                     // A hit is one line: legacy titles may still hold
                                     // newlines, which would forge extra results.
                                     one_line_title(&meta.title),
@@ -1438,7 +1512,7 @@ impl Agent {
             SlashCommand::AutoCompact { setting } => match setting.as_str() {
                 "on" | "off" => self.config_apply("autocompact", &setting),
                 "toggle" => {
-                    let mode = if self.cfg.context_window == 0 {
+                    let mode = if !self.autocompact {
                         "on"
                     } else {
                         "off"
@@ -1464,9 +1538,7 @@ impl Agent {
                     match spec {
                         TokenSpec::Percent(p) => {
                             let result = self.config_apply("autocompact_percent", &p.to_string())?;
-                            if self.cfg.context_window == 0 {
-                                self.config_apply("context_window", "128k")?;
-                            }
+                            self.config_apply("autocompact", "on")?;
                             Ok(format!(
                                 "{result}; effective trigger ~{} tokens",
                                 format_tokens(self.compaction_trigger_tokens())
@@ -1481,7 +1553,7 @@ impl Agent {
                             }
                             let result =
                                 self.config_apply("autocompact_tokens", &tokens.to_string())?;
-                            if self.cfg.context_window == 0 {
+                            if !self.autocompact {
                                 self.config_apply("autocompact", "on")?;
                             }
                             Ok(format!(
@@ -1803,12 +1875,7 @@ impl Agent {
             "tool_output_bytes" => self.cfg.tool_output_bytes.to_string(),
             "autocompact_tokens" => self.autocompact_tokens.unwrap_or(0).to_string(),
             "autocompact_percent" => self.autocompact_percent.unwrap_or(0).to_string(),
-            "autocompact" => if self.cfg.context_window == 0 {
-                "off"
-            } else {
-                "on"
-            }
-            .to_string(),
+            "autocompact" => if !self.autocompact { "off" } else { "on" }.to_string(),
             _ => String::new(),
         }
     }
@@ -1930,9 +1997,6 @@ impl Agent {
                 if p > 0 {
                     self.autocompact_tokens = None;
                 }
-                if self.cfg.context_window == 0 {
-                    self.cfg.context_window = 128_000;
-                }
                 format!(
                     "autocompact at {}% of the window ({} tokens)",
                     if p == 0 { 80 } else { p },
@@ -2023,7 +2087,11 @@ impl Agent {
             }
             "autocompact" => {
                 let enable = value == "on";
-                self.cfg.context_window = if enable { 128_000 } else { 0 };
+                self.autocompact = enable;
+                self.emit(crate::AgentEvent::UiPreference {
+                    key: "autocompact".into(),
+                    value: enable.to_string(),
+                });
                 format!("autocompact = {value}")
             }
             other => return Err(format!("unknown setting `{other}`")),
@@ -2110,9 +2178,7 @@ impl Agent {
                 cfg.session.tool_output_bytes = value.parse().map_err(|_| "bad integer")?
             }
             "effort" => cfg.session.effort = Some(value.into()),
-            "autocompact" => {
-                cfg.session.context_window = Some(if value == "off" { 0 } else { 128_000 })
-            }
+            "autocompact" => cfg.session.autocompact = value != "off",
             other => return Err(format!("unknown setting {other}")),
         }
         cfg.save(&paths).map_err(|e| e.to_string())
@@ -2345,8 +2411,8 @@ impl Agent {
         use loon_config::tokens::{format_tokens, parse_token_spec, TokenSpec};
         match size.trim().to_ascii_lowercase().as_str() {
             "off" | "0" => {
-                self.config_apply("context_window", "0")?;
-                return Ok("context compaction off (window = 0)".into());
+                self.config_apply("autocompact", "off")?;
+                return Ok("automatic compaction off; context window retained".into());
             }
             "auto" => {
                 self.config_apply("autocompact_percent", "0")?;
@@ -2428,7 +2494,7 @@ impl Agent {
             roles.join(" "),
             if window > 0 { format_tokens(window) } else { "off".into() },
             format_tokens(self.compaction_trigger_tokens()),
-            if window == 0 {
+            if !self.autocompact || window == 0 {
                 "compaction disabled".to_string()
             } else if self.should_compact() {
                 "compaction will trigger before the next request".to_string()
@@ -2471,6 +2537,62 @@ impl Agent {
 }
 
 use loon_events::model::EventKind;
+
+impl Agent {
+    async fn run_terminal_command(
+        &mut self,
+        tool: &str,
+        args: Vec<String>,
+    ) -> Result<String, String> {
+        use serde_json::json;
+        let action = args.first().map(String::as_str).unwrap_or("list");
+        let value = match (tool, action) {
+            ("shell_session", "list") => json!({"action":"list"}),
+            ("shell_session", "start" | "close" | "cwd") => json!({"action":action,"name":args.get(1).map(String::as_str).unwrap_or("main")}),
+            ("shell_session", "run") if args.len() >= 3 => json!({"action":"run","name":args[1],"command":args[2..].join(" ")}),
+            ("monitor", "list") => json!({"action":"list"}),
+            ("monitor", "start") if args.len() > 1 => json!({"action":"start","command":args[1..].join(" ")}),
+            ("monitor", "logs" | "poll" | "stop" | "remove") => json!({"action":action,"monitor_id":args.get(1).and_then(|s|s.parse::<u64>().ok()).ok_or("provide a numeric monitor ID")?}),
+            ("process", "list") => json!({"action":"list"}),
+            ("process", "poll" | "stop") => json!({"action":action,"job_id":args.get(1).and_then(|s|s.parse::<u64>().ok()).ok_or("provide a numeric process ID")?}),
+            _ => return Err("usage: /shell list|start NAME|run NAME COMMAND|cwd NAME|close NAME; /monitors list|start COMMAND|logs ID|poll ID|stop ID|remove ID; /jobs list|poll ID|stop ID".into()),
+        };
+        let spec = self
+            .tools
+            .get(tool)
+            .ok_or("terminal tool is unavailable")?
+            .spec();
+        loon_tools::validate_args(&spec, &value).map_err(|e| e.to_string())?;
+        // An idle cancel signal must not cancel this explicitly requested command.
+        let _ = self.cancel_tx.send(false);
+        let call = loon_events::EvId::now_v7();
+        let request = loon_events::EvId::now_v7();
+        let _ = self.journal.append(
+            Some(request),
+            loon_events::model::EventKind::ToolCallObserved {
+                request,
+                call,
+                wire_id: call.to_string(),
+                name: tool.into(),
+                arguments_json: value.to_string(),
+            },
+        );
+        let output = self
+            .execute_tool(
+                &call,
+                &loon_providers::ToolCallReq {
+                    id: call.to_string(),
+                    name: tool.into(),
+                    arguments_json: value.to_string(),
+                },
+            )
+            .await;
+        if let Ok(events) = self.journal.events() {
+            self.history = crate::replay::replay_history(&events, None);
+        }
+        Ok(output.model_text)
+    }
+}
 
 #[cfg(test)]
 mod tests {

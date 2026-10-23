@@ -446,18 +446,17 @@ impl crate::Agent {
         Ok(state.render())
     }
     pub(crate) fn emit_session_loaded(&self) {
-        let blocks = self
-            .history
-            .iter()
-            .filter_map(|m| match m.role {
-                loon_providers::Role::User => Some(("user".into(), m.text.clone())),
-                loon_providers::Role::Assistant if !m.text.is_empty() => {
-                    Some(("assistant".into(), m.text.clone()))
-                }
-                _ => None,
-            })
-            .collect();
+        let events = self.journal.events().unwrap_or_default();
+        let blocks = crate::replay::visible_blocks(&events, None);
         self.emit(crate::AgentEvent::SessionLoaded { blocks });
+        self.emit(crate::AgentEvent::UiPreference {
+            key: "context_window".into(),
+            value: self.cfg.context_window.to_string(),
+        });
+        self.emit(crate::AgentEvent::UiPreference {
+            key: "autocompact".into(),
+            value: self.autocompact.to_string(),
+        });
         self.emit(crate::AgentEvent::ModelChanged {
             model: self.cfg.model_ref.clone(),
         });

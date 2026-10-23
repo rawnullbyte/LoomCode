@@ -323,6 +323,9 @@ pub struct SessionCfg {
     /// `autocompact_tokens` and follows the window when the model changes.
     #[serde(default)]
     pub autocompact_percent: Option<u8>,
+    /// Enable automatic summarization independently of the model context window.
+    #[serde(default = "yes")]
+    pub autocompact: bool,
 }
 
 /// UI/behavior settings (the `[ui]` table). Defaults mirror Claude-Code's feel.
@@ -399,6 +402,7 @@ impl Default for SessionCfg {
             effort: None,
             autocompact_tokens: None,
             autocompact_percent: None,
+            autocompact: true,
         }
     }
 }

@@ -585,8 +585,12 @@ fn rewinding_clears_newer_chat_and_restores_original_draft() {
     ];
     a.rewind_conversation(
         vec![
-            ("user".into(), "keep".into()),
-            ("assistant".into(), "keep reply".into()),
+            loon_core::replay::VisibleBlock::User {
+                text: "keep".into(),
+            },
+            loon_core::replay::VisibleBlock::Assistant {
+                text: "keep reply".into(),
+            },
         ],
         "remove\nexact draft".into(),
     );
@@ -619,8 +623,12 @@ fn rewind_keeps_earlier_tool_rows_in_the_live_transcript() {
     ];
     a.rewind_conversation(
         vec![
-            ("user".into(), "keep".into()),
-            ("assistant".into(), "keep answer".into()),
+            loon_core::replay::VisibleBlock::User {
+                text: "keep".into(),
+            },
+            loon_core::replay::VisibleBlock::Assistant {
+                text: "keep answer".into(),
+            },
         ],
         "remove".into(),
     );
@@ -801,4 +809,51 @@ fn configuration_scope_search_prefers_labels_and_back_returns_to_settings() {
     assert_eq!(nav.history.len(), 1);
     nav.back();
     assert_eq!(nav.title(), "Settings");
+}
+
+#[test]
+fn new_session_clears_selection_and_shows_wordmark_in_a_short_terminal() {
+    let mut a = app();
+    a.push_welcome_banner();
+    a.blocks.push(Block::Assistant("old answer".repeat(200)));
+    a.selection_snapshot = Some(a.transcript_rows(80));
+    a.queued.push("old queued".into());
+    a.status.busy = true;
+    a.set_session_blocks(std::iter::empty());
+    assert!(a.selection_snapshot.is_none());
+    assert!(!a.status.busy && a.queued.is_empty());
+    let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
+    t.draw(|f| loon_tui::ui::draw(f, &mut a)).unwrap();
+    let text = t
+        .backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect::<String>();
+    assert!(
+        text.contains("██████╗"),
+        "the new session banner should be visible: {text}"
+    );
+    assert!(!text.contains("old answer"));
+}
+
+#[test]
+fn wrapped_fenced_comments_and_sql_keep_their_syntax_styles() {
+    use ratatui::style::Color;
+    let mut a = app();
+    a.blocks.push(Block::Assistant("```rust\n// return fn let this comment should stay dim over several visual rows\n```\n~~~sql\nSELECT id FROM users WHERE active = 1\n~~~".into()));
+    let rows = a.transcript_rows(25);
+    for row in rows
+        .iter()
+        .filter(|r| r.raw.contains("return") || r.raw.contains("visual"))
+    {
+        for span in row.line.spans.iter().skip(1) {
+            assert_eq!(span.style.fg, Some(Color::DarkGray), "{:?}", row.line);
+        }
+    }
+    assert!(rows
+        .iter()
+        .flat_map(|r| &r.line.spans)
+        .any(|s| s.content == "SELECT" && s.style.fg == Some(Color::Magenta)));
 }

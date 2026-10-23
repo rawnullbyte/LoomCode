@@ -86,7 +86,7 @@ async fn bundled_skills_and_coding_tools_are_available_without_files_or_plugins(
     let d = tempfile::tempdir().unwrap();
     let (_, a) = agent(d.path(), vec![]);
     assert!(a.tools.len() >= 40, "{} tools", a.tools.len());
-    assert_eq!(a.skills.iter().filter(|s| s.scope == "bundled").count(), 26);
+    assert_eq!(a.skills.iter().filter(|s| s.scope == "bundled").count(), 30);
     for name in [
         "rust",
         "python",

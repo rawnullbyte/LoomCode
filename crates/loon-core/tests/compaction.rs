@@ -314,3 +314,243 @@ async fn model_summarizer_reports_the_real_failure_instead_of_empty_summary() {
         "the warning must carry the real cause: {warning}"
     );
 }
+
+/// Compaction throws history away and replaces it with one summary message
+/// (`self.history = vec![ChatMessage::user(..)]`). The system prompt lives outside
+/// history, so the behavioural rules should survive — but "should" is exactly what the
+/// no-guessing rule forbids me from asserting. This drives a real compaction and then
+/// reads the NEXT provider request, so a regression that rebuilt the prompt from the
+/// compacted history (or dropped the leading system message) would fail here.
+#[tokio::test]
+async fn the_prompt_rules_survive_a_compaction() {
+    use loon_core::compaction::Summarizer;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+
+    // The mock must outlive the agent so the post-compaction request is inspectable.
+    let mock = loon_providers::MockProvider::with_scripts(vec![
+        MockScript::text("first answer with padding"),
+        MockScript::text("second answer with padding"),
+        MockScript::text("third answer with padding"),
+        MockScript::text("after compaction"),
+    ]);
+    let registry = Arc::new(ProviderRegistry::with_mock(mock.clone()));
+    let mut agent = Agent::new_session(
+        &paths,
+        AgentConfig {
+            model_ref: "mock".into(),
+            tool_output_bytes: 4096,
+            max_retries: 0,
+            allow_retry_after_partial_stream: false,
+            check_command: None,
+            ultra_rounds: 0,
+            permissions: Default::default(),
+            context_window: 128_000,
+            extra_tools: Vec::new(),
+        },
+        registry,
+        ToolRegistry::standard(),
+        ws,
+        true,
+    )
+    .unwrap();
+
+    for i in 1..=3 {
+        let r = agent.run_turn(&format!("question {i}")).await;
+        assert!(matches!(r.status, loon_core::TurnStatus::Completed));
+    }
+
+    // A deterministic summarizer: no model call, so the test stays offline.
+    let summarizer: Summarizer = Arc::new(|_: String| {
+        Box::pin(async { Ok("summary of the earlier questions".to_string()) })
+    });
+    agent.summarizer = Some(summarizer);
+    agent.cfg.context_window = 1; // force the trigger
+    assert!(
+        agent.compact_now().await,
+        "the forced compaction must actually run"
+    );
+
+    // One more turn: this is the first request built from compacted history.
+    let r = agent.run_turn("question after compaction").await;
+    assert!(matches!(r.status, loon_core::TurnStatus::Completed));
+
+    let requests = mock.requests();
+    let last = requests
+        .last()
+        .expect("the final turn must have sent a request");
+    assert_eq!(
+        last.messages.first().map(|m| m.role),
+        Some(Role::System),
+        "the rules must still lead the request after compaction"
+    );
+    let system = &last.messages[0].text;
+    assert!(
+        system.contains("Never guess"),
+        "the no-guessing rule must survive compaction: {system:.300}"
+    );
+    assert!(
+        system.contains("path:line"),
+        "the citation requirement must survive compaction"
+    );
+    assert!(
+        system.contains("Prefer the dedicated tool over a shell equivalent"),
+        "the tool-preference rule must survive compaction"
+    );
+}
+
+/// Compaction is a *lossy* rewrite of the agent's own context, so the summarizer is the
+/// one component whose inventions the agent inherits as fact. The single-pass instruction
+/// already demands "Distinguish evidence from assumptions" and forbids completion from an
+/// agent claim alone — but a transcript over one chunk is summarized in pieces and then
+/// folded by a separate MERGE_INSTRUCTION, and that fold is what becomes the final
+/// handoff. The merge pass must carry the same rules, or the longest sessions — the ones
+/// that most need the handoff to be honest — are the ones that lose them.
+#[tokio::test]
+async fn every_summarizer_pass_carries_the_evidence_rules() {
+    use loon_core::compaction::model_summarizer;
+
+    let mock = loon_providers::MockProvider::with_scripts(vec![
+        MockScript::text("partial one"),
+        MockScript::text("partial two"),
+        MockScript::text("partial three"),
+        MockScript::text("merged a"),
+        MockScript::text("merged b"),
+        MockScript::text("merged final"),
+    ]);
+    let registry = Arc::new(ProviderRegistry::with_mock(mock.clone()));
+    let summarizer = model_summarizer(registry, "mock".into());
+
+    // The chunk budget floors at 16_000 chars, so this forces several chunks and at
+    // least two merge rounds — the shape a long real session takes.
+    let transcript = "x".repeat(600_000);
+    summarizer(transcript)
+        .await
+        .expect("summarizing must succeed");
+
+    let requests = mock.requests();
+    assert!(
+        requests.len() > 3,
+        "the fixture must exercise the merge pass, not just chunking (got {} requests)",
+        requests.len()
+    );
+    for (i, request) in requests.iter().enumerate() {
+        let text: String = request.messages.iter().map(|m| m.text.clone()).collect();
+        // Case-insensitive: the merge pass states the same rules mid-sentence, so the
+        // rule is what matters, not its capitalisation.
+        let lower = text.to_lowercase();
+        assert!(
+            lower.contains("distinguish evidence from assumptions"),
+            "request {i} must keep evidence separate from assumptions: {text:.200}"
+        );
+        assert!(
+            lower.contains("do not claim completion from an agent"),
+            "request {i} must not accept an agent's completion claim as fact"
+        );
+    }
+}
+
+#[tokio::test]
+async fn compaction_toggle_preserves_window_and_persists_independently() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut a = agent(&tmp, vec![]);
+    a.run_slash(loon_core::commands::parse("/context 1m").unwrap().unwrap())
+        .await
+        .unwrap();
+    let window = a.cfg.context_window;
+    for cmd in [
+        "/autocompact off",
+        "/autocompact on",
+        "/context off",
+        "/autocompact on",
+    ] {
+        a.run_slash(loon_core::commands::parse(cmd).unwrap().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            a.cfg.context_window, window,
+            "{cmd} must not reset model capacity"
+        );
+    }
+    let cfg = loon_config::Config::load_or_builtin(&test_paths(tmp.path()))
+        .unwrap()
+        .0;
+    assert!(cfg.session.autocompact);
+    assert_eq!(
+        cfg.models.get("mock").and_then(|m| m.context_window),
+        Some(window)
+    );
+}
+
+#[tokio::test]
+async fn nonshrinking_summary_backs_off_instead_of_retrying_every_request() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut a = agent(
+        &tmp,
+        vec![
+            MockScript::text("one"),
+            MockScript::text("two"),
+            MockScript::text("three"),
+        ],
+    );
+    for q in ["first", "second", "third"] {
+        a.run_turn(q).await;
+    }
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    a.summarizer = Some(Arc::new(move |_| {
+        count.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Ok("padding ".repeat(1000)) })
+    }));
+    a.cfg.context_window = 100;
+    a.maybe_compact().await;
+    a.maybe_compact().await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert!(a.auto_compaction_paused());
+}
+
+#[tokio::test]
+async fn short_tool_heavy_turn_can_compact_without_orphaning_tool_results() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut a = agent(&tmp, vec![]);
+    a.history = vec![loon_providers::ChatMessage::user(
+        "exact original goal: fix the renderer",
+    )];
+    for n in 0..4 {
+        a.history.push(loon_providers::ChatMessage {
+            role: Role::Assistant,
+            text: String::new(),
+            tool_calls: vec![loon_providers::ToolCallReq {
+                id: format!("call{n}"),
+                name: "read".into(),
+                arguments_json: "{}".into(),
+            }],
+            tool_call_id: None,
+        });
+        a.history.push(loon_providers::ChatMessage::tool_result(
+            format!("call{n}"),
+            "log ".repeat(2000),
+        ));
+    }
+    a.summarizer = Some(Arc::new(|_| {
+        Box::pin(async { Ok("Read the renderer and identified the failing branch.".into()) })
+    }));
+    assert!(a.compact_now().await);
+    assert!(a
+        .history
+        .iter()
+        .any(|m| m.text == "exact original goal: fix the renderer"));
+    for m in &a.history {
+        if let Some(id) = &m.tool_call_id {
+            assert!(a
+                .history
+                .iter()
+                .any(|m| m.tool_calls.iter().any(|c| &c.id == id)));
+        }
+    }
+}
