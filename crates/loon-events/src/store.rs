@@ -105,9 +105,16 @@ impl Store {
             )?;
             tracing::info!(version = v, "applied store migration");
         }
-        // A database written by a *newer* build must not be silently downgraded.
-        let highest_known = MIGRATIONS.len() as u32;
-        let _ = highest_known;
+        // A database written by a *newer* build must not be silently downgraded: this
+        // build cannot know what the extra migrations changed, so reading or writing
+        // the rows could misread them.
+        let supported = MIGRATIONS.len() as u32;
+        if current > supported {
+            return Err(EventsError::SchemaTooNew {
+                found: current,
+                supported,
+            });
+        }
         conn.commit()?;
         Ok(())
     }
@@ -417,5 +424,64 @@ impl Store {
             .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))
             .unwrap_or_default();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod schema_guard_tests {
+    use super::*;
+
+    /// A database written by a newer build must not be silently downgraded: the
+    /// older build does not know the newer migrations, so reading and writing it
+    /// can corrupt or misread rows. `migrate()` claims this guard in a comment but
+    /// discarded the computed version, so the check never ran.
+    #[test]
+    fn a_database_from_a_newer_build_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let store = Store::open(&path).unwrap();
+            // Simulate a database written by a build with more migrations.
+            let conn = store.conn.lock().unwrap();
+            let future = (MIGRATIONS.len() as u32) + 7;
+            conn.execute(
+                "INSERT INTO schema_migrations(version, applied_ms) VALUES (?1, ?2)",
+                params![future, Utc::now().timestamp_millis()],
+            )
+            .unwrap();
+        }
+        let err = match Store::open(&path) {
+            Ok(_) => panic!("a newer schema must be refused"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("cannot be read by this build"),
+            "the error must name the downgrade problem, got: {msg}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod schema_upgrade_tests {
+    use super::*;
+
+    /// The guard must not block the normal path: reopening a database this build
+    /// wrote is an upgrade-or-equal case and has to succeed.
+    #[test]
+    fn reopening_an_own_database_still_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.db");
+        {
+            let _ = Store::open(&path).unwrap();
+        }
+        let store = Store::open(&path).expect("an equal schema must open");
+        let conn = store.conn.lock().unwrap();
+        let version: u32 = conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.len() as u32);
     }
 }
