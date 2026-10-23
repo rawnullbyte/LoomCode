@@ -163,3 +163,38 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod diff_boundary_tests {
+    use super::unified;
+
+    /// The prefix/suffix arithmetic indexes `x[prefix..x.len() - suffix]`: an
+    /// off-by-one there panics, and `lines()`/`ends_with` edge cases (empty
+    /// strings, bare newlines, missing trailing newline) are exactly what shifts
+    /// the boundary. Lock them in so a future trim change fails here first.
+    #[test]
+    fn boundary_inputs_never_panic_and_trim_correctly() {
+        let pieces = ["", "a", "b", "\n", "a\n", "\n\n", "a\nb", "x\ny\n", "a\r\n"];
+        for before in pieces {
+            for after in pieces {
+                for label in ["f.rs", ""] {
+                    let _ = unified(label, before, after);
+                }
+            }
+        }
+        // Same-line rewrite larger than the per-side budget: the single-line
+        // tail is unchanged, so the changed region itself exceeds the budget.
+        let big_a = "a\n".repeat(200);
+        let big_b = "b\n".repeat(200);
+        let clipped = unified("big", &big_a, &big_b).unwrap();
+        assert!(
+            clipped.contains("[diff clipped:"),
+            "a 200-line rewrite must clip, got {clipped:.120}"
+        );
+        let flipped = unified("big2", &big_b, &big_a).unwrap();
+        assert!(
+            flipped.contains("[diff clipped:"),
+            "clipping must apply to either side, got {flipped:.120}"
+        );
+    }
+}
