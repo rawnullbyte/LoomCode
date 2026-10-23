@@ -49,6 +49,10 @@ pub fn load_for_prompt(paths: &MemoryPaths) -> String {
 /// Append one fact to a scope, creating the file with its header when absent.
 /// Returns the path written.
 pub fn save(paths: &MemoryPaths, scope: Scope, fact: &str) -> std::io::Result<PathBuf> {
+    // One entry per line is the file's format, and the fact is free text from the
+    // model: a newline in it would forge extra entries (including fake "- " ones).
+    let fact = fact.split_whitespace().collect::<Vec<_>>().join(" ");
+    let fact = fact.as_str();
     let path = match scope {
         Scope::Global => &paths.global,
         Scope::Workspace => &paths.workspace,

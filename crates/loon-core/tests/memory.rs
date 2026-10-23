@@ -189,3 +189,38 @@ fn tool_ctx(ws: &std::path::Path) -> loon_tools::ToolCtx {
         blob_sink: None,
     }
 }
+
+/// A memory fact is stored as one `- fact` line. The fact comes from the model as
+/// free text, so a newline in it would forge a second entry in the memory file.
+#[tokio::test]
+async fn memory_tool_keeps_one_fact_per_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = test_paths(&tmp.path().join("home"));
+    paths.ensure().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let reg = loon_core::standard_tools(&paths, &ws);
+    let tool = reg.get("memory").expect("memory tool registered");
+    let ctx = tool_ctx(&ws);
+
+    let out = tool
+        .run(
+            json!({"fact": "prefers tabs\n- injected entry\n- another", "scope": "workspace"}),
+            &ctx,
+        )
+        .await
+        .unwrap();
+    assert!(out.ok);
+
+    let saved = std::fs::read_to_string(ws.join(".loon/memory/MEMORY.md")).unwrap();
+    let entries: Vec<&str> = saved.lines().filter(|l| l.starts_with("- ")).collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "one fact must stay one entry, got: {saved:?}"
+    );
+    assert!(
+        entries[0].contains("prefers tabs"),
+        "the fact keeps its words, got: {saved:?}"
+    );
+}
