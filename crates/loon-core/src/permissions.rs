@@ -301,7 +301,6 @@ fn redact(s: &str) -> String {
         "private_key",
         "credential",
     ];
-    let lower = s.to_lowercase();
     let mut out = String::with_capacity(s.len());
     let mut i = 0;
     while i < s.len() {
@@ -311,7 +310,16 @@ fn redact(s: &str) -> String {
                 let prev = s[..i].chars().next_back().unwrap_or(' ');
                 !prev.is_alphanumeric() && prev != '_'
             };
-            if boundary && lower[i..].starts_with(k) {
+            // Compare in place rather than indexing a lowercased copy: lowercasing
+            // can change byte length ('İ' → 'i̇'), so an offset from `s` is not a
+            // valid boundary in the copy. That mismatch both panicked and, worse,
+            // silently skipped redaction.
+            let end = i + k.len();
+            if boundary
+                && end <= s.len()
+                && s.is_char_boundary(end)
+                && s[i..end].eq_ignore_ascii_case(k)
+            {
                 Some(k.len())
             } else {
                 None
@@ -348,7 +356,11 @@ fn redact(s: &str) -> String {
         i = j;
         // `Authorization: Bearer <token>` — the scheme word is not the secret.
         let rest = &s[i..];
-        if klen == "authorization".len() && rest.to_lowercase().starts_with("bearer") {
+        if klen == "authorization".len()
+            && rest.len() >= 6
+            && rest.is_char_boundary(6)
+            && rest[..6].eq_ignore_ascii_case("bearer")
+        {
             out.push_str(&rest[..6]);
             i += 6;
             while i < s.len() && s[i..].starts_with(' ') {
@@ -580,6 +592,61 @@ mod redaction_false_positive_tests {
         assert_eq!(
             redact(r#"{"note":"rotate the token soon"}"#),
             r#"{"note":"rotate the token soon"}"#
+        );
+    }
+}
+
+#[cfg(test)]
+mod redaction_unicode_tests {
+    use super::redact;
+
+    /// Lowercasing can change a string's byte length ('İ' is 2 bytes, its
+    /// lowercase is 3), so a byte offset taken from the original cannot index
+    /// the lowered copy. That mismatch panicked the audit path, which runs on
+    /// every tool call — a non-ASCII argument could crash the agent.
+    #[test]
+    fn a_unicode_argument_does_not_panic() {
+        for args in [
+            "İ token=abc",
+            "{\"note\":\"İstanbul\",\"api_key\":\"sk-1\"}",
+            "Übergriff password=hunter2",
+            "naïve secret=x",
+            "日本語 token=abc",
+        ] {
+            let out = redact(args);
+            assert!(
+                !out.contains("sk-1") && !out.contains("hunter2"),
+                "still redacts alongside unicode: {out}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod redaction_panic_probe {
+    use super::redact;
+
+    /// The bare form: a lowercase-changing char before a key shifts the byte
+    /// offsets between the original and the lowered copy.
+    #[test]
+    fn a_lowercase_length_change_before_a_key_does_not_panic() {
+        let out = redact("İİİ token=abc");
+        assert!(out.contains("[redacted]") || !out.contains("abc"));
+    }
+}
+
+#[cfg(test)]
+mod redaction_unicode_key_tests {
+    use super::redact;
+
+    /// The key itself can be non-ASCII-adjacent: the fix must still match the
+    /// credential name when a multibyte char sits right before it.
+    #[test]
+    fn a_key_after_a_multibyte_char_still_redacts() {
+        let out = redact("{\"note\":\"日本語\",\"api_key\":\"sk-secret-1\"}");
+        assert!(
+            !out.contains("sk-secret-1"),
+            "a multibyte neighbour must not defeat redaction, got: {out}"
         );
     }
 }
