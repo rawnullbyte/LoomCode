@@ -785,3 +785,52 @@ fn ambiguous_selector_lists_one_candidate_per_line() {
         "the title should appear flattened, got: {err:?}"
     );
 }
+
+/// The CWD column exists to tell sessions apart. Truncating the *front* keeps the
+/// shared parent directory and throws away the project name, so two different
+/// projects both read `/tmp/tmp.O`. Keep the tail, which is the part that differs.
+#[test]
+fn sessions_list_distinguishes_projects_sharing_a_parent() {
+    let home = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let alpha = root.path().join("alpha");
+    let beta = root.path().join("beta");
+    std::fs::create_dir_all(&alpha).unwrap();
+    std::fs::create_dir_all(&beta).unwrap();
+    let loom = |dir: &std::path::Path| {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c.current_dir(dir);
+        c
+    };
+    assert!(loom(&alpha)
+        .args(["run", "a"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    assert!(loom(&beta)
+        .args(["run", "b"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+
+    let out = loom(root.path())
+        .args(["sessions", "list"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let rows: Vec<&str> = text
+        .lines()
+        .skip(1)
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    assert_eq!(rows.len(), 2, "two sessions, got: {text}");
+    let shows_alpha = rows.iter().any(|r| r.contains("alpha"));
+    let shows_beta = rows.iter().any(|r| r.contains("beta"));
+    assert!(
+        shows_alpha && shows_beta,
+        "the CWD column must distinguish alpha from beta, got: {text}"
+    );
+}

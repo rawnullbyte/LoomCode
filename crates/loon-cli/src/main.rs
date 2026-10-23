@@ -665,7 +665,9 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
             for s in &list {
                 let used = chrono_fmt(s.updated_ms);
                 let created = chrono_fmt(s.created_ms);
-                let cwd = s.cwd.chars().take(10).collect::<String>();
+                // Keep the TAIL: the leading path is usually a shared parent, so
+                // truncating the front makes two projects look identical.
+                let cwd = short_path(&s.cwd, 18);
                 println!(
                     "{:<38} {:<20} {:<20} {:<10} {}",
                     s.id,
@@ -788,6 +790,18 @@ fn resolve_workspace(
         (None, Some(r)) => (r, true),
         (None, None) => (invocation, false),
     }
+}
+
+/// Shorten a path for a table column, keeping its end: the tail names the project
+/// while the head is usually a shared parent. An elided path starts with "…".
+fn short_path(path: &str, max: usize) -> String {
+    let count = path.chars().count();
+    if count <= max {
+        return path.to_string();
+    }
+    let keep = max.saturating_sub(1);
+    let tail: String = path.chars().skip(count - keep).collect();
+    format!("…{tail}")
 }
 
 /// Collapse any whitespace run to a single space so stored text cannot forge
@@ -979,7 +993,7 @@ fn doctor(connect: bool) -> i32 {
 
 #[cfg(test)]
 mod workspace_tests {
-    use super::resolve_workspace;
+    use super::{resolve_workspace, short_path};
     use std::path::PathBuf;
 
     /// Precedence: --cwd, then the resumed session's own directory, then the
@@ -1018,5 +1032,25 @@ mod workspace_tests {
         let (dir, from_session) = resolve_workspace(None, None, PathBuf::from("/invoked"));
         assert_eq!(dir, PathBuf::from("/invoked"));
         assert!(!from_session);
+    }
+
+    /// Short paths are shown whole; long ones keep the project-naming tail and
+    /// mark the elision. The old front-truncation showed two different projects
+    /// as the same shared parent.
+    #[test]
+    fn short_path_keeps_the_distinguishing_tail() {
+        assert_eq!(
+            short_path("/tmp/xyz/alpha", 18),
+            "/tmp/xyz/alpha",
+            "short paths pass through untouched"
+        );
+        let a = short_path("/home/user/work/alpha", 14);
+        let b = short_path("/home/user/work/beta", 14);
+        assert_ne!(a, b, "two projects must not elide to the same text");
+        assert!(a.ends_with("alpha") && b.ends_with("beta"));
+        assert!(
+            a.chars().count() <= 14 && b.chars().count() <= 14,
+            "stays within the column: {a} / {b}"
+        );
     }
 }
