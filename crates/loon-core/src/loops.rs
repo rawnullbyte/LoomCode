@@ -26,7 +26,14 @@ pub struct LoopRegistry {
 /// Parse `30s` / `5m` / `2h` / bare seconds.
 pub fn parse_interval(s: &str) -> Result<Duration, String> {
     let s = s.trim();
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    // Split the trailing *character* off, never the trailing byte: a multi-byte unit
+    // (`5µ`, a pasted CJK marker) used to slice mid-character and panic. An
+    // unrecognised unit falls through to the bare-seconds parse and errors there.
+    let (num, unit) = match s.chars().next_back() {
+        Some(c) => (&s[..s.len() - c.len_utf8()], c.to_string()),
+        None => (s, String::new()),
+    };
+    let unit = unit.as_str();
     let secs = match unit {
         "s" => num.parse::<u64>().map_err(|_| "bad seconds")?,
         "m" => num
@@ -113,6 +120,23 @@ impl LoopRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A unit is a single ASCII letter. Splitting off the last *byte* panicked when
+    /// the user typed a multi-byte character (`/loop 5µ check`, or a CJK unit pasted
+    /// from an input method), taking the session down instead of reporting a bad
+    /// interval. Anything unrecognised must come back as an error.
+    #[test]
+    fn a_multibyte_unit_is_an_error_not_a_panic() {
+        for bad in ["5µ", "3é", "5分", "µ", "5→", "30秒"] {
+            assert!(
+                parse_interval(bad).is_err(),
+                "{bad:?} must be rejected as a bad interval"
+            );
+        }
+        // ASCII behaviour is unchanged.
+        assert_eq!(parse_interval("30s"), Ok(Duration::from_secs(30)));
+        assert_eq!(parse_interval("45"), Ok(Duration::from_secs(45)));
+    }
 
     #[test]
     fn interval_parses_units_and_bare_seconds() {
