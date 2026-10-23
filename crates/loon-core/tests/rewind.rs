@@ -412,3 +412,45 @@ async fn rewind_entries_describe_each_turn() {
     assert_eq!(e.files_changed, 1, "a.txt was mutated");
     assert!(e.added >= 1, "the new line is counted: +{}", e.added);
 }
+
+/// `RewindEntry::prompt` is documented as "flattened to one line" because it is
+/// rendered as a single menu row. It used to carry the raw message, so a
+/// multi-line prompt split the picker entry across rows.
+#[tokio::test]
+async fn rewind_entries_flatten_a_multiline_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_root = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws_root).unwrap();
+
+    let registry = ProviderRegistry::with_mock(loon_providers::MockProvider::with_scripts(vec![
+        MockScript::text("done"),
+    ]));
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let mut agent = Agent::new_session(
+        &paths,
+        cfg(),
+        Arc::new(registry),
+        ToolRegistry::standard(),
+        ws_root.clone(),
+        true,
+    )
+    .unwrap();
+    let sid = agent.session_id();
+    agent.run_turn("first line\nsecond line").await;
+
+    let store = loon_core::open_store(&paths).unwrap();
+    let (journal, events) = Journal::open_default(&store, &paths.sessions_dir(), sid).unwrap();
+    let entries = rewind::rewind_entries(&journal, &events);
+    let e = entries.last().expect("one entry");
+    assert!(
+        !e.prompt.contains('\n'),
+        "the picker row is one line, so the prompt must be flattened, got: {:?}",
+        e.prompt
+    );
+    assert!(
+        e.prompt.contains("first line second line"),
+        "the flattened prompt keeps its words, got: {:?}",
+        e.prompt
+    );
+}
