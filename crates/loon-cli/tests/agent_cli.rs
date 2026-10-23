@@ -882,3 +882,102 @@ fn sessions_list_starts_title_in_the_same_column_on_every_row() {
         "TITLE must start in the same column on both rows, got: {text}"
     );
 }
+
+/// The prompt asks the user to "type the session id prefix to confirm". The full
+/// id IS a prefix of itself, and it is the most natural answer — but the check
+/// compared for exact equality with the 8-char key, so a user who pasted the id
+/// they were just shown got "aborted" instead of a deletion.
+#[test]
+fn delete_confirm_accepts_the_full_id_as_a_prefix() {
+    use std::io::Write as _;
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    assert!(loom()
+        .args(["run", "seed"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let list = loom().args(["sessions", "list"]).output().unwrap();
+    let full = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().next().map(str::to_string))
+        .expect("one session exists");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["sessions", "delete", &full[..12]])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(format!("{full}\n").as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "the full id is a prefix of itself and must confirm, got: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = loom().args(["sessions", "list"]).output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&after.stdout).contains("no sessions yet"),
+        "the session must actually be gone"
+    );
+}
+
+/// A one- or two-character answer is guessable and must still be refused: the
+/// confirmation exists so the user reads the id, not to be a formality.
+#[test]
+fn delete_confirm_refuses_a_trivially_short_answer() {
+    use std::io::Write as _;
+    let home = tempfile::tempdir().unwrap();
+    let loom = || {
+        let mut c = Command::new(env!("CARGO_BIN_EXE_loom"));
+        c.env("LOON_HOME", home.path());
+        c
+    };
+    assert!(loom()
+        .args(["run", "seed"])
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let list = loom().args(["sessions", "list"]).output().unwrap();
+    let full = String::from_utf8_lossy(&list.stdout)
+        .lines()
+        .nth(1)
+        .and_then(|l| l.split_whitespace().next().map(str::to_string))
+        .expect("one session exists");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["sessions", "delete", &full[..12]])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(b"01a\n").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        !out.status.success(),
+        "a 3-char answer must not delete, got: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let after = loom().args(["sessions", "list"]).output().unwrap();
+    assert!(
+        !String::from_utf8_lossy(&after.stdout).contains("no sessions yet"),
+        "the session must survive"
+    );
+}

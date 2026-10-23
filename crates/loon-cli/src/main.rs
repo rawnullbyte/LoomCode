@@ -747,11 +747,11 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
                 return 1;
             };
             if !force {
-                // The prefix comes from the RESOLVED id, not the raw argument: the
+                // The key comes from the RESOLVED id, not the raw argument: the
                 // user may have typed anything that uniquely selects the session
-                // ("01a"), but the confirmation key is always the documented 8
-                // chars of the real id.
-                let short = sid.to_string().chars().take(8).collect::<String>();
+                // ("01a"), but the confirmation is always anchored to the real id.
+                let full = sid.to_string();
+                let short = full.chars().take(8).collect::<String>();
                 eprintln!(
                     "delete session {short} ({} events) titled `{}`?",
                     store.events(sid).map(|e| e.len()).unwrap_or(0),
@@ -766,7 +766,12 @@ fn sessions_cmd(cmd: &SessionsCmd) -> i32 {
                 if std::io::stdin().read_line(&mut answer).is_err() {
                     return 1;
                 }
-                if answer.trim() != short {
+                // The prompt asks for "the session id prefix": the 8-char key or
+                // the full id both prove the user is looking at the right session.
+                // Shorter answers stay refused so the confirmation is not a
+                // formality.
+                let answer = answer.trim();
+                if answer != short && answer != full {
                     eprintln!("aborted");
                     return 1;
                 }
