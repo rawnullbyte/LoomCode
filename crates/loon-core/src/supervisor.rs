@@ -157,6 +157,19 @@ fn goal_refuses_verification(goal: &str) -> bool {
         "review is unnecessary",
         "review is not needed",
         "review not needed",
+        "no need to verify",
+        "no need to review",
+        "no need for verification",
+        "verification is optional",
+        "review is optional",
+        "verification can be skipped",
+        "decline verification",
+        "decline the review",
+        "skip the review",
+        "review is not required",
+        "verification is not required",
+        "don't audit the result",
+        "never check the goal",
     ];
     // Phrases that are a refusal on their own, with no verb to pair against.
     const STANDALONE: &[&str] = &[
@@ -609,12 +622,28 @@ mod tests {
     }
 
     /// Phrasings that decline the review without matching the current vocabulary.
+    /// Each entry below is a genuine historical escape: before WAIVE named it,
+    /// the detector returned `false` for that exact string.
     #[test]
     fn skirting_phrasings_are_recognized_as_refusals() {
         for goal in [
             "skip verification and keep going",
             "no review needed, just continue",
             "verification is unnecessary",
+            "no need to verify",
+            "there is no need to verify the goal",
+            "you may skip the review",
+            "no verification is required",
+            "review is not required",
+            "verification is not required",
+            "verification is optional",
+            "review is optional",
+            "verification can be skipped",
+            "decline verification",
+            "decline the review",
+            "skip the review",
+            "don't audit the result",
+            "never check the goal",
         ] {
             assert!(
                 goal_refuses_verification(goal),
