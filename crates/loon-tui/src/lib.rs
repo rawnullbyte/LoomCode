@@ -851,38 +851,7 @@ async fn run_inner(
             let delivered = clipboard::copy(&text).await;
             if !delivered {
                 use std::io::Write;
-                let b64 = {
-                    use std::fmt::Write as _;
-                    let mut out = String::new();
-                    const T: &[u8; 64] =
-                        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-                    let bytes = text.as_bytes();
-                    for chunk in bytes.chunks(3) {
-                        let b = [
-                            chunk[0],
-                            chunk.get(1).copied().unwrap_or(0),
-                            chunk.get(2).copied().unwrap_or(0),
-                        ];
-                        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
-                        let _ = write!(
-                            out,
-                            "{}{}{}{}",
-                            T[(n >> 18) as usize & 63],
-                            T[(n >> 12) as usize & 63],
-                            if chunk.len() > 1 {
-                                T[(n >> 6) as usize & 63]
-                            } else {
-                                b'='
-                            },
-                            if chunk.len() > 2 {
-                                T[n as usize & 63]
-                            } else {
-                                b'='
-                            },
-                        );
-                    }
-                    out
-                };
+                let b64 = osc52_base64(text.as_bytes());
                 let _ = write!(std::io::stdout(), "\x1b]52;c;{b64}\x07");
                 let _ = std::io::stdout().flush();
             }
@@ -1510,6 +1479,42 @@ async fn submit(app: &mut App, cmd_tx: &mpsc::Sender<UiCommand>, text: String, s
     let _ = cmd_tx.send(command).await;
 }
 
+/// Base64 for the OSC 52 clipboard escape. Terminals decode this strictly, so it
+/// must be the real alphabet, not decimal byte values.
+fn osc52_base64(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        // The table holds bytes but the payload is text: format them as chars.
+        // `write!("{}")` on a `u8` emits its decimal value ("f" became "901036161"),
+        // which no terminal can decode back to the copied text.
+        let _ = write!(
+            out,
+            "{}{}{}{}",
+            T[(n >> 18) as usize & 63] as char,
+            T[(n >> 12) as usize & 63] as char,
+            if chunk.len() > 1 {
+                T[(n >> 6) as usize & 63] as char
+            } else {
+                '='
+            },
+            if chunk.len() > 2 {
+                T[n as usize & 63] as char
+            } else {
+                '='
+            },
+        );
+    }
+    out
+}
+
 /// Mouse: wheel scrolls the transcript; click positions the input cursor; click on a
 /// popup row selects that completion; drag across the transcript selects text, and
 /// releasing copies it — returns the selected text for the caller to put on the
@@ -2097,5 +2102,73 @@ mod prompt_editing_tests {
         };
         handle_mouse(&mut app, click);
         assert_eq!(app.cursor, 2, "a click outside the box is not a caret move");
+    }
+}
+
+#[cfg(test)]
+mod osc52_tests {
+    use super::osc52_base64;
+
+    /// OSC 52 carries the selection as base64. The encoder wrote `T[i]` (a `u8`)
+    /// through `write!("{}")`, which formats the *decimal* value, so a terminal
+    /// decoded "a" as "89816161" — a corrupted paste. Vectors from RFC 4648 §10.
+    #[test]
+    fn the_osc52_payload_is_real_base64() {
+        for (input, expected) in [
+            ("", ""),
+            ("f", "Zg=="),
+            ("fo", "Zm8="),
+            ("foo", "Zm9v"),
+            ("foob", "Zm9vYg=="),
+            ("fooba", "Zm9vYmE="),
+            ("foobar", "Zm9vYmFy"),
+        ] {
+            assert_eq!(
+                osc52_base64(input.as_bytes()),
+                expected,
+                "OSC 52 payload for {input:?}"
+            );
+        }
+    }
+
+    /// Multi-byte text must round-trip byte-exactly: the encoder works on UTF-8
+    /// bytes, so a wide glyph or an emoji must not be split across chunks wrongly.
+    #[test]
+    fn multibyte_text_encodes_byte_exactly() {
+        for input in ["日本語", "a日b", "✓", "line1\nline2\n", "tab\there"] {
+            let encoded = osc52_base64(input.as_bytes());
+            let decoded = decode(&encoded);
+            assert_eq!(
+                decoded,
+                input.as_bytes(),
+                "round-trip failed for {input:?} (payload {encoded})"
+            );
+        }
+    }
+
+    /// A minimal strict decoder, so the test checks the alphabet rather than
+    /// trusting the encoder's own table.
+    fn decode(s: &str) -> Vec<u8> {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = Vec::new();
+        let mut acc: u32 = 0;
+        let mut bits = 0;
+        for c in s.bytes() {
+            if c == b'=' {
+                continue;
+            }
+            let v = T
+                .iter()
+                .position(|&t| t == c)
+                .unwrap_or_else(|| panic!("not base64: {:?} in {s}", c as char))
+                as u32;
+            acc = (acc << 6) | v;
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+            }
+        }
+        out
     }
 }
