@@ -190,32 +190,49 @@ impl WorkState {
             text.push_str("Ultraloop: active; independent supervisor checks completion.\n");
         }
         if let Some(goal) = &self.goal {
-            text.push_str(&format!("Goal: {goal}\n"));
+            text.push_str(&format!("Goal: {}\n", one_line(goal)));
         }
         for (i, p) in self.plan.iter().enumerate() {
-            text.push_str(&format!("{}. [{}] {}\n", i + 1, p.status, p.step));
+            text.push_str(&format!(
+                "{}. [{}] {}\n",
+                i + 1,
+                p.status,
+                one_line(&p.step)
+            ));
         }
         if !self.tasks.is_empty() {
             text.push_str("Tasks:\n");
             for task in &self.tasks {
                 text.push_str(&format!(
                     "#{} [{}] {} (depends: {:?})\n",
-                    task.id, task.status, task.subject, task.blocked_by
+                    task.id,
+                    task.status,
+                    one_line(&task.subject),
+                    task.blocked_by
                 ));
                 if !task.description.trim().is_empty() {
-                    text.push_str(&format!("  Evidence/context: {}\n", task.description));
+                    text.push_str(&format!(
+                        "  Evidence/context: {}\n",
+                        one_line(&task.description)
+                    ));
                 }
             }
         }
         if !self.notes.is_empty() {
             text.push_str("Notes:\n");
             for n in &self.notes {
-                text.push_str(&format!("- {n}\n"));
+                text.push_str(&format!("- {}\n", one_line(n)));
             }
         }
         text
     }
 }
+/// Collapse whitespace runs to single spaces. `render()` output is fed into the
+/// model's prompt, so a newline in a stored field would forge extra structure.
+fn one_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub struct PlanTool {
     pub log: WorkLog,
 }
