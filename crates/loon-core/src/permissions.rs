@@ -305,10 +305,15 @@ fn redact(s: &str) -> String {
     let mut i = 0;
     while i < s.len() {
         let hit = KEYS.iter().find_map(|k| {
-            // The key must start a token: preceded by a non-word char or the start.
+            // The key must start a word: the string start, or after a non-alphanumeric
+            // char. `_` deliberately counts as a separator: credentials arrive as
+            // environment assignments (`OPENAI_API_KEY=`, `DB_PASSWORD=`) where the key
+            // is a suffix, and requiring a non-word prefix journaled every one of them
+            // in plaintext. Plain identifiers (`mysecret=`) still pass through, which
+            // the separator rule below handles.
             let boundary = i == 0 || {
                 let prev = s[..i].chars().next_back().unwrap_or(' ');
-                !prev.is_alphanumeric() && prev != '_'
+                !prev.is_alphanumeric()
             };
             // Compare in place rather than indexing a lowercased copy: lowercasing
             // can change byte length ('İ' → 'i̇'), so an offset from `s` is not a
@@ -586,6 +591,21 @@ mod redaction_false_positive_tests {
         );
     }
 
+    /// Accepting a key that ends a longer identifier (for `OPENAI_API_KEY=`) must not
+    /// start eating ordinary paths and prose that merely contain a key word.
+    #[test]
+    fn a_key_word_inside_a_path_or_phrase_is_left_alone() {
+        for args in [
+            "src/token.rs",
+            "src/api_key.rs",
+            "docs/password.md",
+            r#"{"note":"rotate the token soon"}"#,
+            r#"{"path":"src/secret/mod.rs"}"#,
+        ] {
+            assert_eq!(redact(args), args, "must not alter: {args}");
+        }
+    }
+
     /// A key with no separator is prose, not a credential.
     #[test]
     fn a_key_word_in_prose_is_left_alone() {
@@ -648,5 +668,30 @@ mod redaction_unicode_key_tests {
             !out.contains("sk-secret-1"),
             "a multibyte neighbour must not defeat redaction, got: {out}"
         );
+    }
+}
+#[cfg(test)]
+mod redaction_env_shape_tests {
+    use super::redact;
+
+    /// Credentials usually reach a tool as environment assignments, where the key
+    /// is a *suffix* of a longer name: `OPENAI_API_KEY=...`, `GITHUB_TOKEN=...`.
+    /// The boundary rule required the key to start a token, so every one of these
+    /// was journaled in plaintext — the shapes a user is most likely to leak.
+    #[test]
+    fn an_environment_assignment_does_not_leak_its_value() {
+        for (args, secret) in [
+            ("OPENAI_API_KEY=sk-live-123", "sk-live-123"),
+            ("GITHUB_TOKEN=ghp_abc", "ghp_abc"),
+            ("export DB_PASSWORD=hunter2", "hunter2"),
+            ("MY_SECRET=xyz", "xyz"),
+            (r#"{"env":{"ANTHROPIC_API_KEY":"sk-ant-1"}}"#, "sk-ant-1"),
+        ] {
+            let out = redact(args);
+            assert!(
+                !out.contains(secret),
+                "an env-shaped credential must not be journaled: {args} -> {out}"
+            );
+        }
     }
 }
