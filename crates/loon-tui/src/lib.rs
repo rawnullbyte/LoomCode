@@ -1181,6 +1181,37 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
     if app.pending_approval.is_none() && manager::key(app, key, cmd_tx).await {
         return;
     }
+    // A pending approval is modal: y approves, n or Esc refuses, everything else is
+    // swallowed so the turn cannot be poked while it waits.
+    //
+    // The answer must be an *unmodified* key. Matching `key.code` alone meant
+    // Ctrl+Y — the copy-last-answer shortcut — approved the pending tool call, so a
+    // user reaching for a copy silently authorized whatever was being asked about.
+    if let Some((tool, _excerpt, answer_tx)) = app.pending_approval.take() {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char('y' | 'Y') if plain => {
+                let _ = answer_tx.send(true);
+                app.push_block(Block::System(format!("approved: {tool}")));
+            }
+            KeyCode::Char('n' | 'N') if plain => {
+                let _ = answer_tx.send(false);
+                app.push_block(Block::System(format!("refused: {tool}")));
+            }
+            KeyCode::Esc if plain => {
+                let _ = answer_tx.send(false);
+                app.push_block(Block::System(format!("refused: {tool}")));
+            }
+            _ => {
+                // Not an answer: keep waiting. Anything else (Ctrl+Y, Ctrl+O, typing)
+                // must not resolve the prompt.
+                app.pending_approval = Some((tool, _excerpt, answer_tx));
+            }
+        }
+        return;
+    }
     if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
         app.show_tool_details = !app.show_tool_details;
         app.selection = None;
@@ -1211,26 +1242,6 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         app.selection = None;
         app.selection_snapshot = None;
         app.input_anchor = None;
-        return;
-    }
-    // A pending approval is modal: y approves, n or Esc refuses, everything else is
-    // swallowed so the turn cannot be poked while it waits.
-    if let Some((tool, _excerpt, answer_tx)) = app.pending_approval.take() {
-        match key.code {
-            KeyCode::Char('y') | KeyCode::Char('Y') => {
-                let _ = answer_tx.send(true);
-                app.push_block(Block::System(format!("approved: {tool}")));
-            }
-            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                let _ = answer_tx.send(false);
-                app.push_block(Block::System(format!("refused: {tool}")));
-            }
-            other => {
-                // not an answer: keep waiting
-                app.pending_approval = Some((tool, _excerpt, answer_tx));
-                let _ = other;
-            }
-        }
         return;
     }
     match key.code {
@@ -2170,5 +2181,118 @@ mod osc52_tests {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod modal_contract_tests {
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use tokio::sync::mpsc;
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    fn app_pending() -> (App, tokio::sync::oneshot::Receiver<bool>) {
+        let mut app = App::new(
+            true,
+            StatusLine {
+                model: "mock".into(),
+                ..Default::default()
+            },
+        );
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+        app.pending_approval = Some(("bash".into(), "rm -rf /".into(), answer_tx));
+        (app, answer_rx)
+    }
+
+    /// `pending_approval` is documented as modal: keys other than y/n/Esc are
+    /// ignored while it is set. The copy and tool-detail shortcuts were handled
+    /// *before* the modal check, so Ctrl+Y silently copied transcript text and
+    /// Ctrl+O toggled the view while the user was being asked to authorize a
+    /// command — and the prompt stayed up, so nothing on screen explained it.
+    #[tokio::test]
+    async fn shortcuts_do_not_fire_while_an_approval_is_pending() {
+        let (tx, _rx) = mpsc::channel(8);
+        let (mut app, mut answer_rx) = app_pending();
+        app.push_block(Block::Assistant("transcript answer".into()));
+        app.show_tool_details = false;
+
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            &tx,
+        )
+        .await;
+        assert_eq!(
+            app.pending_copy, None,
+            "Ctrl+Y must not copy while an approval is pending"
+        );
+
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            &tx,
+        )
+        .await;
+        assert!(
+            !app.show_tool_details,
+            "Ctrl+O must not toggle tool details while an approval is pending"
+        );
+
+        assert!(
+            app.pending_approval.is_some(),
+            "the prompt must still be waiting for y/n/Esc"
+        );
+        assert!(
+            answer_rx.try_recv().is_err(),
+            "no answer may be sent by an unrelated key"
+        );
+    }
+
+    /// Ctrl+Y is the "copy last answer" shortcut. The modal matched `key.code`
+    /// alone, so Ctrl+Y resolved the prompt as *approval*: a user reaching for a
+    /// copy silently authorized the pending tool call. Only an unmodified key may
+    /// answer.
+    #[tokio::test]
+    async fn a_modified_key_never_answers_the_prompt() {
+        let (tx, _rx) = mpsc::channel(8);
+        for (code, mods) in [
+            (KeyCode::Char('y'), KeyModifiers::CONTROL),
+            (KeyCode::Char('n'), KeyModifiers::CONTROL),
+            (KeyCode::Char('y'), KeyModifiers::ALT),
+            (KeyCode::Esc, KeyModifiers::CONTROL),
+        ] {
+            let (mut app, mut rx) = app_pending();
+            handle_key(&mut app, key(code, mods), &tx).await;
+            assert!(
+                rx.try_recv().is_err(),
+                "{code:?}+{mods:?} must not answer the prompt"
+            );
+            assert!(
+                app.pending_approval.is_some(),
+                "{code:?}+{mods:?} must leave the prompt waiting"
+            );
+        }
+    }
+
+    /// The modal still has to work: y approves, n refuses, Esc refuses.
+    #[tokio::test]
+    async fn y_and_n_still_answer_the_prompt() {
+        let (tx, _rx) = mpsc::channel(8);
+
+        let (mut app, mut rx) = app_pending();
+        handle_key(&mut app, key(KeyCode::Char('y'), KeyModifiers::NONE), &tx).await;
+        assert_eq!(rx.try_recv(), Ok(true), "y approves");
+        assert!(app.pending_approval.is_none(), "the prompt is cleared");
+
+        let (mut app, mut rx) = app_pending();
+        handle_key(&mut app, key(KeyCode::Char('n'), KeyModifiers::NONE), &tx).await;
+        assert_eq!(rx.try_recv(), Ok(false), "n refuses");
+
+        let (mut app, mut rx) = app_pending();
+        handle_key(&mut app, key(KeyCode::Esc, KeyModifiers::NONE), &tx).await;
+        assert_eq!(rx.try_recv(), Ok(false), "Esc refuses");
     }
 }
