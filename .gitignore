@@ -4,5 +4,10 @@ prompt.md
 *.swp
 /target
 
+# Local build output, never a source directory: a stray `bin/loom` from a manual
+# `cargo build` was committed by accident. Release binaries are built into
+# target/ and dist/ by .github/workflows/release.yml.
+/bin/
+
 # Documentation site build output (generated; deployed by .github/workflows/docs.yml)
 docs/site/_out/
