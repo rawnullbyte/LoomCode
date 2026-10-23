@@ -1968,3 +1968,87 @@ mod escape_sequence_tests {
         assert_eq!(clean("\x1b[31mred\x1b[0m"), "red");
     }
 }
+
+/// A mouse selection is anchored to the row list frozen at click time, while
+/// `transcript_point` (drag/up) and `selected_text` (copy) both look rows up again.
+/// They stay consistent because `transcript_rows` returns `selection_snapshot`
+/// first, ignoring the requested width — so a re-render between Down and Up (streaming
+/// output, resize, a new block) cannot make the point and the copied rows disagree.
+/// This pins that contract: an out-of-range or reversed selection degrades to a
+/// shorter string instead of panicking on an index.
+#[cfg(test)]
+mod selection_snapshot_tests {
+    use super::*;
+
+    fn app_with_lines(n: usize) -> crate::App {
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        for i in 0..n {
+            app.push_block(crate::Block::Assistant(format!("line {i}")));
+        }
+        app
+    }
+
+    #[test]
+    fn the_frozen_rows_win_over_width_and_later_output() {
+        let mut app = app_with_lines(5);
+        let frozen = app.transcript_rows(80);
+        app.selection_snapshot = Some(frozen.clone());
+        app.selection = Some(crate::SelRange {
+            start_line: 0,
+            start_col: 0,
+            end_line: 0,
+            end_col: 3,
+        });
+        // Output streams in and the terminal is resized between Down and Drag/Up.
+        for i in 0..10 {
+            app.push_block(crate::Block::Assistant(format!("new {i}")));
+        }
+        assert_eq!(
+            app.transcript_rows(40).len(),
+            frozen.len(),
+            "the anchored snapshot must be returned, not re-rendered rows"
+        );
+        assert_eq!(
+            app.transcript_lines(40).len(),
+            frozen.len(),
+            "transcript_point reads through the same snapshot"
+        );
+    }
+
+    #[test]
+    fn an_out_of_range_or_reversed_selection_never_panics() {
+        let app = app_with_lines(4);
+        let rows = app.transcript_rows(80);
+        // Dragged far past the end: clipped, not an index panic.
+        let far = crate::SelRange {
+            start_line: 0,
+            start_col: 0,
+            end_line: 999,
+            end_col: 999,
+        };
+        let text = copy(&rows, far);
+        assert!(
+            text.contains("line 0"),
+            "still copies what exists: {text:?}"
+        );
+        // Dragged upwards: the endpoints are swapped, so the same span comes back.
+        let fwd = crate::SelRange {
+            start_line: 0,
+            start_col: 0,
+            end_line: 3,
+            end_col: 99,
+        };
+        let rev = crate::SelRange {
+            start_line: 3,
+            start_col: 99,
+            end_line: 0,
+            end_col: 0,
+        };
+        assert_eq!(
+            copy(&rows, fwd),
+            copy(&rows, rev),
+            "a selection dragged upwards must copy the same text"
+        );
+    }
+}
