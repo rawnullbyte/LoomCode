@@ -29,6 +29,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 
+/// Most sent prompts kept for Up/Down recall. Enough for a long session's recent
+/// work without unbounded memory growth.
+pub const SENT_HISTORY_LIMIT: usize = 100;
+
 #[derive(Debug, Clone)]
 pub enum UiCommand {
     Submit(String),
@@ -139,6 +143,16 @@ pub struct App {
     /// Mirrored prompt queue, kept in sync by [`UiNotice::Queue`].
     pub queued: Vec<String>,
     pub queue_paused: bool,
+    /// Sent prompts, newest last. Up on an empty input with no queued prompt
+    /// walks this shell-style history instead of moving the caret; Down walks
+    /// back toward the empty draft. `history_pos` is the index into
+    /// `sent_history` currently shown, or `None` when the input is a live
+    /// draft rather than a recalled entry.
+    pub sent_history: Vec<String>,
+    pub history_pos: Option<usize>,
+    /// The draft the user had typed before starting to browse `sent_history`
+    /// with Up; restored when Down walks back past the newest entry.
+    pub history_draft: Option<String>,
     /// Esc was pressed once while busy; the next Esc is a hard stop.
     pub cancel_armed: bool,
     /// Selected row in the slash-command popup; reset on input change.
@@ -232,6 +246,9 @@ impl App {
             turn_started: None,
             queued: Vec::new(),
             queue_paused: false,
+            sent_history: Vec::new(),
+            history_pos: None,
+            history_draft: None,
             cancel_armed: false,
             completion_selected: 0,
             popup_dismissed: false,
@@ -333,7 +350,11 @@ impl App {
         }
     }
 
-    /// Input changed: popup returns, keyboard selection resets.
+    /// Input changed: popup returns, keyboard selection resets. History browsing
+    /// state is deliberately *not* reset here: `show_recalled` loads entries
+    /// programmatically, and `input_changed` is also called from paths (typing over
+    /// a recall) where dropping the position would break Down. Only a submit or a
+    /// driver-side draft restore ends browsing.
     pub fn input_changed(&mut self) {
         self.completion_selected = 0;
         self.popup_dismissed = false;
@@ -369,6 +390,93 @@ impl App {
             self.input_anchor = None;
         }
         self.cursor = target;
+    }
+
+    /// Record a prompt that was actually submitted so Up can recall it later.
+    /// Slash commands are deliberately not remembered: recalling one would open the
+    /// completion popup, where Up navigates the popup instead of the history. A
+    /// repeat of the previous prompt is not stored twice, so resending after a
+    /// cancelled turn does not pile up duplicates.
+    pub fn record_sent(&mut self, text: &str) {
+        self.history_pos = None;
+        self.history_draft = None;
+        let text = text.trim();
+        if text.is_empty() || text.starts_with('/') {
+            return;
+        }
+        if self.sent_history.last().map(String::as_str) == Some(text) {
+            return;
+        }
+        if self.sent_history.len() >= SENT_HISTORY_LIMIT {
+            self.sent_history.remove(0);
+        }
+        self.sent_history.push(text.to_string());
+    }
+
+    /// Up steps into the history when the caret is on the first input line; on any
+    /// lower line it stays ordinary line motion. A single-line draft is always on
+    /// line 0, so recall starts immediately instead of spending a keystroke on
+    /// "jump to the start". On line 0 of a *multi-line* draft, Up would otherwise be
+    /// a dead key (it only re-targets the line it is already on), so it recalls too:
+    /// the draft is kept in `history_draft` and Down brings it back intact.
+    pub fn can_recall_previous(&self) -> bool {
+        !self.sent_history.is_empty() && self.cursor_line_col().0 == 0
+    }
+
+    /// Down leaves a recalled entry only from its last line, so a recalled
+    /// multi-line prompt still uses Down for ordinary line motion.
+    pub fn can_recall_next(&self) -> bool {
+        self.history_pos.is_some() && self.cursor_line_col().0 + 1 >= self.input_lines().len()
+    }
+
+    /// Show a recalled entry (or the set-aside draft) with the caret at its end.
+    fn show_recalled(&mut self, text: String) {
+        // A recalled prompt that happens to start with '/' is draft text, not an
+        // open command menu.
+        self.popup_dismissed = text.starts_with('/');
+        self.input = text;
+        self.cursor = self.input.chars().count();
+        self.input_view_start = 0;
+        self.completion_selected = 0;
+        self.input_anchor = None;
+    }
+
+    /// Up: the previous (older) sent prompt, walking from newest to oldest. The
+    /// live draft is kept aside so Down can bring it back unchanged.
+    pub fn recall_previous(&mut self) -> bool {
+        if self.sent_history.is_empty() {
+            return false;
+        }
+        let pos = match self.history_pos {
+            Some(0) => return false,
+            Some(pos) => pos - 1,
+            None => {
+                self.history_draft = Some(self.input.clone());
+                self.sent_history.len() - 1
+            }
+        };
+        self.history_pos = Some(pos);
+        let text = self.sent_history[pos].clone();
+        self.show_recalled(text);
+        true
+    }
+
+    /// Down: the next (newer) sent prompt, or the draft set aside when browsing
+    /// started. Returns false when the input is a live draft rather than a recall.
+    pub fn recall_next(&mut self) -> bool {
+        let Some(pos) = self.history_pos else {
+            return false;
+        };
+        if pos + 1 < self.sent_history.len() {
+            self.history_pos = Some(pos + 1);
+            let text = self.sent_history[pos + 1].clone();
+            self.show_recalled(text);
+        } else {
+            self.history_pos = None;
+            let draft = self.history_draft.take().unwrap_or_default();
+            self.show_recalled(draft);
+        }
+        true
     }
 
     /// Commands matching the current input (popup contents), or empty when hidden.
@@ -446,6 +554,9 @@ impl App {
         self.selection_snapshot = None;
         self.queued.clear();
         self.queue_paused = false;
+        self.sent_history.clear();
+        self.history_pos = None;
+        self.history_draft = None;
         self.status.busy = false;
         self.status.member = None;
         self.cancel_armed = false;
@@ -537,6 +648,8 @@ impl App {
         self.input_changed();
         // A restored message starting with '/' is draft text, not an open menu.
         self.popup_dismissed = true;
+        self.history_pos = None;
+        self.history_draft = None;
     }
 
     /// Invalidate coordinates from the previous terminal geometry, retaining text,
@@ -620,6 +733,10 @@ impl App {
             UiNotice::Queue(items) => self.queued = items,
             UiNotice::QueuePaused(paused) => self.queue_paused = paused,
             UiNotice::Draft(text) => {
+                // A driver-restored draft replaces the input, so any history entry
+                // being browsed is no longer what Down would return to.
+                self.history_pos = None;
+                self.history_draft = None;
                 if self.input.is_empty() {
                     self.input = text;
                 } else {
@@ -654,6 +771,8 @@ impl App {
                 self.selection_snapshot = None;
                 // The cancelled prompt comes back as editable text: cursor at the end,
                 // the popup stays closed so the draft is not mistaken for a command.
+                self.history_pos = None;
+                self.history_draft = None;
                 self.input = text;
                 self.cursor = self.input.chars().count();
                 self.input_view_start = 0;
@@ -1506,7 +1625,11 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         }
         // single-line input: Up/Down jump to the ends (popup navigation keeps
         // priority when the popup is visible). Up on an empty input pulls the most
-        // recently queued prompt back for editing.
+        // recently queued prompt back for editing; otherwise Up steps through the
+        // sent-prompt history shell-style, newest first. Queued recall wins when
+        // both apply because its text never ran; browsing sent prompts is the
+        // fallback. Shift+Up/Down stay ordinary caret motion: a selection anchor
+        // cannot survive swapping the whole input for a different prompt.
         KeyCode::Up
             if app.completion_count() == 0 && app.input.is_empty() && !app.queued.is_empty() =>
         {
@@ -1514,10 +1637,27 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             // only text it actually removed, preventing duplicate sends after Up.
             let _ = cmd_tx.send(UiCommand::TakeLastQueued).await;
         }
+        // Shift is excluded so it falls through to the line-motion arms below:
+        // swapping the whole input out from under a selection anchor is never what
+        // "select the line above" means.
+        KeyCode::Up
+            if app.completion_count() == 0
+                && !key.modifiers.contains(KeyModifiers::SHIFT)
+                && app.can_recall_previous() =>
+        {
+            app.recall_previous();
+        }
         KeyCode::Up if app.completion_count() == 0 && app.input.contains('\n') => {
             let (line, col) = app.cursor_line_col();
             let extend = key.modifiers.contains(KeyModifiers::SHIFT);
             app.move_cursor(app.offset_at(line.saturating_sub(1), col), extend);
+        }
+        KeyCode::Down
+            if app.completion_count() == 0
+                && !key.modifiers.contains(KeyModifiers::SHIFT)
+                && app.can_recall_next() =>
+        {
+            app.recall_next();
         }
         KeyCode::Down if app.completion_count() == 0 && app.input.contains('\n') => {
             let (line, col) = app.cursor_line_col();
@@ -1597,6 +1737,9 @@ async fn submit(app: &mut App, cmd_tx: &mpsc::Sender<UiCommand>, text: String, s
         app.quit = true;
         return;
     }
+    // Remember what was actually submitted so Up can recall it later. Slash
+    // commands are filtered inside `record_sent`.
+    app.record_sent(&text);
     if let Some(parsed) = loon_core::commands::parse(&text) {
         match parsed {
             Ok(cmd) => {
@@ -2254,6 +2397,250 @@ mod prompt_editing_tests {
 /// land on a char boundary: a multi-byte separator (ideographic space U+3000, U+00A0,
 /// U+2028) pasted from a CJK input method used to leave the cut mid-character and
 /// `String::truncate` panicked, killing the session mid-edit.
+/// Up/Down must recall prompts that were actually *sent*, not only the ones still
+/// sitting in the queue. The reported symptom was that arrows did nothing after a
+/// turn ran: the only recall path was `TakeLastQueued`, which by definition cannot
+/// return text the agent already consumed. These pin the shell-style contract,
+/// including the edges where history must yield to ordinary caret motion.
+#[cfg(test)]
+mod prompt_history_tests {
+    use super::*;
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    async fn press(app: &mut App, code: KeyCode, mods: KeyModifiers) {
+        let (tx, _rx) = mpsc::channel(8);
+        handle_key(app, key(code, mods), &tx).await;
+    }
+
+    fn app_with_history(sent: &[&str]) -> App {
+        let mut app = super::tests::app_for_test();
+        for text in sent {
+            app.record_sent(text);
+        }
+        app
+    }
+
+    /// The core reported defect: send a prompt, then Up must bring it back.
+    #[tokio::test]
+    async fn up_recalls_the_prompt_that_was_just_sent() {
+        let mut app = app_with_history(&["fix the parser tests"]);
+        assert!(app.input.is_empty());
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "fix the parser tests");
+        assert_eq!(
+            app.cursor,
+            app.input.chars().count(),
+            "the caret sits at the end of the recalled prompt, ready to edit"
+        );
+    }
+
+    /// Submitting through the real Enter path is what populates the history.
+    #[tokio::test]
+    async fn sending_a_prompt_makes_it_recallable() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = super::tests::app_for_test();
+        app.input = "summarise the diff".into();
+        app.cursor = app.input.chars().count();
+        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+        assert!(matches!(rx.try_recv(), Ok(UiCommand::Submit(t)) if t == "summarise the diff"));
+        assert!(app.input.is_empty(), "Enter cleared the input");
+
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(
+            app.input, "summarise the diff",
+            "the prompt sent a moment ago comes back on Up"
+        );
+    }
+
+    /// Repeated Up walks newest → oldest; Down walks back and finally restores the
+    /// draft that was being typed, so browsing never destroys work.
+    #[tokio::test]
+    async fn up_and_down_walk_the_history_and_restore_the_draft() {
+        let mut app = app_with_history(&["first", "second", "third"]);
+        app.input = "half-written draft".into();
+        app.cursor = app.input.chars().count();
+
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "third", "Up starts at the newest prompt");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "second");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "first", "walked to the oldest entry");
+
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "second", "Down returns toward the newest");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "third");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE).await;
+        assert_eq!(
+            app.input, "half-written draft",
+            "stepping past the newest entry restores the draft untouched"
+        );
+    }
+
+    /// At the oldest entry Up must not wrap around or clear the input.
+    #[tokio::test]
+    async fn up_at_the_oldest_entry_stays_put() {
+        let mut app = app_with_history(&["only one"]);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "only one");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "only one", "no wrap, no blank input");
+    }
+
+    /// Slash commands are not remembered: recalling one would reopen the completion
+    /// popup, where Up navigates the popup instead of the history — the keys would
+    /// appear dead again.
+    #[tokio::test]
+    async fn slash_commands_are_not_recalled_but_prompts_around_them_are() {
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = super::tests::app_for_test();
+        for text in ["a real prompt", "/model p/m"] {
+            app.input = text.into();
+            app.cursor = text.chars().count();
+            handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+        }
+        assert_eq!(
+            app.sent_history,
+            vec!["a real prompt".to_string()],
+            "the slash command is skipped, the prompt is kept"
+        );
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "a real prompt");
+        assert_eq!(app.completion_count(), 0, "no popup hijacks Up here");
+    }
+
+    /// A repeated prompt is stored once, so resending after a cancel does not fill
+    /// the history with copies.
+    #[tokio::test]
+    async fn consecutive_duplicates_are_collapsed() {
+        let app = app_with_history(&["same", "same", "other", "same"]);
+        assert_eq!(
+            app.sent_history,
+            vec!["same".to_string(), "other".to_string(), "same".to_string()],
+            "only immediately repeated entries collapse"
+        );
+    }
+
+    /// The history is bounded so a long session cannot grow without limit, and the
+    /// oldest entry is the one dropped.
+    #[test]
+    fn history_keeps_only_the_most_recent_entries() {
+        let mut app = super::tests::app_for_test();
+        for n in 0..SENT_HISTORY_LIMIT + 5 {
+            app.record_sent(&format!("prompt {n}"));
+        }
+        assert_eq!(app.sent_history.len(), SENT_HISTORY_LIMIT);
+        assert_eq!(app.sent_history.first().unwrap(), "prompt 5");
+        assert_eq!(
+            app.sent_history.last().unwrap(),
+            &format!("prompt {}", SENT_HISTORY_LEN_LAST)
+        );
+    }
+
+    const SENT_HISTORY_LEN_LAST: usize = SENT_HISTORY_LIMIT + 4;
+
+    /// Shift+Up must stay a selection gesture even when history could apply: the
+    /// anchor cannot survive the whole input being swapped for another prompt.
+    #[tokio::test]
+    async fn shift_up_selects_instead_of_recalling() {
+        let mut app = app_with_history(&["an old prompt"]);
+        app.input = "draft".into();
+        app.cursor = 5;
+        press(&mut app, KeyCode::Up, KeyModifiers::SHIFT).await;
+        assert_eq!(app.input, "draft", "the input was not replaced");
+        assert_eq!(
+            app.input_selection(),
+            Some((0, 5)),
+            "Shift+Up selected the draft instead"
+        );
+    }
+
+    /// A multi-line draft keeps Up as line motion *below* the first line, so the
+    /// caret never jumps out of what is being written mid-draft. On the first line
+    /// Up recalls instead of being a dead key — and Down restores the draft intact.
+    #[tokio::test]
+    async fn multi_line_draft_moves_by_line_then_browses_and_restores() {
+        let mut app = app_with_history(&["older", "newer"]);
+        app.input = "line one\nline two".into();
+        app.cursor = app.input.chars().count();
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(
+            app.input, "line one\nline two",
+            "Up on the last line moved the caret, it did not replace the draft"
+        );
+        assert_eq!(
+            app.cursor, 8,
+            "caret moved to the same column (end of 'line one') one line up"
+        );
+
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(
+            app.input, "newer",
+            "now on the first line, Up recalls instead of re-targeting line 0"
+        );
+
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "older", "Up continues toward the oldest entry");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "newer", "Down steps back toward the newest");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE).await;
+        assert_eq!(
+            app.input, "line one\nline two",
+            "the multi-line draft comes back unchanged, line breaks included"
+        );
+    }
+
+    /// A recalled prompt is submitted like any other and then becomes the newest
+    /// history entry again — the classic "Up, Enter to resend" flow.
+    #[tokio::test]
+    async fn a_recalled_prompt_can_be_resent() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = app_with_history(&["rerun the tests"]);
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "rerun the tests");
+        handle_key(&mut app, key(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(UiCommand::Submit(t)) if t == "rerun the tests"),
+            "the recalled prompt is submitted verbatim"
+        );
+        assert_eq!(
+            app.sent_history,
+            vec!["rerun the tests".to_string()],
+            "resending does not duplicate the entry"
+        );
+    }
+
+    /// `/new` starts a fresh session: history from the previous one must not leak
+    /// into the new conversation.
+    #[test]
+    fn switching_sessions_clears_the_history() {
+        let mut app = app_with_history(&["old session prompt"]);
+        app.set_session_blocks(std::iter::empty());
+        assert!(app.sent_history.is_empty());
+        assert!(app.history_pos.is_none());
+        assert!(!app.recall_previous(), "nothing to recall after /new");
+    }
+
+    /// The queue still wins on an empty input: that text never ran, so editing it
+    /// is more useful than recalling something already sent.
+    #[tokio::test]
+    async fn a_queued_prompt_takes_priority_over_sent_history() {
+        let (tx, mut rx) = mpsc::channel(8);
+        let mut app = app_with_history(&["already sent"]);
+        app.queued = vec!["still pending".into()];
+        handle_key(&mut app, key(KeyCode::Up, KeyModifiers::NONE), &tx).await;
+        assert!(
+            matches!(rx.try_recv(), Ok(UiCommand::TakeLastQueued)),
+            "Up on an empty input pulls the queued prompt first"
+        );
+        assert!(app.input.is_empty(), "the history entry was not shown");
+    }
+}
+
 #[cfg(test)]
 mod completion_boundary_tests {
     use crate::tests::app_for_test;
