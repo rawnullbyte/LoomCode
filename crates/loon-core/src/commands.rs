@@ -1051,7 +1051,7 @@ impl Agent {
             SlashCommand::Config { args } => Ok(self.run_config_command(args).await?),
             SlashCommand::New => {
                 let paths = self.loon_paths();
-                let mut fresh = Agent::new_session(
+                let fresh = Agent::new_session(
                     &paths,
                     self.cfg.clone(),
                     self.registry.clone(),
@@ -1060,11 +1060,9 @@ impl Agent {
                     true,
                 )
                 .map_err(|e| format!("new session: {e}"))?;
-                fresh.approval_hook = self.approval_hook.clone();
-                fresh.summarizer = self.summarizer.clone();
-                fresh.events = self.events.take();
-                fresh.loops = self.loops.clone();
-                *self = fresh;
+                // Carries the event sink and the background hub, so a running child is not
+                // orphaned by the switch.
+                self.replace_with(fresh);
                 self.refresh_delegate();
                 self.emit_session_loaded();
                 Ok(
@@ -1189,7 +1187,7 @@ impl Agent {
                         found[0].id
                     }
                 };
-                let mut switched = Agent::resume(
+                let switched = Agent::resume(
                     &paths,
                     picked,
                     self.cfg.clone(),
@@ -1197,11 +1195,9 @@ impl Agent {
                     self.tools.clone(),
                 )
                 .map_err(|e| format!("resume: {e}"))?;
-                switched.approval_hook = self.approval_hook.clone();
-                switched.summarizer = self.summarizer.clone();
-                switched.events = self.events.take();
-                switched.loops = self.loops.clone();
-                *self = switched;
+                // Same as /new: the background hub and event sink belong to the host, not
+                // the session, so a switch must not orphan a running child.
+                self.replace_with(switched);
                 self.refresh_delegate();
                 self.emit_session_loaded();
                 Ok(format!("resumed session {picked}"))
@@ -1530,11 +1526,14 @@ impl Agent {
                         before_sha256,
                         ..
                     } if p.ends_with(path.trim()) && e.seq <= seq => {
-                        Some((before_blob.clone(), before_sha256.clone()))
+                        // Keep the *journaled* path: `path` is a suffix the user typed, so
+                        // rebuilding the target from it wrote the wrong file (`main.rs`
+                        // matched `src/main.rs` but restored into `./main.rs`).
+                        Some((p.clone(), before_blob.clone(), before_sha256.clone()))
                     }
                     _ => None,
                 });
-                let Some((Some(blob), before_sha)) = target else {
+                let Some((recorded, Some(blob), before_sha)) = target else {
                     return Err(format!(
                         "no snapshotted state before seq {seq} for `{path}` (creations have no prior state)"
                     ));
@@ -1546,11 +1545,21 @@ impl Agent {
                         bytes: blob.bytes,
                     })
                     .map_err(|e| format!("blob read: {e}"))?;
-                let p = self.ctx.ws.root().join(path.trim());
-                std::fs::write(&p, &content).map_err(|e| format!("write: {e}"))?;
+                // Restore through the sandbox so an absolute or `..` path cannot write
+                // outside the workspace, and take the workspace write lock so a concurrent
+                // tool cannot interleave.
+                let p = self
+                    .ctx
+                    .ws
+                    .resolve(&recorded)
+                    .map_err(|e| format!("refusing to restore `{recorded}`: {e}"))?;
+                let guard = self.ctx.ws.write_lock();
+                self.ctx
+                    .ws
+                    .cas_write(&p, &content, None, "shadow-restore", &guard)
+                    .map_err(|e| format!("write: {e}"))?;
                 Ok(format!(
-                    "restored `{}` to its pre-seq-{seq} state (sha {}, {} bytes) — journaled on your next edit",
-                    path.trim(),
+                    "restored `{recorded}` to its pre-seq-{seq} state (sha {}, {} bytes) — recorded as a mutation, so `/undo` can reverse it",
                     &before_sha[..8.min(before_sha.len())],
                     content.len()
                 ))

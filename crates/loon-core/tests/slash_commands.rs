@@ -1006,3 +1006,154 @@ async fn resume_does_not_confuse_a_sibling_directory_with_a_prefix_name() {
         "app-old is a different workspace from app: {listing}"
     );
 }
+
+/// `/new` and `/resume` build a fresh agent and hand-copy the host-owned fields. They
+/// forgot the background hub, which owns the running children: after a switch, a child's
+/// report landed in a hub nothing read, and `background_list` could no longer see the job
+/// at all. The hub must survive a session switch; `replace_with` is the one place that
+/// guarantees it.
+#[tokio::test]
+async fn switching_sessions_keeps_the_background_hub() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let mut a = agent(tmp.path(), &ws);
+
+    // Identify the hub the running children were registered in.
+    let hub = a.background.clone();
+    assert!(
+        hub.listing().is_empty(),
+        "no children yet, but the handle exists"
+    );
+
+    // A switch to a fresh session, and back to a resumed one.
+    a.run_slash(SlashCommand::New).await.unwrap();
+    assert!(
+        a.background.same_hub(&hub),
+        "/new must carry the hub, not create a fresh one"
+    );
+
+    a.run_turn("a real session").await;
+    let id = a.session_id();
+    a.run_slash(SlashCommand::New).await.unwrap();
+    a.run_slash(SlashCommand::Resume {
+        target: Some(id.to_string()),
+    })
+    .await
+    .unwrap();
+    assert!(
+        a.background.same_hub(&hub),
+        "/resume must carry the hub, not create a fresh one"
+    );
+}
+
+/// Drive one real `edit` through a turn so the journal holds a `FileMutated` with a
+/// before-blob, then return the sequence number of that mutation.
+async fn a_journaled_edit(
+    a: &mut Agent,
+    ws: &std::path::Path,
+    rel: &str,
+    original: &str,
+    edited: &str,
+) -> u64 {
+    use loon_providers::{MockScript, MockStep, ProviderRegistry};
+    let full = ws.join(rel);
+    std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+    std::fs::write(&full, original).unwrap();
+    let hash = loon_workspace::sha256_hex(original.as_bytes());
+    let registry = Arc::new(ProviderRegistry::with_mock(
+        loon_providers::MockProvider::with_scripts(vec![MockScript::new(vec![
+            MockStep::tool_call(
+                "call_edit",
+                "edit",
+                serde_json::json!({"path": rel, "old_string": original, "new_string": edited, "expect_sha256": hash}),
+            ),
+        ])]),
+    ));
+    a.registry = registry;
+    let r = a.run_turn("edit it").await;
+    assert!(
+        matches!(r.status, loon_core::TurnStatus::Completed),
+        "{:?}",
+        r.status
+    );
+    // The newest FileMutated for this path carries the pre-edit snapshot.
+    a.journal
+        .events()
+        .unwrap()
+        .iter()
+        .filter(|e| matches!(&e.kind, loon_events::model::EventKind::FileMutated { path, .. } if path.ends_with(rel)))
+        .map(|e| e.seq)
+        .next_back()
+        .expect("the edit must be journaled with a snapshot")
+}
+
+/// `/shadow-restore` matched the journaled path by *suffix* but then rebuilt the write
+/// target from the text the user typed, so `/shadow-restore N main.rs` (matching
+/// `src/main.rs`) wrote `./main.rs` instead — the wrong file, silently. It also joined the
+/// raw text onto the root, so an absolute path or `..` escaped the workspace and the write
+/// was neither sandboxed nor journaled.
+#[tokio::test]
+async fn shadow_restore_writes_the_recorded_path_not_the_typed_suffix() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    let mut a = agent(tmp.path(), &ws);
+    let original = "fn main() { old(); }\n";
+    let seq = a_journaled_edit(
+        &mut a,
+        &ws,
+        "src/main.rs",
+        original,
+        "fn main() { new(); }\n",
+    )
+    .await;
+
+    // The user names the short suffix, as the /shadow listing shows.
+    let out = a
+        .run_slash(SlashCommand::ShadowRestore {
+            seq,
+            path: "main.rs".into(),
+        })
+        .await
+        .expect("the suffix must resolve to the journaled path");
+    assert!(out.contains("src/main.rs"), "{out}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("src/main.rs")).unwrap(),
+        original,
+        "the snapshotted file is the one restored"
+    );
+    assert!(
+        !ws.join("main.rs").exists(),
+        "the typed suffix must not create a second file at the root"
+    );
+}
+
+/// A selector naming a file outside the workspace must not write anything: the lookup is
+/// by journaled path, and the write goes through the sandbox, so nothing escapes.
+#[tokio::test]
+async fn shadow_restore_cannot_write_outside_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+    let mut a = agent(tmp.path(), &ws);
+    let seq = a_journaled_edit(&mut a, &ws, "src/main.rs", "old\n", "new\n").await;
+
+    let err = a
+        .run_slash(SlashCommand::ShadowRestore {
+            seq,
+            path: "../../outside/secret.txt".into(),
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        !tmp.path().join("outside/secret.txt").exists(),
+        "nothing may be written outside the workspace: {err}"
+    );
+    // The workspace file is untouched, too.
+    assert_eq!(
+        std::fs::read_to_string(ws.join("src/main.rs")).unwrap(),
+        "new\n"
+    );
+}

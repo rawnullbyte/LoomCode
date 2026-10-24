@@ -636,12 +636,22 @@ impl Agent {
 
     /// Replace this agent wholesale (/new, /resume): the replacement keeps THIS
     /// agent's event sink, approval hook and summarizer so the UI keeps streaming.
+    /// Adopt `other` as this agent, carrying over everything that belongs to the *host*
+    /// rather than the session: the live event sink, the approval prompt, the summarizer
+    /// and reviewer, the loop registry, and the background hub.
+    ///
+    /// The background hub must be carried, not replaced: it owns the running child
+    /// processes, so a fresh one orphans them — their reports land in a hub nothing reads,
+    /// and `background_list` can no longer see them. `/new` and `/resume` used to hand-copy
+    /// fields and forgot the hub, so switching sessions with a live child lost its report;
+    /// routing both through here keeps that from drifting again.
     pub fn replace_with(&mut self, mut other: Agent) {
         other.background = self.background.clone();
         other.events = self.events.take();
         other.approval_hook = self.approval_hook.take();
         other.summarizer = self.summarizer.take();
         other.stop_reviewer = self.stop_reviewer.take();
+        other.loops = self.loops.clone();
         *self = other;
     }
 
@@ -742,13 +752,53 @@ impl Agent {
     }
 
     /// Parse ALLOW/DENY from a reviewer answer; anything else is None (no verdict).
+    ///
+    /// Matching has to be on whole words, and a negation has to win. Counting substrings
+    /// meant `DISALLOW` contained `ALLOW` and parsed as **approved** — a reviewer refusing
+    /// an operation had it waved through, the most dangerous direction to get wrong. A
+    /// decision word that appears only negated is a refusal, not an approval.
     pub fn parse_reviewer_verdict(answer: &str) -> Option<bool> {
-        let upper = answer.to_uppercase();
-        let allow = upper.matches("ALLOW").count();
-        let deny = upper.matches("DENY").count();
-        match (allow > 0, deny > 0) {
+        let mut allow = false;
+        let mut deny = false;
+        let mut negate_next = false;
+        for raw in answer.split(|c: char| !c.is_alphanumeric() && c != '_') {
+            if raw.is_empty() {
+                continue;
+            }
+            let word = raw.to_ascii_uppercase();
+            match word.as_str() {
+                "NOT" | "NO" | "NEVER" | "DONT" | "DON" | "CANNOT" | "CANT" => {
+                    negate_next = true;
+                    continue;
+                }
+                "ALLOW" | "ALLOWED" | "APPROVE" | "APPROVED" => {
+                    if negate_next {
+                        deny = true;
+                    } else {
+                        allow = true;
+                    }
+                    negate_next = false;
+                    continue;
+                }
+                "DENY" | "DENIED" | "DISALLOW" | "DISALLOWED" | "REJECT" | "REJECTED"
+                | "REFUSE" | "REFUSED" => {
+                    // A negated refusal ("do not deny") reads as an approval.
+                    if negate_next {
+                        allow = true;
+                    } else {
+                        deny = true;
+                    }
+                    negate_next = false;
+                    continue;
+                }
+                _ => {}
+            }
+            negate_next = false;
+        }
+        match (allow, deny) {
             (true, false) => Some(true),
             (false, true) => Some(false),
+            // Contradictory, or no decision word at all: no verdict.
             _ => None,
         }
     }
@@ -2493,6 +2543,64 @@ mod auto_mode_tests {
             None,
             "contradictory"
         );
+    }
+
+    /// `DISALLOW` contains `ALLOW`, and the old substring count read it as APPROVED — a
+    /// reviewer refusing an operation had it waved through. Fail-open in the permission
+    /// path is the direction that matters most.
+    #[test]
+    fn a_refusal_is_never_read_as_approval() {
+        for answer in [
+            "DISALLOW",
+            "disallowed",
+            "DISALLOWED",
+            "I must DISALLOW this operation",
+            "REJECT",
+            "REFUSE",
+            "rejected: the path escapes the workspace",
+        ] {
+            assert_eq!(
+                Agent::parse_reviewer_verdict(answer),
+                Some(false),
+                "{answer:?} is a refusal"
+            );
+        }
+    }
+
+    /// A negation in front of the decision word flips it, in both directions.
+    #[test]
+    fn a_negated_decision_word_flips() {
+        for answer in [
+            "do NOT allow this",
+            "cannot allow",
+            "never allow",
+            "I will not allow it",
+        ] {
+            assert_eq!(
+                Agent::parse_reviewer_verdict(answer),
+                Some(false),
+                "{answer:?} must read as a refusal"
+            );
+        }
+        assert_eq!(
+            Agent::parse_reviewer_verdict("do not deny this"),
+            Some(true),
+            "a negated refusal is an approval"
+        );
+    }
+
+    /// An unambiguous decision still parses, and prose with no verdict is still None.
+    #[test]
+    fn a_clear_verdict_still_parses() {
+        assert_eq!(
+            Agent::parse_reviewer_verdict("Safe to proceed; ALLOW."),
+            Some(true)
+        );
+        assert_eq!(
+            Agent::parse_reviewer_verdict("The operation is DENY because it writes outside."),
+            Some(false)
+        );
+        assert_eq!(Agent::parse_reviewer_verdict("maybe later"), None);
     }
 
     #[test]

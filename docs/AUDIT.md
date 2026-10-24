@@ -125,7 +125,53 @@ before any permission decision. Verified the injected command ran.
 **Fixed:** `--` before the target in both call sites, plus explicit validation of `host`
 and `user` at the input boundary.
 
-### BUG-8 · `parse_reviewer_verdict` underflow (defensive)
+### BUG-9 · `/new` and `/resume` dropped the background hub
+**Severity:** High (lost work) · **CONFIRMED (reproduced)**
+**Location:** `crates/loon-core/src/commands.rs` (`New`, `Resume`)
+Both handlers built a fresh agent and hand-copied `approval_hook`, `summarizer`, `events`
+and `loops` — but not `background`. The hub owns the running children, so after a session
+switch a child's report landed in a hub nothing read, and `background_list` could no longer
+see the job. `replace_with` already existed with a comment warning about exactly this and
+preserved the hub, but neither handler used it (the function was dead code).
+**Fixed:** both route through `replace_with`, which now also carries `loops`; added
+`BackgroundHub::same_hub` so hub identity is testable.
+
+### BUG-10 · Reviewer verdict parsed `DISALLOW` as approval
+**Severity:** High (fail-open in the permission path) · **CONFIRMED (reproduced)**
+**Location:** `crates/loon-core/src/lib.rs` (`parse_reviewer_verdict`)
+The parser counted substrings, so `"DISALLOW"` contained `"ALLOW"` and returned
+`Some(true)` — **approved**. A reviewer refusing an operation had it waved through. Prose
+containing both words ("ALLOW with caution is wrong here, so DENY") also degraded to "no
+verdict" while the reviewer had decided.
+**Fixed:** whole-word matching with negation handling; `DISALLOW`, `REJECT`, `REFUSE` and
+friends are refusals, and "do not allow" is a refusal while "do not deny" is an approval.
+
+### BUG-11 · `/shadow-restore` restored into the wrong file and could escape the workspace
+**Severity:** High (silent wrong-file write; sandbox bypass) · **CONFIRMED (reproduced)**
+**Location:** `crates/loon-core/src/commands.rs` (`ShadowRestore`)
+The lookup matched a *suffix* of the journaled path (`main.rs` matches `src/main.rs`) but
+the write target was rebuilt as `ws.root().join(path)`, so `/shadow-restore N main.rs`
+wrote `./main.rs` — a different file, silently. The raw `join` also meant an absolute path
+discarded the root entirely and `..` escaped it, writing outside the workspace with no
+sandbox check and no `FileMutated` record (so `/undo` could not reverse it).
+**Fixed:** restore the *journaled* path, resolved through the workspace sandbox under the
+write lock via `cas_write`, which journals the mutation. Verified the suffix no longer
+creates a second file.
+
+### Refuted (reported by the audit, disproven by a test)
+- **MCP stdio children orphaned on reload** — I could not reproduce a leak. `McpClient`
+  sets `kill_on_drop(true)` on the child, and dropping the last `Arc` kills the server. The
+  audit's evidence (a non-panicking `kill_on_drop`) is true but not sufficient: it omits
+  the task-kill that the `Child` handle performs. I added
+  `dropping_a_client_leaves_no_server_process_running`, which fails when `kill_on_drop` is
+  disabled and passes otherwise, so the guarantee is now pinned rather than assumed.
+- **Background-subagent worktree never removed** — `docs/HARNESS.md:89` documents retention
+  as deliberate ("retained for review … remove the worktree with Git when finished"). Not a
+  defect; pruning is a backlog item.
+- **`Ctrl+O expands tool output` not implemented** — it is implemented
+  (`transcript.rs:877`); the collapsed view simply did not say *what* it hid.
+
+### BUG-12 · `parse_reviewer_verdict` underflow (defensive)
 **Severity:** Low · **Location:** `crates/loon-core/src/supervisor.rs:102`
 `text.len() - 1` is only safe because the loop cannot run on an empty buffer. Replaced with
 `saturating_sub` so a future edit cannot turn it into a panic.

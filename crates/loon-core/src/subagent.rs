@@ -513,6 +513,13 @@ impl BackgroundHub {
         self.lock().sink = Some(sink);
     }
 
+    /// True when both handles refer to the same hub. Used to pin that a session switch
+    /// carries the hub rather than silently replacing it: a fresh hub loses sight of the
+    /// running children, whose reports then land where nothing reads them.
+    pub fn same_hub(&self, other: &BackgroundHub) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, HubState> {
         // A panicked child task must not poison the registry for the parent.
         self.inner.lock().unwrap_or_else(|e| e.into_inner())

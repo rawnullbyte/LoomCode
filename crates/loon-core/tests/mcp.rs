@@ -263,3 +263,103 @@ async fn streamable_http_negotiates_session_and_handles_json_sse_and_pagination(
         ]
     );
 }
+
+/// A dropped `McpClient` must not leave its stdio server running. `/mcp reload` swaps the
+/// tool set and drops the old clients, so a client that only cleaned up in an explicit
+/// `shutdown()` leaked one server process per reload.
+#[tokio::test]
+async fn dropping_a_client_leaves_no_server_process_running() {
+    if !python3_available().await {
+        eprintln!("skipping: python3 not available");
+        return;
+    }
+    // The fixture reports its own pid, then serves normally.
+    let pid_file = std::env::temp_dir().join(format!("loom-mcp-pid-{}", std::process::id()));
+    let _ = std::fs::remove_file(&pid_file);
+    // The fixture ignores stdin EOF and keeps running, so the test measures whether the
+    // process is *killed* rather than whether it exits on its own when its stdin closes.
+    // (The real writer task closes stdin on drop, which would mask a missing kill.)
+    let script = format!(
+        r#"import os, sys, json, time
+open({pid_file:?}, "w").write(str(os.getpid()))
+sys.stdout.write("")
+sys.stdout.flush()
+def serve():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        req = json.loads(line)
+        if "id" not in req:
+            continue
+        method = req.get("method")
+        if method == "initialize":
+            resp = {{"jsonrpc": "2.0", "id": req["id"], "result": {{
+                "protocolVersion": "2024-11-05",
+                "capabilities": {{"tools": {{}}}},
+                "serverInfo": {{"name": "fixture", "version": "0.1"}}}}}}
+        elif method == "tools/list":
+            resp = {{"jsonrpc": "2.0", "id": req["id"], "result": {{"tools": []}}}}
+        else:
+            resp = {{"jsonrpc": "2.0", "id": req["id"], "error": {{"code": -32601, "message": "no"}}}}
+        sys.stdout.write(json.dumps(resp) + "\n")
+        sys.stdout.flush()
+serve()
+# stdin closed: ignore EOF and stay alive so only a kill ends this process.
+while True:
+    time.sleep(0.05)
+"#,
+        pid_file = pid_file.display().to_string()
+    );
+    let cfg = McpServerConfig {
+        url: None,
+        command: "python3".into(),
+        args: vec!["-I".into(), "-c".into(), script],
+        env: Default::default(),
+        timeout_secs: 10,
+    };
+
+    let client = McpClient::spawn("fixture", &cfg).await.unwrap();
+    // Wait for the pid file (the handshake implies the script has started).
+    let mut child_pid = None;
+    for _ in 0..50 {
+        if let Ok(text) = std::fs::read_to_string(&pid_file) {
+            child_pid = text.trim().parse::<i32>().ok();
+            if child_pid.is_some() {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let child_pid = child_pid.expect("the fixture must report its pid");
+    assert!(process_alive(child_pid), "the server is running");
+
+    drop(client);
+    // Dropping is synchronous for the handle; give the OS a moment to reap the child.
+    let mut alive_after = true;
+    for _ in 0..50 {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        if !process_alive(child_pid) {
+            alive_after = false;
+            break;
+        }
+    }
+    let _ = std::fs::remove_file(&pid_file);
+    assert!(
+        !alive_after,
+        "dropping the client must kill the stdio server (pid {child_pid} still running)"
+    );
+}
+
+/// Liveness probe: `kill(pid, 0)` sends no signal, only checks for the process.
+/// ESRCH (3) means it is gone; EPERM (1) means it exists but belongs to someone else.
+#[cfg(unix)]
+fn process_alive(pid: i32) -> bool {
+    extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    if unsafe { kill(pid, 0) } == 0 {
+        return true;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
