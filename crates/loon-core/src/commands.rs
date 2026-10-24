@@ -639,6 +639,69 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
     ]
 }
 
+#[cfg(test)]
+mod help_tests {
+    use super::*;
+
+    /// `/help` was a flat list of 50-plus rows, so finding "how do I undo this" meant
+    /// scanning the whole thing. It is grouped by task now — and every command must still
+    /// appear exactly once, so a newly added command cannot go undocumented just because
+    /// nobody filed it under a heading.
+    #[test]
+    fn every_command_appears_in_exactly_one_group() {
+        let mut seen: Vec<&str> = Vec::new();
+        for (title, names) in help_groups() {
+            for name in names {
+                assert!(
+                    command_list().iter().any(|(n, _)| *n == name),
+                    "group {title:?} lists `{name}`, which is not a real command"
+                );
+                assert!(
+                    !seen.contains(&name),
+                    "`{name}` is listed twice (groups must not overlap)"
+                );
+                seen.push(name);
+            }
+        }
+        for (name, _) in command_list() {
+            assert!(
+                seen.contains(&name),
+                "`/{name}` is missing from every /help group"
+            );
+        }
+    }
+
+    /// The rendered page must carry each heading and each command, so the grouping is
+    /// visible and no row is dropped at render time.
+    #[test]
+    fn the_rendered_help_carries_headings_and_commands() {
+        let text = help_text();
+        for (title, _) in help_groups() {
+            assert!(text.contains(title), "missing heading {title:?}");
+        }
+        for (name, desc) in command_list() {
+            assert!(text.contains(&format!("/{name}")), "missing /{name}");
+            assert!(text.contains(desc), "missing the description of /{name}");
+        }
+    }
+
+    /// A long usage line must not run into its description (which is what a fixed column
+    /// width did): the description starts on its own line instead. Checked against the real
+    /// descriptions rather than a guess about whitespace, because a usage line legitimately
+    /// contains spaces of its own.
+    #[test]
+    fn a_long_command_name_does_not_collide_with_its_description() {
+        let text = help_text();
+        for (name, desc) in command_list() {
+            let collision = format!("/{name}{desc}");
+            assert!(
+                !text.contains(&collision),
+                "the description of /{name} ran into its usage line with no gap"
+            );
+        }
+    }
+}
+
 /// One-line, length-bounded excerpt for list output. Flattening comes first: a
 /// multi-line message would otherwise continue onto following lines and forge
 /// extra hits in `/find` and `/sessions search`.
@@ -651,18 +714,147 @@ fn truncate_prompt(p: &str, max: usize) -> String {
     }
 }
 
+/// `/help` groups the commands by what the user is trying to do, rather than printing one
+/// flat list of 50-plus rows. The autocomplete popup still uses [`command_list`]; only the
+/// help page is grouped, so a reader can find "how do I undo this" without scanning every
+/// entry. Every command in `command_list` appears in exactly one group — a test pins that,
+/// so adding a command cannot silently leave it undocumented.
 pub fn help_text() -> String {
+    let all = command_list();
     let mut out = String::new();
-    for (name, desc) in command_list() {
-        out.push('/');
-        out.push_str(name);
-        let pad = 38usize.saturating_sub(name.len() + 1);
-        out.push_str(&" ".repeat(pad));
-        out.push_str(desc);
+    for (title, names) in help_groups() {
+        let mut rows: Vec<(&str, &str)> = Vec::new();
+        for name in names {
+            if let Some(&(n, d)) = all.iter().find(|(n, _)| *n == name) {
+                rows.push((n, d));
+            }
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(title);
         out.push('\n');
+        // Column width grows for the longest name in *this* group, so a long usage line
+        // does not run into its description the way a fixed width would.
+        let name_w = rows
+            .iter()
+            .map(|(n, _)| n.len() + 3)
+            .max()
+            .unwrap_or(0)
+            .clamp(20, 44);
+        for (name, desc) in rows {
+            out.push_str("  /");
+            out.push_str(name);
+            let used = name.len() + 3;
+            if used >= name_w {
+                // Too long to share a line: put the description on the next one.
+                out.push('\n');
+                out.push_str(&" ".repeat(4 + name_w.saturating_sub(3)));
+            } else {
+                out.push_str(&" ".repeat(name_w - used));
+            }
+            out.push_str(desc);
+            out.push('\n');
+        }
     }
     out.pop();
     out
+}
+
+/// The `/help` sections: a heading and the commands under it, in reading order. Kept
+/// beside the command list so the two are edited together.
+fn help_groups() -> Vec<(&'static str, Vec<&'static str>)> {
+    vec![
+        ("Getting around", vec!["help", "quit", "tools", "doctor"]),
+        (
+            "Sessions",
+            vec![
+                "new",
+                "clear",
+                "resume [ID|n]",
+                "sessions",
+                "sessions search <query>",
+                "rename TITLE",
+                "delete <id|n>",
+                "fork NAME",
+            ],
+        ),
+        (
+            "Context and model",
+            vec![
+                "context [1m|200k|90%|off]",
+                "compact",
+                "autocompact [1m|200k|90%|on|off|auto]",
+                "model [REF]",
+                "effort [low|medium|high|xhigh|ultra]",
+                "recap",
+            ],
+        ),
+        (
+            "Providers",
+            vec![
+                "providers",
+                "provider add NAME URL [api] [key_env]",
+                "combos",
+                "combo add NAME provider:model ...",
+                "context7",
+                "mcp",
+            ],
+        ),
+        (
+            "Planning and work state",
+            vec![
+                "plan",
+                "todos [add|start|done|block|remove N]",
+                "notes [add TEXT|remove N]",
+                "goal <text|clear>",
+                "btw <text>",
+                "ultraloop [GOAL|on|off|status|limit N|model REF]",
+                "ultracode [TASK]",
+                "agents",
+                "tasks",
+            ],
+        ),
+        (
+            "Files and undo",
+            vec![
+                "diff",
+                "undo",
+                "redo",
+                "rewind [n] [mode]",
+                "checkpoint NAME",
+                "shadow <path>",
+                "shadow-restore <seq> <path>",
+            ],
+        ),
+        (
+            "Search and memory",
+            vec![
+                "find <query>",
+                "memory [global|workspace] [text]",
+                "skills",
+                "workflows",
+            ],
+        ),
+        (
+            "Long-running work",
+            vec![
+                "shell [list|start NAME|run NAME COMMAND|close NAME]",
+                "monitors [list|start COMMAND|logs ID|stop ID|remove ID]",
+                "jobs [list|poll ID|stop ID]",
+                "loop <interval> <prompt>",
+                "loops",
+                "loopcancel <id>",
+            ],
+        ),
+        (
+            "Appearance and settings",
+            vec!["settings", "config [key[=value]]", "theme [NAME]"],
+        ),
+    ]
 }
 
 /// Titles are stored text and older rows may contain newlines; every surface that

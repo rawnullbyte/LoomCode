@@ -165,6 +165,10 @@ pub struct App {
     /// The draft the user had typed before starting to browse `sent_history`
     /// with Up; restored when Down walks back past the newest entry.
     pub history_draft: Option<String>,
+    /// Prefix captured when browsing started. Up then only walks entries that *start
+    /// with* what was typed, so "cargo" steps through cargo commands instead of every
+    /// prompt ever sent. `None`/empty means walk the whole history.
+    pub history_filter: Option<String>,
     /// Where to persist `sent_history` so recall survives a restart. `None` keeps
     /// history in memory only (tests, and any host without a state directory).
     pub history_file: Option<std::path::PathBuf>,
@@ -267,6 +271,7 @@ impl App {
             sent_history: Vec::new(),
             history_pos: None,
             history_draft: None,
+            history_filter: None,
             history_file: None,
             history_search: None,
             cancel_armed: false,
@@ -420,6 +425,7 @@ impl App {
     pub fn record_sent(&mut self, text: &str) {
         self.history_pos = None;
         self.history_draft = None;
+        self.history_filter = None;
         let text = text.trim();
         if text.is_empty() || text.starts_with('/') {
             return;
@@ -468,19 +474,66 @@ impl App {
         self.input_anchor = None;
     }
 
+    /// Indices of the entries that Up may walk, newest last. With a filter captured at the
+    /// start of browsing, only entries beginning with it qualify.
+    fn recallable(&self) -> Vec<usize> {
+        self.recallable_for(self.history_filter.as_deref().unwrap_or(""))
+    }
+
+    fn recallable_for(&self, filter: &str) -> Vec<usize> {
+        if filter.is_empty() {
+            return (0..self.sent_history.len()).collect();
+        }
+        let needle = filter.to_lowercase();
+        self.sent_history
+            .iter()
+            .enumerate()
+            .filter(|(_, text)| text.to_lowercase().starts_with(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// Up: the previous (older) sent prompt, walking from newest to oldest. The
     /// live draft is kept aside so Down can bring it back unchanged.
+    ///
+    /// When the input holds text that prefixes at least one earlier prompt, Up walks only
+    /// those — typing "cargo" steps through cargo commands instead of everything ever sent.
+    /// A draft that prefixes nothing (an ordinary sentence) falls back to the whole history,
+    /// so Up never becomes a dead key just because of what happens to be typed.
     pub fn recall_previous(&mut self) -> bool {
         if self.sent_history.is_empty() {
             return false;
         }
-        let pos = match self.history_pos {
-            Some(0) => return false,
-            Some(pos) => pos - 1,
+        let candidates = match self.history_pos {
+            // Browsing already started: the filter was captured on the first Up.
+            Some(_) => self.recallable(),
             None => {
                 self.history_draft = Some(self.input.clone());
-                self.sent_history.len() - 1
+                let filtered = self.recallable_for(&self.input);
+                // Use the prefix filter only when it actually narrows to something;
+                // otherwise a normal draft made Up do nothing at all.
+                let narrows = filtered.len() < self.sent_history.len();
+                if narrows && !filtered.is_empty() {
+                    self.history_filter = Some(self.input.clone());
+                    filtered
+                } else {
+                    self.history_filter = None;
+                    self.recallable_for("")
+                }
             }
+        };
+        if candidates.is_empty() {
+            return false;
+        }
+        let pos = match self.history_pos {
+            Some(current) => {
+                // Step to the next older candidate before `current`.
+                match candidates.iter().rev().find(|&&i| i < current) {
+                    Some(&i) => i,
+                    None => return false,
+                }
+            }
+            None => *candidates.last().expect("non-empty"),
         };
         self.history_pos = Some(pos);
         let text = self.sent_history[pos].clone();
@@ -494,12 +547,15 @@ impl App {
         let Some(pos) = self.history_pos else {
             return false;
         };
-        if pos + 1 < self.sent_history.len() {
-            self.history_pos = Some(pos + 1);
-            let text = self.sent_history[pos + 1].clone();
+        let candidates = self.recallable();
+        if let Some(&i) = candidates.iter().find(|&&i| i > pos) {
+            self.history_pos = Some(i);
+            let text = self.sent_history[i].clone();
             self.show_recalled(text);
         } else {
+            // Past the newest match: restore the draft and end browsing.
             self.history_pos = None;
+            self.history_filter = None;
             let draft = self.history_draft.take().unwrap_or_default();
             self.show_recalled(draft);
         }
@@ -699,6 +755,7 @@ impl App {
         // hide it until the next launch, since the file still holds it.
         self.history_pos = None;
         self.history_draft = None;
+        self.history_filter = None;
         self.status.busy = false;
         self.status.member = None;
         self.cancel_armed = false;
@@ -792,6 +849,7 @@ impl App {
         self.popup_dismissed = true;
         self.history_pos = None;
         self.history_draft = None;
+        self.history_filter = None;
     }
 
     /// Invalidate coordinates from the previous terminal geometry, retaining text,
@@ -879,6 +937,7 @@ impl App {
                 // being browsed is no longer what Down would return to.
                 self.history_pos = None;
                 self.history_draft = None;
+                self.history_filter = None;
                 if self.input.is_empty() {
                     self.input = text;
                 } else {
@@ -915,6 +974,7 @@ impl App {
                 // the popup stays closed so the draft is not mistaken for a command.
                 self.history_pos = None;
                 self.history_draft = None;
+                self.history_filter = None;
                 self.input = text;
                 self.cursor = self.input.chars().count();
                 self.input_view_start = 0;
@@ -2770,6 +2830,95 @@ mod prompt_history_tests {
             app.input, "line one\nline two",
             "the multi-line draft comes back unchanged, line breaks included"
         );
+    }
+
+    /// Typing a prefix and pressing Up should step through the prompts that start with
+    /// it, not every prompt ever sent. This is the shell behaviour people expect after
+    /// typing "cargo".
+    #[tokio::test]
+    async fn up_after_a_prefix_walks_only_matching_entries() {
+        let mut app = app_with_history(&[
+            "cargo test --workspace",
+            "explain the parser",
+            "cargo build --release",
+            "unrelated prompt",
+        ]);
+        app.input = "cargo".into();
+        app.cursor = 5;
+
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "cargo build --release", "newest cargo entry");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "cargo test --workspace", "older cargo entry");
+        // Nothing older matches, so Up stops rather than jumping to an unrelated prompt.
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(
+            app.input, "cargo test --workspace",
+            "stays on the oldest match"
+        );
+
+        // Down walks back and finally restores the typed prefix as the draft.
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "cargo build --release");
+        press(&mut app, KeyCode::Down, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "cargo", "the original draft comes back");
+    }
+
+    /// The filter is captured when browsing starts: typing after a recall edits the
+    /// recalled text without re-filtering mid-walk.
+    #[tokio::test]
+    async fn the_filter_is_captured_on_the_first_up() {
+        // A third entry that "cargo" does not prefix, so the filter actually narrows.
+        let mut app = app_with_history(&["cargo one", "cargo two", "something else"]);
+        app.input = "cargo".into();
+        app.cursor = 5;
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "cargo two");
+        assert_eq!(
+            app.history_filter.as_deref(),
+            Some("cargo"),
+            "the filter is the prefix that was typed"
+        );
+        // Editing the recalled entry must not re-filter the walk: the filter was captured
+        // when browsing started, not recomputed from the text now in the input.
+        app.input = "cargo two and more".into();
+        app.cursor = app.input.chars().count();
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(
+            app.input, "cargo one",
+            "the walk continues on the captured filter, not the edited text"
+        );
+    }
+
+    /// A prefix that matches nothing must not make Up a dead key: an ordinary sentence
+    /// falls back to the whole history, because Up is still the fastest way to the last
+    /// prompt.
+    #[tokio::test]
+    async fn a_prefix_that_matches_nothing_falls_back_to_all_history() {
+        let mut app = app_with_history(&["cargo test", "cargo build"]);
+        app.input = "an ordinary sentence".into();
+        app.cursor = app.input.chars().count();
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(
+            app.input, "cargo build",
+            "Up still recalls the newest prompt rather than doing nothing"
+        );
+    }
+
+    /// A prefix that matches *everything* is not a filter either: it must not narrow
+    /// anything away. (The guard is by count, so this pins that it does not change the
+    /// walk when the draft prefixes every entry.)
+    #[tokio::test]
+    async fn a_prefix_matching_everything_still_walks_the_whole_history() {
+        let mut app = app_with_history(&["cargo a", "cargo b", "cargo c"]);
+        app.input = "cargo".into();
+        app.cursor = 5;
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "cargo c");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "cargo b");
+        press(&mut app, KeyCode::Up, KeyModifiers::NONE).await;
+        assert_eq!(app.input, "cargo a");
     }
 
     /// A recalled prompt is submitted like any other and then becomes the newest

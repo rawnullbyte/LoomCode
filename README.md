@@ -90,6 +90,8 @@ mockup. Regenerate them with `cargo run -p loon-tui --example preview -- docs/pr
 
 | Command | Behavior |
 | --- | --- |
+| `/help` | Every command, grouped by what you are trying to do (sessions, context, files and undo, long-running work …) |
+| `/tools` | Browse tools, their effects and parameter schemas |
 | `/model` | Home with five recent selections, provider entries, combos and global search |
 | `/model PROVIDER` | Search models inside one provider |
 | `/model all` | Browse every discovered model |
@@ -453,6 +455,9 @@ distinguished. The UI does not invent progress percentages.
 - In the prompt, **Ctrl+Left/Right** moves by a word (the same boundaries Ctrl+Backspace deletes), **Shift+arrows** select text, and **Ctrl+Shift+arrows** select a word at a time. Typing or Backspace replaces the selection, and **Ctrl+C** copies it. Clicking anywhere in a multi-line prompt puts the caret on that line and column.
 - **Esc** twice stops immediately and preserves completed edits, tool results and conversation. Pending messages pause; **Enter** on an empty input resumes them. A held Escape key does not count as two presses.
 - Messages submitted during a turn enter the **next inference request**, in order. **Up** on an empty input retrieves the newest pending message only if it has not already been sent. **Ctrl+Enter** interrupts and submits pending messages plus the new text immediately.
+- **Up/Down** on the prompt recall prompts you have already sent, newest first; **Down** past the newest restores the draft you were typing. Typing a prefix makes **Up** walk only the entries that start with it (`cargo` steps through your cargo commands), falling back to the whole history when the prefix matches nothing. This history is saved under the state directory, so it survives a restart and is shared across sessions.
+- **Ctrl+R** searches that history: typing narrows the match (case-insensitive), a second **Ctrl+R** steps to older matches, **Enter** accepts, and **Esc** puts back the draft you had. The prompt row shows `reverse-i-search › <query>` while it is open.
+- Tool calls that run back to back share one group; every call in a small group shows a line of its real output, so a passing test run is visible without a keystroke. **Ctrl+O** expands every call in the group in full.
 - `/new` and `/resume ID` work during a turn. A fresh session clears selection/stream state and shows its title again, including in short terminals.
 - Drag a transcript selection to copy; the selected cells are highlighted with a grey background. **Ctrl+Y** copies the last assistant block directly from its source text.
 - Copy preserves source indentation/newlines and Unicode; visual wraps, prompt labels, ANSI escapes and the streaming caret are excluded. The selection uses a stable snapshot while output streams.
