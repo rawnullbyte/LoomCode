@@ -112,7 +112,17 @@ enum ConfigCmd {
 
 #[tokio::main]
 async fn main() {
-    let cli = Cli::parse();
+    // clap exits 2 on a parse failure; the documented contract (see the module header) is
+    // 64 for a usage error, and 2 is reserved for "cancelled". Map it so a bad flag is not
+    // reported as a cancel.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            // `--help` / `--version` are successful exits, and clap prints them to stdout.
+            let _ = e.print();
+            std::process::exit(if e.use_stderr() { 64 } else { 0 });
+        }
+    };
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
@@ -874,7 +884,12 @@ fn config_cmd(cmd: &ConfigCmd) -> i32 {
                         );
                     }
                     if findings.iter().any(|f| f.is_error) {
-                        1
+                        // The header contract is `64 usage/config error`, and every other
+                        // subcommand exits 64 for a bad config. Returning 1 here made the
+                        // same broken file report differently depending on the
+                        // subcommand — and 1 means "the task ran and failed", which is not
+                        // what happened.
+                        64
                     } else {
                         0
                     }

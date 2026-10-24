@@ -156,9 +156,17 @@ impl ChatCompletionsAdapter {
                                 .and_then(crate::args::arguments_to_string);
                             // Missing `index` continues the most recent call; index 0 is
                             // the common fallback only when nothing has arrived yet.
+                            //
+                            // A negative index is not valid on the wire, and accepting it
+                            // split one logical call in two: `{"index":-5}` created a
+                            // key `-5` for the name, then the arguments arrived under
+                            // `index: 0` in a *different* entry — surfacing an executable
+                            // call with `{}` arguments. Clamp it to the "continue the
+                            // current call" case instead of trusting it.
                             let i = frag
                                 .get("index")
                                 .and_then(|x| x.as_i64())
+                                .filter(|i| *i >= 0)
                                 .unwrap_or_else(|| calls.len().saturating_sub(1) as i64);
                             let pos = match by_index.get(&i) {
                                 Some(&p) if starts_new_call(&calls[p], frag_id, frag_name) => {
@@ -190,6 +198,7 @@ impl ChatCompletionsAdapter {
                                     entry.name.push_str(n);
                                 }
                             }
+                            let args_label = frag_args.clone().unwrap_or_default();
                             if let Some(a) = frag_args {
                                 entry.args.push_str(&a);
                             }
@@ -201,7 +210,10 @@ impl ChatCompletionsAdapter {
                                     } else {
                                         Some(entry.name.clone())
                                     },
-                                    args_delta: String::new(),
+                                    // Report the fragment just accumulated: the core counts
+                                    // these characters for streamed progress, so sending an
+                                    // empty delta made every Chat tool call look stalled.
+                                    args_delta: args_label,
                                 })
                                 .await;
                         }

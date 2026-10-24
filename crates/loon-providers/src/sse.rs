@@ -27,10 +27,18 @@ pub struct SseParser {
     pub last_id: Option<String>,
 }
 
+/// Cap on an unterminated frame. A server that streams `data:` forever without a blank
+/// line would otherwise grow `buf` until the process dies: the transport's idle timeout
+/// never fires while bytes keep arriving.
+pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedError {
     /// A frame contained invalid UTF-8; the frame is skipped and reported.
     InvalidUtf8,
+    /// An unterminated frame exceeded [`MAX_FRAME_BYTES`] and was dropped. Reported
+    /// rather than buffered, so a hostile or broken stream cannot exhaust memory.
+    FrameTooLarge,
 }
 
 impl SseParser {
@@ -40,6 +48,10 @@ impl SseParser {
 
     /// Feed raw bytes; returns every complete frame. Treats both `\n\n` and `\r\n\r\n`
     /// (and stray `\r`) as line terminators.
+    ///
+    /// An unterminated frame larger than [`MAX_FRAME_BYTES`] is dropped and reported:
+    /// buffering it would let a stream that never sends a blank line grow the process
+    /// without bound.
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<Result<SseFrame, FeedError>> {
         self.buf.extend_from_slice(chunk);
         let mut frames = Vec::new();
@@ -47,6 +59,10 @@ impl SseParser {
             let frame_bytes: Vec<u8> = self.buf.drain(..end.total).collect();
             let raw = &frame_bytes[..end.payload_len];
             frames.push(self.parse_frame(raw));
+        }
+        if self.buf.len() > MAX_FRAME_BYTES {
+            self.buf.clear();
+            frames.push(Err(FeedError::FrameTooLarge));
         }
         frames
     }
@@ -58,6 +74,9 @@ impl SseParser {
             return Vec::new();
         }
         let rest = std::mem::take(&mut self.buf);
+        if rest.len() > MAX_FRAME_BYTES {
+            return vec![Err(FeedError::FrameTooLarge)];
+        }
         vec![self.parse_frame(&rest)]
     }
 
@@ -100,30 +119,38 @@ struct FrameEnd {
     total: usize,
 }
 
-/// Find the first blank line (\n\n, \r\n\r\n, \r\r, or mixed). Returns the payload length
-/// and total bytes to consume.
+/// Find the first blank line, treating `\r\n` as ONE line terminator and a bare `\r` or
+/// `\n` as another.
+///
+/// Counting bytes instead of line endings was a real defect: `\r\n` is two bytes, so a
+/// CRLF-terminated `data:` line (`data: a\r\ndata: b\r\n\r\n`) looked like a blank line at
+/// the first `\r` and every CRLF stream was cut into one frame per field — a multi-line
+/// `data:` was never joined, and each fragment was dispatched separately.
 fn find_frame_end(buf: &[u8]) -> Option<FrameEnd> {
     let mut i = 0;
     while i < buf.len() {
-        let b = buf[i];
-        if b == b'\n' || b == b'\r' {
-            // count consecutive terminators
-            let mut j = i;
-            let mut newlines = 0;
-            while j < buf.len() && (buf[j] == b'\n' || buf[j] == b'\r') {
-                newlines += 1;
-                j += 1;
+        match buf[i] {
+            b'\r' | b'\n' => {
+                // One line terminator: `\r\n` together, or a lone `\r` / `\n`.
+                let mut j = i;
+                let mut terminators = 0;
+                while j < buf.len() && (buf[j] == b'\r' || buf[j] == b'\n') {
+                    if buf[j] == b'\r' && j + 1 < buf.len() && buf[j + 1] == b'\n' {
+                        j += 2;
+                    } else {
+                        j += 1;
+                    }
+                    terminators += 1;
+                }
+                if terminators >= 2 {
+                    return Some(FrameEnd {
+                        payload_len: i,
+                        total: j,
+                    });
+                }
+                i = j;
             }
-            if newlines >= 2 {
-                return Some(FrameEnd {
-                    payload_len: i,
-                    total: j,
-                });
-            }
-            // A single terminator followed by content is a normal line ending; skip it.
-            i = j;
-        } else {
-            i += 1;
+            _ => i += 1,
         }
     }
     None
@@ -173,6 +200,46 @@ mod tests {
         let p = SseParser::new();
         let fs = frames(p, &[b"data: line1\ndata: line2\n\n"]);
         assert_eq!(fs[0].data, "line1\nline2");
+    }
+
+    /// `\r\n` is ONE line ending, not two. Counting bytes made every CRLF stream look
+    /// like it had a blank line after each field: a multi-line `data:` was split into
+    /// separate frames, each dispatched on its own — truncated JSON to the caller.
+    #[test]
+    fn crlf_multiline_data_is_one_joined_frame() {
+        let p = SseParser::new();
+        let fs = frames(p, &[b"data: line1\r\ndata: line2\r\n\r\n"]);
+        assert_eq!(fs.len(), 1, "CRLF must not split the frame: {fs:?}");
+        assert_eq!(fs[0].data, "line1\nline2");
+    }
+
+    /// The same frame split across network chunks at an awkward boundary.
+    #[test]
+    fn crlf_multiline_split_across_chunks() {
+        let p = SseParser::new();
+        let fs = frames(p, &[b"data: a\r", b"\ndata: b\r\n", b"\r\n"]);
+        assert_eq!(fs.len(), 1, "{fs:?}");
+        assert_eq!(fs[0].data, "a\nb");
+    }
+
+    /// Mixed endings in one frame still join rather than split.
+    #[test]
+    fn mixed_line_endings_keep_one_frame() {
+        let p = SseParser::new();
+        let fs = frames(p, &[b"data: a\ndata: b\r\n\r\n"]);
+        assert_eq!(fs.len(), 1, "{fs:?}");
+        assert_eq!(fs[0].data, "a\nb");
+    }
+
+    /// A lone `\r` is still a terminator, and `\r\r` is still a blank line (the legacy
+    /// Mac convention), so the fix must not lose those.
+    #[test]
+    fn bare_cr_framing_still_works() {
+        let p = SseParser::new();
+        let fs = frames(p, &[b"data: a\r\rdata: b\r\r"]);
+        assert_eq!(fs.len(), 2, "{fs:?}");
+        assert_eq!(fs[0].data, "a");
+        assert_eq!(fs[1].data, "b");
     }
 
     #[test]

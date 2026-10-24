@@ -317,6 +317,55 @@ async fn ssh_reports_a_failed_connection_instead_of_pretending() {
     assert!(list.text.contains("no open connections"), "{}", list.text);
 }
 
+/// A host that begins with `-` is not a hostname. ssh reads a leading-`-` argument as an
+/// *option*, and `-oProxyCommand=...` runs a command locally while connecting — so
+/// `connect` with such a host executed code before any permission decision. The tool must
+/// refuse it by name.
+#[tokio::test]
+async fn ssh_refuses_a_host_that_looks_like_an_option() {
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path());
+    let t = tool("ssh");
+    for host in [
+        "-oProxyCommand=touch /tmp/loom-pwned",
+        "--host",
+        "-F/etc/passwd",
+    ] {
+        let err = t
+            .run(json!({"action":"connect","name":"evil","host":host}), &c)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("must not begin with `-`"),
+            "host {host:?} must be refused by name, got: {err}"
+        );
+    }
+    assert!(
+        !std::path::Path::new("/tmp/loom-pwned").exists(),
+        "no injected command may run"
+    );
+}
+
+/// The same guard applies to the user field, which is passed as `-l USER`.
+#[tokio::test]
+async fn ssh_refuses_a_user_that_looks_like_an_option() {
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path());
+    let t = tool("ssh");
+    let err = t
+        .run(
+            json!({"action":"connect","name":"evil","host":"example.invalid","user":"-oProxyCommand=touch /tmp/loom-pwned2"}),
+            &c,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("user must not begin with `-`"),
+        "got: {err}"
+    );
+    assert!(!std::path::Path::new("/tmp/loom-pwned2").exists());
+}
+
 #[tokio::test]
 async fn ssh_run_without_a_connection_is_an_honest_error() {
     let d = tempfile::tempdir().unwrap();

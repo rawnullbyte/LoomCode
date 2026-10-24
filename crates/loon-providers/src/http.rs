@@ -197,6 +197,15 @@ impl SseStream {
                             Err(FeedError::InvalidUtf8) => {
                                 tracing::warn!(origin = %self.endpoint_origin, "skipping SSE frame with invalid UTF-8");
                             }
+                            Err(FeedError::FrameTooLarge) => {
+                                // Fail loudly: silently dropping a runaway frame would
+                                // turn a broken server into an empty answer the user
+                                // cannot explain.
+                                return Err(ProviderError::Malformed(format!(
+                                    "SSE frame exceeded {} bytes without a blank-line terminator",
+                                    crate::sse::MAX_FRAME_BYTES
+                                )));
+                            }
                         }
                     }
                 }

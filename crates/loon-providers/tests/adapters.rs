@@ -377,3 +377,100 @@ fn responses_serializes_flat_call_and_output_items() {
     assert_eq!(items[3]["type"], "function_call_output");
     assert_eq!(items[2]["call_id"], items[3]["call_id"]);
 }
+
+/// A Responses `{"type":"error"}` event that carried a 429 used to become `Rejected`,
+/// which is neither switchable nor retriable — so a rate limit killed the turn and a
+/// combo neither backed off nor advanced. It must classify like the Chat adapter.
+#[tokio::test]
+async fn responses_flat_error_event_keeps_rate_limit_semantics() {
+    let body = b"data: {\"type\":\"error\",\"message\":\"slow down\",\"code\":429}\n\n\
+data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r\",\"status\":\"completed\"}}\n\n"
+        .to_vec();
+    let fixture = support::Fixture::start(vec![(200, "text/event-stream", body)]).await;
+    let adapter = ResponsesAdapter::new(Arc::new(HttpTransport::new().unwrap()));
+    let (tx, rx) = mpsc::channel(64);
+    adapter
+        .stream(&endpoint_of(&fixture.base_url), &ChatRequest::default(), tx)
+        .await
+        .unwrap();
+    let failure = drain(rx)
+        .await
+        .into_iter()
+        .find_map(|e| match e {
+            ProviderEvent::Failure { error } => Some(error),
+            _ => None,
+        })
+        .expect("the error event must surface as a failure");
+    assert!(
+        failure.switchable(),
+        "a streamed 429 must stay switchable so a combo can move on, got: {failure:?}"
+    );
+    assert!(
+        failure.retriable(),
+        "a streamed 429 must stay retriable, got: {failure:?}"
+    );
+}
+
+/// A negative wire `index` created a separate entry from the real `index: 0`, so a call's
+/// name and its arguments landed in two different `PartialToolCall`s and the surfaced call
+/// had `{}` arguments — silently wrong, not a failure.
+#[tokio::test]
+async fn a_negative_wire_index_does_not_split_a_tool_call() {
+    let frames = vec![
+        serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":-5,"id":"call_neg","type":"function","function":{"name":"read","arguments":"{\"pa"}}]}}]}).to_string(),
+        serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\": \"src/main.rs\"}"}}]},"finish_reason":"tool_calls"}]}).to_string(),
+    ];
+    let fixture =
+        support::Fixture::start(vec![(200, "text/event-stream", support::sse_body(&frames))]).await;
+    let adapter = ChatCompletionsAdapter::new(Arc::new(HttpTransport::new().unwrap()));
+    let (tx, rx) = mpsc::channel(64);
+    adapter
+        .stream(&endpoint_of(&fixture.base_url), &ChatRequest::default(), tx)
+        .await
+        .unwrap();
+    let calls: Vec<_> = drain(rx)
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            ProviderEvent::ToolCallComplete { call } => Some(call),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 1, "one logical call, not two: {calls:?}");
+    assert_eq!(calls[0].name, "read");
+    assert_eq!(
+        calls[0].arguments_json, r#"{"path": "src/main.rs"}"#,
+        "the arguments must not be silently emptied"
+    );
+}
+
+/// Tool-call fragments must report their accumulated characters: the core counts these
+/// for streamed progress, so an always-empty delta made every Chat tool call look stalled.
+#[tokio::test]
+async fn chat_tool_call_deltas_report_their_fragment() {
+    let frames = vec![
+        serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read","arguments":"{\"path\":"}}]}}]}).to_string(),
+        serde_json::json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"a.rs\"}"}}]},"finish_reason":"tool_calls"}]}).to_string(),
+    ];
+    let fixture =
+        support::Fixture::start(vec![(200, "text/event-stream", support::sse_body(&frames))]).await;
+    let adapter = ChatCompletionsAdapter::new(Arc::new(HttpTransport::new().unwrap()));
+    let (tx, rx) = mpsc::channel(64);
+    adapter
+        .stream(&endpoint_of(&fixture.base_url), &ChatRequest::default(), tx)
+        .await
+        .unwrap();
+    let deltas: Vec<String> = drain(rx)
+        .await
+        .into_iter()
+        .filter_map(|e| match e {
+            ProviderEvent::ToolCallDelta { args_delta, .. } => Some(args_delta),
+            _ => None,
+        })
+        .collect();
+    let joined: String = deltas.concat();
+    assert_eq!(
+        joined, r#"{"path":"a.rs"}"#,
+        "the deltas must carry the fragments, got {deltas:?}"
+    );
+}

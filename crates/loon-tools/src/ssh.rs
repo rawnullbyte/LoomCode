@@ -104,6 +104,21 @@ impl SshTool {
             .as_str()
             .filter(|h| !h.trim().is_empty())
             .ok_or_else(|| ToolError::InvalidArgs("connect requires host".into()))?;
+        // A host beginning with `-` is not a hostname; ssh would read it as an option.
+        // `--` already stops that at the argv level, but refusing it here names the real
+        // problem instead of letting ssh report a confusing usage error.
+        if host.starts_with('-') {
+            return Err(ToolError::InvalidArgs(format!(
+                "host `{host}` must not begin with `-` (that is an ssh option, not a hostname)"
+            )));
+        }
+        // The user field is passed as `-l USER`, so a leading `-` would be read as the
+        // argument of `-l` in a way we did not intend; reject it for the same reason.
+        if args["user"].as_str().is_some_and(|u| u.starts_with('-')) {
+            return Err(ToolError::InvalidArgs(
+                "user must not begin with `-`".into(),
+            ));
+        }
         let target = match (args["user"].as_str(), args["port"].as_u64()) {
             (Some(user), Some(port)) => format!("{user}@{host}:{port}"),
             (Some(user), None) => format!("{user}@{host}"),
@@ -168,7 +183,11 @@ impl SshTool {
         if let Some(user) = args["user"].as_str() {
             cmd.arg("-l").arg(user);
         }
-        cmd.arg(host)
+        // `--` ends option parsing. Without it a host beginning with `-` is read as an
+        // ssh *option*: `--host "-oProxyCommand=..."` ran an arbitrary command before any
+        // permission decision, since ssh executes ProxyCommand locally while connecting.
+        cmd.arg("--")
+            .arg(host)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -292,6 +311,9 @@ impl SshTool {
             .arg(&socket)
             .arg("-o")
             .arg("BatchMode=yes")
+            // `--` before the target: a stored host that begins with `-` must never be
+            // re-interpreted as an ssh option (`-oProxyCommand=...` runs locally).
+            .arg("--")
             .arg(&target)
             .arg(&command)
             .stdin(Stdio::null())

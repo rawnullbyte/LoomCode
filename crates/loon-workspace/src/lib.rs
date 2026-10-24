@@ -277,6 +277,13 @@ fn normalize_lexical(p: &Path) -> PathBuf {
     out
 }
 
+/// Write `data` to `path` atomically (temp file in the same directory, then rename).
+///
+/// The temp file is created with `File::create`, which applies 0666 & ~umask. Renaming it
+/// over an existing file therefore *replaced its permissions*: editing a 0755 script left
+/// it 0644, so the executable bit vanished after one agent edit and the script stopped
+/// running. Copy the existing mode onto the temp file before the rename so a rewrite only
+/// changes content.
 pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -286,6 +293,13 @@ pub fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(data)?;
         f.sync_all()?;
+    }
+    // Preserve the mode of the file being replaced. Best-effort: a failure here must not
+    // lose the write, and a *new* file keeps the default creation mode.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(path) {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(meta.mode()));
     }
     std::fs::rename(&tmp, path)?;
     Ok(())
@@ -307,6 +321,41 @@ mod tests {
         std::fs::create_dir_all(d.path().join("proj")).unwrap();
         let w = Workspace::new(d.path().join("proj"), vec![]).unwrap();
         (d, w)
+    }
+
+    /// A rewrite must change content, not permissions. Creating the temp file with
+    /// `File::create` and renaming over the target replaced the mode, so editing a 0755
+    /// script left it 0644 and the script silently stopped being executable.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_preserves_the_existing_file_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (d, w) = ws();
+        let file = w.root().join("run.sh");
+        std::fs::write(&file, b"#!/bin/sh\necho one\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        write_atomic(&file, b"#!/bin/sh\necho two\n").unwrap();
+
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "the executable bit must survive a rewrite");
+        assert!(file.is_file(), "the file still exists");
+        let _ = d;
+    }
+
+    /// A brand-new file keeps the umask default: there is no prior mode to copy.
+    #[cfg(unix)]
+    #[test]
+    fn write_atomic_gives_a_new_file_a_sane_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_d, w) = ws();
+        let file = w.root().join("fresh.txt");
+        write_atomic(&file, b"hello").unwrap();
+        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o644,
+            "a new file is created with the default mode, not 0o755 or 0o000"
+        );
     }
 
     #[test]

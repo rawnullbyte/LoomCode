@@ -562,8 +562,8 @@ fn run_does_not_offer_a_palette_flag() {
         .unwrap();
     assert_eq!(
         rejected.status.code(),
-        Some(2),
-        "an unknown flag must be rejected by the parser, got: {}",
+        Some(64),
+        "an unknown flag must be a usage error (64), got: {}",
         String::from_utf8_lossy(&rejected.stderr)
     );
 }
@@ -979,5 +979,80 @@ fn delete_confirm_refuses_a_trivially_short_answer() {
     assert!(
         !String::from_utf8_lossy(&after.stdout).contains("no sessions yet"),
         "the session must survive"
+    );
+}
+
+/// The module header documents `64 usage/config error`, and `2` means "cancelled". clap's
+/// own default for a parse failure is 2, so an unknown flag was reported as a cancel and a
+/// mistyped `--effort` value was not classified as a usage error at all.
+#[test]
+fn a_bad_flag_exits_64_not_clap_2() {
+    use std::process::Command;
+    let home = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["run", "--effort", "bogus", "hi"],
+        vec!["run", "--nope", "hi"],
+        vec!["sessions", "--nope"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_loom"))
+            .env("LOON_HOME", home.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(64),
+            "{args:?} must exit 64 (usage), not {}",
+            out.status.code().unwrap_or(-1)
+        );
+    }
+}
+
+/// `--help` and `--version` are successful exits even though clap returns them as "errors"
+/// from the parser; mapping every parse error to 64 would have broken shell scripts.
+#[test]
+fn help_and_version_still_exit_zero() {
+    use std::process::Command;
+    let home = tempfile::tempdir().unwrap();
+    for args in [vec!["--help"], vec!["--version"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_loom"))
+            .env("LOON_HOME", home.path())
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{args:?} must exit 0");
+    }
+}
+
+/// `loom config validate` used to exit 1 for an invalid config while every other
+/// subcommand exited 64 for the same file — the same problem reported two ways, and 1 means
+/// "the task ran and failed", which is not what happened.
+#[test]
+fn config_validate_agrees_with_other_subcommands_on_a_bad_config() {
+    use std::process::Command;
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join("config");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("config.toml"), "not valid toml [[[\n").unwrap();
+
+    let validate = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["config", "validate"])
+        .output()
+        .unwrap();
+    let run = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "x"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        validate.status.code(),
+        Some(64),
+        "validate must report a config error as 64"
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(64),
+        "run must report the same config error the same way"
     );
 }

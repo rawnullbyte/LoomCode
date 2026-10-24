@@ -555,6 +555,49 @@ fn tool_detail(excerpt: &str, ok: bool, pending: bool) -> String {
     }
 }
 
+/// How many calls in one visual group keep an inline result row. The transcript is the
+/// product: the user must be able to see that a command succeeded without a keystroke.
+/// Beyond this the tail is a count, and Ctrl+O shows everything.
+const INLINE_CALLS: usize = 3;
+
+/// The most informative single line of a successful call's output, for an inline row.
+/// Preferred order: a diff stat, a pass/fail summary, then the first real content line.
+/// Falls back to the line count only when there is nothing shorter to say.
+fn inline_excerpt(lines: &[String], excerpt: &str) -> String {
+    if let Some(stat) = diff_stat(excerpt) {
+        return stat;
+    }
+    let content: Vec<&String> = lines.iter().filter(|l| !metadata_line(l)).collect();
+    // A pass/fail summary is the single most useful line a test or build emits; prefer it
+    // wherever it appears, since it is often the last line rather than the first.
+    if let Some(summary) = content
+        .iter()
+        .find(|l| looks_like_summary(l))
+        .map(|l| (*l).clone())
+    {
+        return summary;
+    }
+    match content.as_slice() {
+        [] => "(no output)".into(),
+        [only] => (*only).clone(),
+        [first, ..] => (*first).clone(),
+    }
+}
+
+/// True for the "12 passed · 0 failed", "Tests: 3 failed", "ok" style lines that tell the
+/// user the outcome of a command at a glance.
+fn looks_like_summary(line: &str) -> bool {
+    let l = line.to_lowercase();
+    (l.contains("passed") && l.contains("failed"))
+        || l.starts_with("tests:")
+        || l.starts_with("test result")
+        || l.contains("all tests passed")
+        || l == "ok"
+        || l.starts_with("error: ")
+        || l.starts_with("error[")
+        || l.starts_with("warning: ")
+}
+
 /// One readable phrase for a run of tool calls: "ran 3 shell commands · read 2 files".
 /// Pending calls are named individually so the line says what is happening now.
 fn call_summary(calls: &[ToolCall]) -> String {
@@ -708,16 +751,29 @@ fn push_calls(
         }
     }
 
-    // Errors remain visible even when successful neighboring calls are collapsed.
-    let shown: Vec<&ToolCall> = if calls.iter().any(|c| !c.ok && !c.pending) {
+    // Every call in a group gets a row, because a summary line that mentions a shell
+    // command while showing only the file read is worse than no summary: the user
+    // cannot see that their tests passed. Small groups print one content line per
+    // call; past `INLINE_CALLS` the tail collapses to a count, and full excerpts are
+    // always one Ctrl+O away.
+    let failed_any = calls.iter().any(|c| !c.ok && !c.pending);
+    let shown: Vec<&ToolCall> = if failed_any {
+        // Errors are never collapsed away, even in a long run of successes.
         calls.iter().filter(|c| !c.ok && !c.pending).collect()
+    } else if calls.len() <= INLINE_CALLS {
+        calls.iter().collect()
     } else {
-        calls.iter().take(1).collect()
+        calls.iter().take(INLINE_CALLS).collect()
     };
+    let shown_count = shown.len();
     for call in shown {
         let lines = tool_lines(&call.excerpt);
+        // One line of real output beats a count: "2 lines" tells the user nothing while
+        // "12 passed · 0 failed" tells them the work succeeded.
         let body = if call.pending {
             "running…".to_string()
+        } else if calls.len() > 1 && call.ok {
+            inline_excerpt(&lines, &call.excerpt)
         } else {
             tool_detail(&call.excerpt, call.ok, false)
         };
@@ -749,14 +805,18 @@ fn push_calls(
             }
         }
     }
+    // Name what is hidden instead of assuming the user knows Ctrl+O applies here.
+    let hidden = calls.len().saturating_sub(shown_count);
     if calls.len() > 1 {
-        push_text(
-            rows,
-            "       ",
-            "Ctrl+O expands tool output",
-            theme::system_fg(),
-            width,
-        );
+        let hint = if hidden > 0 {
+            format!(
+                "Ctrl+O shows {hidden} more result{}",
+                if hidden == 1 { "" } else { "s" }
+            )
+        } else {
+            "Ctrl+O expands tool output".to_string()
+        };
+        push_text(rows, "       ", &hint, theme::system_fg(), width);
     }
 }
 
@@ -1081,6 +1141,151 @@ mod summary_tests {
         assert_eq!(call_summary(&run), "bash · (no output)");
         let pending = calls(&[("bash", true, true)]);
         assert_eq!(call_summary(&pending), "running bash");
+    }
+}
+
+/// A group of tool calls used to render only its *first* call's body while its head
+/// summarised every call — so "ran 1 shell command" appeared above a row that showed the
+/// file read instead, and the test result was invisible without pressing Ctrl+O. The
+/// transcript is the product; a passing test run must be visible on its own.
+#[cfg(test)]
+mod tool_group_visibility_tests {
+    fn grouped_app(items: &[(&str, &str, &str)]) -> crate::App {
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        for (name, detail, excerpt) in items {
+            app.push_block(crate::Block::Tool {
+                name: (*name).into(),
+                ok: true,
+                excerpt: (*excerpt).into(),
+                pending: false,
+                detail: (*detail).into(),
+                started: None,
+                elapsed: None,
+            });
+        }
+        app
+    }
+
+    fn rendered(app: &crate::App) -> String {
+        app.transcript_lines(90)
+            .iter()
+            .map(|l| l.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn every_call_in_a_small_group_shows_its_result() {
+        let app = grouped_app(&[
+            ("read", "src/parser.rs", "src/parser.rs\nlines 40-130"),
+            (
+                "bash",
+                "cargo test --test parser",
+                "cargo test --test parser\n12 passed · 0 failed",
+            ),
+        ]);
+        let out = rendered(&app);
+        assert!(
+            out.contains("src/parser.rs"),
+            "the read result must be visible: {out}"
+        );
+        assert!(
+            out.contains("12 passed · 0 failed"),
+            "the shell result must be visible, not replaced by a line count: {out}"
+        );
+        assert!(
+            !out.contains("2 lines"),
+            "a bare line count must not stand in for real output: {out}"
+        );
+    }
+
+    /// The pass/fail summary is usually the *last* line, so taking the first line would
+    /// show the command echo instead of the outcome.
+    #[test]
+    fn a_pass_fail_summary_is_preferred_over_the_first_line() {
+        let app = grouped_app(&[
+            ("read", "a.rs", "1"),
+            (
+                "bash",
+                "cargo test",
+                "Compiling loom\nrunning 3 tests\n3 passed · 0 failed",
+            ),
+        ]);
+        let out = rendered(&app);
+        assert!(
+            out.contains("3 passed · 0 failed"),
+            "the outcome line must be the one shown: {out}"
+        );
+    }
+
+    /// Past the inline cap the tail collapses, and the hint must say how many results are
+    /// hidden — otherwise there is no reason to know Ctrl+O applies.
+    #[test]
+    fn a_long_group_collapses_and_names_what_is_hidden() {
+        let items: Vec<(&str, &str, &str)> = vec![
+            ("read", "a.rs", "alpha"),
+            ("read", "b.rs", "bravo"),
+            ("read", "c.rs", "charlie"),
+            ("read", "d.rs", "delta"),
+            ("read", "e.rs", "echo"),
+        ];
+        let app = grouped_app(&items);
+        let out = rendered(&app);
+        assert!(out.contains("alpha"), "{out}");
+        assert!(
+            !out.contains("echo"),
+            "beyond the cap the tail collapses: {out}"
+        );
+        assert!(
+            out.contains("Ctrl+O shows 2 more results"),
+            "the hint must name the hidden count: {out}"
+        );
+    }
+
+    /// Ctrl+O must reveal the full text of every call, including collapsed ones.
+    #[test]
+    fn expanding_shows_every_call_in_full() {
+        let items: Vec<(&str, &str, &str)> = vec![
+            ("read", "a.rs", "alpha"),
+            ("read", "b.rs", "bravo"),
+            ("read", "c.rs", "charlie"),
+            ("read", "d.rs", "delta"),
+        ];
+        let mut app = grouped_app(&items);
+        app.show_tool_details = true;
+        let out = rendered(&app);
+        for needle in ["alpha", "bravo", "charlie", "delta"] {
+            assert!(
+                out.contains(needle),
+                "{needle} missing from expanded view: {out}"
+            );
+        }
+    }
+
+    /// A failure must never be collapsed out of view, even in a long run of successes.
+    #[test]
+    fn a_failure_stays_visible_in_a_long_group() {
+        let mut app = grouped_app(&[
+            ("read", "a.rs", "alpha"),
+            ("read", "b.rs", "bravo"),
+            ("read", "c.rs", "charlie"),
+            ("read", "d.rs", "delta"),
+        ]);
+        app.blocks.push(crate::Block::Tool {
+            name: "bash".into(),
+            ok: false,
+            excerpt: "error: could not compile `loom`\nhelp: try again".into(),
+            pending: false,
+            detail: "$ cargo build".into(),
+            started: None,
+            elapsed: None,
+        });
+        let out = rendered(&app);
+        assert!(
+            out.contains("could not compile"),
+            "a failing call must stay visible: {out}"
+        );
     }
 }
 

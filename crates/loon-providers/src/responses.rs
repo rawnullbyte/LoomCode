@@ -245,15 +245,12 @@ impl ResponsesAdapter {
                     }
                 }
                 "error" => {
-                    let msg = v
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("provider error event");
-                    let _ = tx
-                        .send(ProviderEvent::Failure {
-                            error: ProviderError::Rejected(msg.to_string()),
-                        })
-                        .await;
+                    // Classify like the Chat adapter: a flat `{"type":"error"}` event can
+                    // carry a 429 or 5xx, and mapping everything to `Rejected` (neither
+                    // switchable nor retriable) made a combo neither back off nor advance
+                    // to the next member — a rate limit killed the turn.
+                    let error = ProviderError::from_error_value(&v);
+                    let _ = tx.send(ProviderEvent::Failure { error }).await;
                     return Ok(());
                 }
                 _ => {} // response.created, heartbeats, other typed events: ignored safely

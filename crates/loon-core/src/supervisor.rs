@@ -99,7 +99,7 @@ fn first_balanced_object(text: &str) -> Option<String> {
                 }
                 depth -= 1;
                 if depth == 0 {
-                    let obj = &text[start.unwrap()..=i.min(text.len() - 1)];
+                    let obj = &text[start.unwrap()..=i.min(text.len().saturating_sub(1))];
                     if serde_json::from_str::<serde_json::Value>(obj).is_ok() {
                         return Some(obj.to_string());
                     }
