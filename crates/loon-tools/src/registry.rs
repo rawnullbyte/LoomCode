@@ -59,6 +59,7 @@ impl ToolRegistry {
             Arc::new(crate::inspect::InspectTool(crate::inspect::Kind::Json)),
             Arc::new(crate::inspect::InspectTool(crate::inspect::Kind::Notebook)),
             Arc::new(crate::inspect::InspectTool(crate::inspect::Kind::Compare)),
+            Arc::new(crate::inspect::InspectTool(crate::inspect::Kind::Diagnose)),
             Arc::new(crate::structured::JsonEditTool),
             Arc::new(crate::structured::NotebookEditTool),
             Arc::new(crate::git_tools::GitTool(crate::git_tools::Kind::Status)),

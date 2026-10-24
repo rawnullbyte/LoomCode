@@ -13,6 +13,7 @@ pub enum Kind {
     Json,
     Notebook,
     Compare,
+    Diagnose,
 }
 pub struct InspectTool(pub Kind);
 pub(crate) fn bounded(ctx: &ToolCtx, text: String) -> ToolOutput {
@@ -47,6 +48,61 @@ pub(crate) fn read_json(ctx: &ToolCtx, path: &str) -> Result<(Value, String), To
 fn read_text(path: &Path) -> Result<String, ToolError> {
     String::from_utf8(read_bytes(path)?)
         .map_err(|_| ToolError::InvalidArgs("file is not UTF-8 text".into()))
+}
+
+/// JSON syntax errors with line:column, computed from the parser's byte offset.
+fn json_diagnostics(text: &str) -> Vec<serde_json::Value> {
+    let Err(e) = serde_json::from_str::<serde_json::Value>(text) else {
+        return Vec::new();
+    };
+    // serde_json reports `line L column C` (1-based line, 1-based column) in its message;
+    // parse those out so the shape matches the Rust diagnostics.
+    let msg = e.to_string();
+    let mut line = 1usize;
+    let mut column = 0usize;
+    if let Some(rest) = msg.split("line ").nth(1) {
+        let mut parts = rest.split(|c: char| !c.is_ascii_digit());
+        if let Some(l) = parts.next().and_then(|p| p.parse::<usize>().ok()) {
+            line = l;
+            if let Some(c) = rest.split("column ").nth(1).and_then(|r| {
+                r.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .ok()
+            }) {
+                column = c.saturating_sub(1);
+            }
+        }
+    }
+    vec![serde_json::json!({"line": line, "column": column, "message": msg})]
+}
+
+/// TOML syntax errors with line:column, same convention.
+fn toml_diagnostics(text: &str) -> Vec<serde_json::Value> {
+    let Err(e) = toml::from_str::<toml::Value>(text) else {
+        return Vec::new();
+    };
+    let msg = e.to_string();
+    // toml reports errors as `line: column` (1-based) when a span is known.
+    let mut line = 1usize;
+    let mut column = 0usize;
+    if let Some(rest) = msg.split(" line ").nth(1) {
+        let mut parts = rest.split(|c: char| !c.is_ascii_digit());
+        if let Some(l) = parts.next().and_then(|p| p.parse::<usize>().ok()) {
+            line = l;
+            if let Some(c) = rest.split(" column ").nth(1).and_then(|r| {
+                r.chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .ok()
+            }) {
+                column = c.saturating_sub(1);
+            }
+        }
+    }
+    vec![serde_json::json!({"line": line, "column": column, "message": msg})]
 }
 fn paths(ctx: &ToolCtx, path: &str) -> Result<Vec<PathBuf>, ToolError> {
     let root = ctx.ws.resolve(path)?;
@@ -93,7 +149,8 @@ impl Tool for InspectTool {
    Kind::Directory=>("list_directory","List one directory with entry types and sizes; optional hidden files. Does not recursively traverse or follow symlink entries.",json!({"path":{"type":"string"},"hidden":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":1000}}),vec![]),
    Kind::Info=>("file_info","Inspect file metadata, size, type, modification time and SHA-256 for files up to 8 MiB.",json!({"path":{"type":"string"}}),vec!["path"]),
    Kind::Many=>("read_many","Read bounded line ranges from up to 20 UTF-8 files in one tool call. Reports individual errors and content hashes.",json!({"paths":{"type":"array","minItems":1,"maxItems":20,"items":{"type":"string"}},"offset":{"type":"integer","minimum":1},"limit":{"type":"integer","minimum":1,"maximum":500}}),vec!["paths"]),
-   Kind::Symbol=>("find_symbol","Find declaration-like lines for an exact symbol in source files. Supports common Rust, JS/TS, Python, Go, Java and C/C++ forms. Heuristic text search, not an LSP. Honors ignore files.",json!({"symbol":{"type":"string","minLength":1,"maxLength":200},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":200}}),vec!["symbol"]),
+   Kind::Symbol=>("find_symbol","Find where a symbol is declared and referenced. Rust files are parsed in-process, so matches carry kind, column, visibility and container (definitions) plus reference rows — no language server needed. Other languages fall back to a declaration-keyword heuristic. Honors ignore files.",json!({"symbol":{"type":"string","minLength":1,"maxLength":200},"path":{"type":"string"},"limit":{"type":"integer","minimum":1,"maximum":200}}),vec!["symbol"]),
+   Kind::Diagnose=>("diagnostics","Report syntax errors in source files, with line and column, computed in-process (Rust via syn; JSON and TOML via their parsers). An empty list means the files parse. Run it after edits to catch breakage before running tests.",json!({"path":{"type":"string"}}),vec![]),
    Kind::Project=>("project_info","Detect project manifests, package scripts and a bounded source inventory before choosing build/test/lint commands. Honors ignore files.",json!({"path":{"type":"string"}}),vec![]),
    Kind::Json=>("read_json","Read a JSON file or RFC 6901 JSON pointer with its original content hash. Preserve the hash when making an edit.",json!({"path":{"type":"string"},"pointer":{"type":"string"}}),vec!["path"]),
    Kind::Notebook=>("notebook_read","Inspect Jupyter notebook cells, source and output counts without flooding context with embedded images. Select one zero-based cell or all cells.",json!({"path":{"type":"string"},"cell":{"type":"integer","minimum":0}}),vec!["path"]),
@@ -166,7 +223,63 @@ impl Tool for InspectTool {
                 )?;
                 let max = args["limit"].as_u64().unwrap_or(60).clamp(1, 200) as usize;
                 let mut matches = Vec::new();
+                let mut parsed_files = 0usize;
+                let mut heuristic_files = 0usize;
                 'files: for p in paths(ctx, path)? {
+                    // Rust files go through the in-process parser: real definition records
+                    // with kind, column and doc, not a regex that can only guess.
+                    let is_rust = p.extension().is_some_and(|e| e == "rs");
+                    if is_rust {
+                        if let Ok(text) = read_text(&p) {
+                            let analysis = crate::lsp::analyse_rust(&text);
+                            if analysis.parsed {
+                                parsed_files += 1;
+                                let hits: Vec<_> = analysis
+                                    .symbols
+                                    .iter()
+                                    .filter(|s| s.name == symbol)
+                                    .collect();
+                                if !hits.is_empty() {
+                                    for s in hits {
+                                        matches.push(json!({
+                                            "path": p,
+                                            "line": s.line,
+                                            "column": s.column,
+                                            "end_line": s.end_line,
+                                            "kind": s.kind.as_str(),
+                                            "visibility": s.visibility,
+                                            "definition": true,
+                                            "doc": !s.doc.is_empty(),
+                                            "container": s.container,
+                                            "text": text.lines().nth(s.line - 1).map(|l| l.chars().take(400).collect::<String>()).unwrap_or_default(),
+                                        }));
+                                        if matches.len() >= max {
+                                            break 'files;
+                                        }
+                                    }
+                                }
+                                // References in parsed files still come from the word scan
+                                // below (fall through), flagged as references.
+                                for (i, line) in text.lines().enumerate() {
+                                    if needle.is_match(line)
+                                        && !analysis
+                                            .symbols
+                                            .iter()
+                                            .any(|s| s.name == symbol && s.line == i + 1)
+                                        && (declaration.is_match(line)
+                                            || line.contains(&format!("{symbol}(")))
+                                    {
+                                        matches.push(json!({"path":p,"line":i+1,"reference":true,"text":line.chars().take(400).collect::<String>()}));
+                                        if matches.len() >= max {
+                                            break 'files;
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
+                    heuristic_files += 1;
                     let Ok(text) = read_text(&p) else { continue };
                     for (i, line) in text.lines().enumerate() {
                         if needle.is_match(line)
@@ -179,7 +292,17 @@ impl Tool for InspectTool {
                         }
                     }
                 }
-                json!({"symbol":symbol,"matches":matches,"limit_reached":matches.len()>=max,"heuristic":true}).to_string()
+                // `heuristic: true` only when nothing was parsed, so a caller can tell real
+                // symbol records from guesses. Mixed results are the honest middle case.
+                json!({
+                    "symbol": symbol,
+                    "matches": matches,
+                    "limit_reached": matches.len() >= max,
+                    "heuristic": parsed_files == 0,
+                    "parsed_files": parsed_files,
+                    "heuristic_files": heuristic_files,
+                })
+                .to_string()
             }
             Kind::Project => {
                 let root = ctx.ws.resolve(path)?;
@@ -292,6 +415,62 @@ impl Tool for InspectTool {
                     }
                     text
                 }
+            }
+            Kind::Diagnose => {
+                // Syntax errors across the selected files, computed in-process. An empty
+                // result is a meaningful answer (the files parse), so it is reported as
+                // such rather than as silence.
+                let mut files = Vec::new();
+                let mut error_count = 0usize;
+                let mut scanned = 0usize;
+                let mut skipped = 0usize;
+                for p in paths(ctx, path)? {
+                    let ext = p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase();
+                    let kind = match ext.as_str() {
+                        "rs" => Some("rust"),
+                        "json" | "jsonc" => Some("json"),
+                        "toml" => Some("toml"),
+                        _ => None,
+                    };
+                    let Some(kind) = kind else { continue };
+                    let Ok(text) = read_text(&p) else {
+                        skipped += 1;
+                        continue;
+                    };
+                    scanned += 1;
+                    let diagnostics: Vec<serde_json::Value> = match kind {
+                        "rust" => crate::lsp::diagnostics_to_json(
+                            &crate::lsp::analyse_rust(&text).diagnostics,
+                        )
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                        "json" => json_diagnostics(&text),
+                        "toml" => toml_diagnostics(&text),
+                        _ => Vec::new(),
+                    };
+                    if !diagnostics.is_empty() {
+                        error_count += diagnostics.len();
+                        files
+                            .push(json!({"path": p, "language": kind, "diagnostics": diagnostics}));
+                    }
+                    if files.len() >= 200 {
+                        break;
+                    }
+                }
+                json!({
+                    "path": path,
+                    "scanned": scanned,
+                    "skipped_not_utf8": skipped,
+                    "error_count": error_count,
+                    "clean": error_count == 0,
+                    "files": files,
+                })
+                .to_string()
             }
         };
         Ok(bounded(ctx, text))

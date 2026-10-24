@@ -441,3 +441,142 @@ async fn fuzzy_edit_reports_its_diff() {
     assert!(out.text.contains("+let x = 42;"), "{}", out.text);
     assert!(out.text.contains("-let  x   = 1;"), "{}", out.text);
 }
+
+/// `find_symbol` on a Rust file must use the in-process parser: real definition records
+/// with kind, column and visibility, not a regex guess. The `"heuristic"` flag flips to
+/// false because the answer no longer is one.
+#[tokio::test]
+async fn find_symbol_reports_parsed_definitions_for_rust() {
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path());
+    std::fs::write(
+        d.path().join("thing.rs"),
+        r#"/// Keeps state.
+pub struct Widget {
+    pub id: u32,
+}
+
+impl Widget {
+    pub fn new(id: u32) -> Self {
+        Widget { id }
+    }
+}
+
+fn caller() -> u32 {
+    let w = Widget::new(7);
+    w.id
+}
+"#,
+    )
+    .unwrap();
+
+    let out = call("find_symbol", json!({"symbol": "Widget"}), &c).await;
+    let value: Value = serde_json::from_str(&out.text).unwrap();
+    assert_eq!(value["heuristic"], false, "Rust was parsed: {value}");
+    assert_eq!(value["parsed_files"], 1);
+
+    let matches = value["matches"].as_array().unwrap();
+    // The struct definition: kind, column, visibility, container.
+    let def = matches
+        .iter()
+        .find(|m| m["definition"] == true && m["kind"] == "struct")
+        .expect("a struct definition record");
+    assert_eq!(def["line"], 2);
+    assert_eq!(def["column"], 11, "`pub struct ` is 11 characters");
+    assert_eq!(def["visibility"], "pub");
+    assert_eq!(def["doc"], true, "the doc comment is attached");
+
+    // The constructor call site is a reference, not a definition.
+    let reference = matches
+        .iter()
+        .find(|m| m["reference"] == true)
+        .expect("the call site as a reference");
+    assert_eq!(reference["line"], 13);
+}
+
+/// A method inside an impl reports its container, so `run` on three types does not produce
+/// three indistinguishable rows.
+#[tokio::test]
+async fn impl_methods_carry_their_receiver() {
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path());
+    std::fs::write(
+        d.path().join("svc.rs"),
+        "struct A;\nstruct B;\nimpl A { fn go(&self) {} }\nimpl B { fn go(&self) {} }\n",
+    )
+    .unwrap();
+    let out = call("find_symbol", json!({"symbol": "go"}), &c).await;
+    let value: Value = serde_json::from_str(&out.text).unwrap();
+    let containers: Vec<&str> = value["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|m| m["definition"] == true)
+        .filter_map(|m| m["container"].as_str())
+        .collect();
+    assert_eq!(containers, vec!["A", "B"], "{value}");
+}
+
+/// `diagnostics` reports syntax errors with position, and an empty file list means clean —
+/// that is the answer the agent needs after an edit.
+#[tokio::test]
+async fn diagnostics_report_syntax_errors_and_clean_files() {
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path());
+    std::fs::write(
+        d.path().join("broken.rs"),
+        "struct A {\n  x: u8,\n}\n\nfn ok() {}\nlet = 5;\n",
+    )
+    .unwrap();
+    std::fs::write(d.path().join("fine.rs"), "fn fine() {}\n").unwrap();
+    std::fs::write(d.path().join("bad.toml"), "[seg\nkey = \n").unwrap();
+    std::fs::write(d.path().join("bad.json"), "{oops}\n").unwrap();
+
+    let out = call("diagnostics", json!({}), &c).await;
+    let value: Value = serde_json::from_str(&out.text).unwrap();
+    assert_eq!(value["clean"], false, "{value}");
+    assert!(value["error_count"].as_u64().unwrap() >= 3, "{value}");
+
+    let files = value["files"].as_array().unwrap();
+    let rust = files.iter().find(|f| f["language"] == "rust").unwrap();
+    let d0 = &rust["diagnostics"][0];
+    assert_eq!(d0["line"], 6, "the top-level `let` is line 6: {rust}");
+    let toml = files.iter().find(|f| f["language"] == "toml").unwrap();
+    assert!(
+        toml["diagnostics"][0]["line"].as_u64().unwrap() >= 1,
+        "toml reports a position: {toml}"
+    );
+    let json_file = files.iter().find(|f| f["language"] == "json").unwrap();
+    assert_eq!(json_file["diagnostics"][0]["line"], 1, "{json_file}");
+
+    // A clean tree says so explicitly.
+    let d2 = tempfile::tempdir().unwrap();
+    let c2 = ctx(d2.path());
+    std::fs::write(d2.path().join("ok.rs"), "fn main() {}\n").unwrap();
+    let out = call("diagnostics", json!({}), &c2).await;
+    let value: Value = serde_json::from_str(&out.text).unwrap();
+    assert_eq!(value["clean"], true, "{value}");
+    assert_eq!(value["error_count"], 0);
+    assert_eq!(value["files"].as_array().unwrap().len(), 0);
+}
+
+/// Non-source files are skipped rather than misparsed, and a broken-but-unparsed file does
+/// not stop the scan.
+#[tokio::test]
+async fn diagnostics_skip_files_without_a_parser_and_keep_scanning() {
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path());
+    std::fs::write(d.path().join("notes.md"), "# not parsed\n").unwrap();
+    std::fs::write(d.path().join("good.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(d.path().join("bad.rs"), "struct {\n").unwrap();
+    std::fs::write(d.path().join("after.rs"), "fn b() {}\n").unwrap();
+
+    let out = call("diagnostics", json!({}), &c).await;
+    let value: Value = serde_json::from_str(&out.text).unwrap();
+    // Three .rs files scanned despite the middle one being broken.
+    assert_eq!(value["scanned"], 3, "{value}");
+    assert_eq!(value["error_count"], 1);
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert!(files[0]["path"].as_str().unwrap().contains("bad.rs"));
+}

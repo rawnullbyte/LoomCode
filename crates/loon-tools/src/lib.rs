@@ -12,6 +12,7 @@ pub mod fetch;
 pub mod fs_tools;
 pub mod git_tools;
 pub mod inspect;
+pub mod lsp;
 pub mod monitor;
 pub mod patch;
 pub mod process;

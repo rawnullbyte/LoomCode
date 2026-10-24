@@ -17,6 +17,17 @@ tokio.workspace = true
 reqwest.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# In-process Rust parsing for the symbol table and syntax diagnostics: real AST
+# navigation with no language server to install. `syn` is already in the tree
+# transitively, so this adds no new resolution work.
+syn = { version = "2", features = ["full", "extra-traits", "visit"] }
+# syn re-exports spans from proc-macro2; positions come from there. `span-locations`
+# makes Span::start()/end() report real offsets in the parsed source.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+# Rendering non-path types back to text (impl receivers like `&Foo`).
+quote = "1"
+# TOML syntax diagnostics reuse the config parser already in the tree.
+toml.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
