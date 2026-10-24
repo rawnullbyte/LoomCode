@@ -16,6 +16,8 @@ use serde_json::json;
 use syn::visit::Visit;
 // `ToTokens` for rendering non-path self-types (`&Foo`, `[u8; 4]`) as written.
 use quote::ToTokens as _;
+// Python AST walking. `Ranged` gives positions on every node.
+use rustpython_parser::ast::{self, Ranged as _, Stmt};
 
 /// What kind of declaration a symbol is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -408,6 +410,200 @@ pub fn analyse_rust(src: &str) -> Analysis {
     }
 }
 
+fn walk(src: &str, body: &[Stmt], depth: usize, out: &mut Vec<Symbol>) {
+    for stmt in body {
+        let (line, column) = line_col(src, stmt.start().to_usize());
+        let end_line = line_col(src, stmt.end().to_usize()).0;
+        match stmt {
+            Stmt::FunctionDef(f) => {
+                push_fn(src, out, depth, &f.name, &f.body, line, column, end_line)
+            }
+            Stmt::AsyncFunctionDef(f) => {
+                push_fn(src, out, depth, &f.name, &f.body, line, column, end_line)
+            }
+            Stmt::ClassDef(c) => {
+                out.push(Symbol {
+                    name: c.name.to_string(),
+                    kind: SymbolKind::Struct,
+                    line,
+                    column,
+                    end_line,
+                    visibility: if c.name.to_string().starts_with('_') {
+                        String::new()
+                    } else {
+                        "public".to_string()
+                    },
+                    doc: docstring_of(&c.body),
+                    container: String::new(),
+                });
+                walk_in_class(src, &c.body, out, c.name.as_ref());
+            }
+            // A module-level ALL_CAPS name is a constant; an assignment inside a
+            // function is a local, which is not worth a symbol.
+            Stmt::Assign(a) if depth == 0 => {
+                if let Some(ast::Expr::Name(n)) = a.targets.first() {
+                    let name = n.id.to_string();
+                    let upper = name.chars().all(|ch| ch.is_ascii_uppercase() || ch == '_')
+                        && name.chars().any(|ch| ch.is_ascii_uppercase());
+                    if upper {
+                        out.push(Symbol {
+                            name,
+                            kind: SymbolKind::Const,
+                            line,
+                            column,
+                            end_line,
+                            visibility: "public".to_string(),
+                            doc: String::new(),
+                            container: String::new(),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Parse Python source and collect classes, functions, methods and module constants.
+///
+/// Docstrings become `doc`; a leading-underscore name reports no visibility, following
+/// the convention rather than a language rule. Fail-open like the Rust path.
+pub fn analyse_python(src: &str) -> Analysis {
+    match rustpython_parser::parse(src, rustpython_parser::Mode::Module, "<tool>") {
+        Ok(ast::Mod::Module(m)) => {
+            let mut out = Vec::new();
+            walk(src, &m.body, 0, &mut out);
+            Analysis {
+                symbols: out,
+                diagnostics: Vec::new(),
+                parsed: true,
+            }
+        }
+        Ok(_) => Analysis::default(),
+        Err(e) => Analysis {
+            symbols: Vec::new(),
+            diagnostics: vec![Diagnostic {
+                line: line_col(src, e.offset.to_usize()).0,
+                column: line_col(src, e.offset.to_usize()).1,
+                message: e.error.to_string(),
+            }],
+            parsed: false,
+        },
+    }
+}
+
+/// Walk a class body: nested defs report the class as their container, so `render` on
+/// two different classes is not two indistinguishable rows.
+fn walk_in_class(src: &str, body: &[Stmt], out: &mut Vec<Symbol>, class: &str) {
+    for stmt in body {
+        let (line, column) = line_col(src, stmt.start().to_usize());
+        let end_line = line_col(src, stmt.end().to_usize()).0;
+        let (name, fn_body) = match stmt {
+            Stmt::FunctionDef(f) => (&f.name, &f.body),
+            Stmt::AsyncFunctionDef(f) => (&f.name, &f.body),
+            _ => continue,
+        };
+        out.push(Symbol {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            line,
+            column,
+            end_line,
+            visibility: if name.to_string().starts_with('_') {
+                String::new()
+            } else {
+                "public".to_string()
+            },
+            doc: docstring_of(fn_body),
+            container: class.to_string(),
+        });
+    }
+}
+
+/// One function (sync or async) plus everything nested in its body.
+#[allow(clippy::too_many_arguments)] // positions are computed by the caller: the Identifier node carries no span
+fn push_fn(
+    src: &str,
+    out: &mut Vec<Symbol>,
+    depth: usize,
+    name: &rustpython_parser::ast::Identifier,
+    body: &[rustpython_parser::ast::Stmt],
+    line: usize,
+    column: usize,
+    end_line: usize,
+) {
+    out.push(Symbol {
+        name: name.to_string(),
+        kind: SymbolKind::Function,
+        line,
+        column,
+        end_line,
+        visibility: if name.to_string().starts_with('_') {
+            String::new()
+        } else {
+            "public".to_string()
+        },
+        doc: docstring_of(body),
+        container: String::new(),
+    });
+    walk(src, body, depth + 1, out);
+}
+
+/// (1-based line, 0-based column) of a char offset.
+fn line_col(src: &str, offset: usize) -> (usize, usize) {
+    let mut line = 1usize;
+    let mut col = 0usize;
+    for c in src.chars().take(offset) {
+        if c == '\n' {
+            line += 1;
+            col = 0;
+        } else {
+            col += 1;
+        }
+    }
+    (line, col)
+}
+
+/// A def/class docstring: the first statement being a lone string literal.
+fn docstring_of(body: &[rustpython_parser::ast::Stmt]) -> String {
+    let Some(ast::Stmt::Expr(expr_stmt)) = body.first() else {
+        return String::new();
+    };
+    let Some(ast::Expr::Constant(c)) = Some(&*expr_stmt.value) else {
+        return String::new();
+    };
+    match &c.value {
+        ast::Constant::Str(s) => s.clone(),
+        _ => String::new(),
+    }
+}
+
+/// Source language for [`analyse`], chosen from the file's extension.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lang {
+    Rust,
+    Python,
+}
+
+impl Lang {
+    /// From a path extension, or `None` when no in-process parser covers it.
+    pub fn from_extension(ext: &str) -> Option<Lang> {
+        match ext.to_ascii_lowercase().as_str() {
+            "rs" => Some(Lang::Rust),
+            "py" | "pyi" => Some(Lang::Python),
+            _ => None,
+        }
+    }
+}
+
+/// Analyse source with the parser for `lang`.
+pub fn analyse(lang: Lang, src: &str) -> Analysis {
+    match lang {
+        Lang::Rust => analyse_rust(src),
+        Lang::Python => analyse_python(src),
+    }
+}
+
 /// JSON shape shared with `inspect.rs`'s `find_symbol` output.
 pub fn symbols_to_json(symbols: &[Symbol]) -> serde_json::Value {
     json!(symbols.iter().map(Symbol::to_json).collect::<Vec<_>>())
@@ -567,6 +763,80 @@ macro_rules! shout {
     fn empty_input_is_empty_not_an_error() {
         let a = analyse_rust("");
         assert!(a.parsed && a.symbols.is_empty() && a.diagnostics.is_empty());
+    }
+
+    /// Python: classes, methods, module constants, docstrings and visibility conventions.
+    ///
+    /// Line numbers are hand-counted from the `concat!` source so the test asserts real
+    /// positions, not whatever the implementation happens to produce.
+    #[test]
+    fn python_symbols_and_errors() {
+        let src = concat!(
+            "import os\n\n",                            // 1-2
+            "MAX_RETRIES = 3\n\n",                      // 3-4
+            "def helper(x):\n",                         // 5
+            "    return x * 2\n\n",                     // 6-7
+            "\"\"\"Module-ish doc.\n\nMore.\n\"\"\"\n", // 8-11
+            "class Widget:\n",                          // 12
+            "    def __init__(self):\n",                // 13
+            "        self.id = 0\n\n",                  // 14-15
+            "    def render(self):\n",                  // 16
+            "        \"\"\"Render.\n\nLong.\n\"\"\"\n", // 17-20
+            "        pass\n\n",                         // 21-22
+            "async def tick():\n",                      // 23
+            "    pass\n\n",                             // 24-25
+            "_local = 1\n",                             // 26
+        );
+        let a = analyse(Lang::Python, src);
+        assert!(a.parsed, "{:?}", a.diagnostics);
+        let named = |n: &str, k: SymbolKind| {
+            a.symbols
+                .iter()
+                .find(|s| s.name == n && s.kind == k)
+                .unwrap_or_else(|| panic!("missing {n} {k:?}; have {:?}", a.symbols))
+        };
+        assert_eq!(named("MAX_RETRIES", SymbolKind::Const).line, 3);
+        assert_eq!(named("helper", SymbolKind::Function).line, 5);
+        let widget = named("Widget", SymbolKind::Struct);
+        assert_eq!(widget.line, 12);
+        // The module docstring (lines 8-11) is a standalone expression *before* the class,
+        // so the class itself has none. Only a string first inside the body is a docstring.
+        assert_eq!(widget.doc, "", "{:?}", widget.doc);
+        let render = named("render", SymbolKind::Function);
+        assert_eq!(render.container, "Widget", "methods report their receiver");
+        assert_eq!(render.line, 16);
+        assert_eq!(
+            render.doc, "Render.\n\nLong.\n",
+            "the literal docstring text"
+        );
+        assert_eq!(named("tick", SymbolKind::Function).line, 23);
+        // `_local` is private by convention; `helper` is public.
+        assert_eq!(named("helper", SymbolKind::Function).visibility, "public");
+        assert!(a.symbols.iter().all(|s| s.name != "_local"));
+        // Methods carry their class; free functions do not.
+        assert_eq!(named("helper", SymbolKind::Function).container, "");
+    }
+
+    #[test]
+    fn python_syntax_error_has_a_position() {
+        let a = analyse(Lang::Python, "def broken(:\n");
+        assert!(!a.parsed);
+        assert_eq!(a.diagnostics.len(), 1);
+        let d = &a.diagnostics[0];
+        assert_eq!(d.line, 1);
+        assert_eq!(d.column, 11);
+        assert!(!d.message.is_empty());
+    }
+
+    #[test]
+    fn lang_from_extension_covers_the_parsed_languages() {
+        assert_eq!(Lang::from_extension("rs"), Some(Lang::Rust));
+        assert_eq!(Lang::from_extension("py"), Some(Lang::Python));
+        assert_eq!(Lang::from_extension("pyi"), Some(Lang::Python));
+        // Extension case is irrelevant.
+        assert_eq!(Lang::from_extension("PY"), Some(Lang::Python));
+        assert_eq!(Lang::from_extension("go"), None, "no in-process parser yet");
+        assert_eq!(Lang::from_extension("md"), None);
     }
 
     /// JSON shapes stay additive and present.

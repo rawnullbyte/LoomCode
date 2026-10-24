@@ -48,13 +48,13 @@ New `loon-tools/src/lsp.rs`:
   problem to manage.
 
 ### Phase 3 — More languages, each a dependency
-| Language | Crate (pure Rust) | Gives |
-| --- | --- | --- |
-| Python | `rustpython-parser` | symbols + syntax errors |
-| JS/TS | `oxc_parser` | symbols + syntax errors |
-| JSON | `serde_json` (already present) | syntax errors, key paths |
-| TOML | `toml` (already present) | syntax errors, table/key symbols |
-| YAML | `serde_yaml` | syntax errors |
+| Language | Crate (pure Rust) | Gives | Status |
+| --- | --- | --- | --- |
+| Python | `rustpython-parser` | symbols + syntax errors | **done** |
+| JSON | `serde_json` (already present) | syntax errors | **done** |
+| TOML | `toml` (already present) | syntax errors | **done** |
+| JS/TS | `oxc_parser` | symbols + syntax errors | later |
+| YAML | `serde_yaml` | syntax errors | later |
 
 Each is a `match` arm in one dispatcher: `fn symbols(lang: Lang, src: &str)`. Languages
 without a dependency keep the regex path and say so.

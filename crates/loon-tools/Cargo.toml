@@ -28,6 +28,8 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 quote = "1"
 # TOML syntax diagnostics reuse the config parser already in the tree.
 toml.workspace = true
+# Python: in-process parse for symbol tables and syntax errors (pure Rust, no binary).
+rustpython-parser = "0.4"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

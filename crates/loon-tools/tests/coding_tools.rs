@@ -580,3 +580,40 @@ async fn diagnostics_skip_files_without_a_parser_and_keep_scanning() {
     assert_eq!(files.len(), 1);
     assert!(files[0]["path"].as_str().unwrap().contains("bad.rs"));
 }
+
+/// Python goes through the in-process parser too: `find_symbol` returns real definitions
+/// with the class as container, and `diagnostics` reports Python syntax errors with a
+/// position. Both must work without any Python tooling on the machine.
+#[tokio::test]
+async fn python_is_parsed_in_process_for_symbols_and_diagnostics() {
+    let d = tempfile::tempdir().unwrap();
+    let c = ctx(d.path());
+    std::fs::write(
+        d.path().join("widget.py"),
+        "class Widget:\n    def render(self):\n        pass\n\ndef helper():\n    return Widget()\n",
+    )
+    .unwrap();
+
+    // find_symbol: the method carries its class.
+    let out = call("find_symbol", json!({"symbol": "render"}), &c).await;
+    let value: Value = serde_json::from_str(&out.text).unwrap();
+    assert_eq!(value["heuristic"], false, "Python was parsed: {value}");
+    let def = value["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["definition"] == true)
+        .expect("definition record");
+    assert_eq!(def["container"], "Widget", "{def}");
+    assert_eq!(def["line"], 2);
+    assert_eq!(def["column"], 4, "indented method body");
+
+    // diagnostics: a Python syntax error is found with a position.
+    std::fs::write(d.path().join("bad.py"), "def broken(:\n").unwrap();
+    let out = call("diagnostics", json!({}), &c).await;
+    let value: Value = serde_json::from_str(&out.text).unwrap();
+    assert_eq!(value["clean"], false, "{value}");
+    let files = value["files"].as_array().unwrap();
+    let py = files.iter().find(|f| f["language"] == "python").unwrap();
+    assert_eq!(py["diagnostics"][0]["line"], 1, "{py}");
+}

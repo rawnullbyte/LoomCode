@@ -226,12 +226,16 @@ impl Tool for InspectTool {
                 let mut parsed_files = 0usize;
                 let mut heuristic_files = 0usize;
                 'files: for p in paths(ctx, path)? {
-                    // Rust files go through the in-process parser: real definition records
-                    // with kind, column and doc, not a regex that can only guess.
-                    let is_rust = p.extension().is_some_and(|e| e == "rs");
-                    if is_rust {
+                    // Rust and Python files go through the in-process parser: real
+                    // definition records with kind, column and doc, not a regex that can
+                    // only guess.
+                    let lang = p
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .and_then(crate::lsp::Lang::from_extension);
+                    if let Some(lang) = lang {
                         if let Ok(text) = read_text(&p) {
-                            let analysis = crate::lsp::analyse_rust(&text);
+                            let analysis = crate::lsp::analyse(lang, &text);
                             if analysis.parsed {
                                 parsed_files += 1;
                                 let hits: Vec<_> = analysis
@@ -432,6 +436,7 @@ impl Tool for InspectTool {
                         .to_ascii_lowercase();
                     let kind = match ext.as_str() {
                         "rs" => Some("rust"),
+                        "py" | "pyi" => Some("python"),
                         "json" | "jsonc" => Some("json"),
                         "toml" => Some("toml"),
                         _ => None,
@@ -445,6 +450,12 @@ impl Tool for InspectTool {
                     let diagnostics: Vec<serde_json::Value> = match kind {
                         "rust" => crate::lsp::diagnostics_to_json(
                             &crate::lsp::analyse_rust(&text).diagnostics,
+                        )
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default(),
+                        "python" => crate::lsp::diagnostics_to_json(
+                            &crate::lsp::analyse(crate::lsp::Lang::Python, &text).diagnostics,
                         )
                         .as_array()
                         .cloned()
