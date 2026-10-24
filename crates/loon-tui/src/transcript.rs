@@ -480,19 +480,21 @@ fn find_closing(chars: &[char], from: usize, marker: &str) -> Option<usize> {
 }
 
 /// Style for one visual line of a diff, or `None` when it is not a diff line.
+///
+/// Delegates to [`crate::code::diff_line_style`] so a fenced ```diff block and a raw pasted
+/// patch render identically — they used to disagree, and the lexer path coloured a deletion
+/// with a bare red that ignored the palette's error colour slot consistency.
 fn diff_style(line: &str) -> Option<Style> {
     let trimmed = line.trim_start();
-    if trimmed.starts_with("--- ") || trimmed.starts_with("+++ ") {
-        Some(theme::accent_fg().add_modifier(Modifier::BOLD))
-    } else if trimmed.starts_with("@@") && trimmed.contains("@@") {
-        Some(theme::member_fg())
-    } else if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
-        Some(theme::tool_ok_fg())
-    } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
-        Some(theme::tool_err_fg())
-    } else {
-        None
-    }
+    let is_diff = trimmed.starts_with("@@")
+        || trimmed.starts_with("diff ")
+        || trimmed.starts_with("index ")
+        || trimmed.starts_with("--- ")
+        || trimmed.starts_with("+++ ")
+        || (trimmed.starts_with('+') && !trimmed.starts_with("+++"))
+        || (trimmed.starts_with('-') && !trimmed.starts_with("---"))
+        || trimmed.starts_with("\\ ");
+    is_diff.then(|| crate::code::diff_line_style(line))
 }
 
 /// One excerpt of a *finished* tool call: a bounded diff or code sample, coloured
@@ -515,6 +517,122 @@ fn push_colored_excerpt(
     )
 }
 
+/// Content of a diff line after its `+`/`-` marker, together with the display-cell offset at
+/// which that content begins in the original line (`- x` → 2, `-  x` → 3). `None` when the
+/// line is not that side of a change. A file header (`--- a/x`) is not a deletion, and a bare
+/// marker has no content.
+fn diff_content_at(line: &str, marker: char) -> Option<(String, usize)> {
+    let t = line.trim_start();
+    if t.starts_with("--- ") || t.starts_with("+++ ") {
+        return None;
+    }
+    let rest = t.strip_prefix(marker)?;
+    // One space after the marker is the separator, not content.
+    let (content, sep) = match rest.strip_prefix(' ') {
+        Some(after) => (after, 1),
+        None => (rest, 0),
+    };
+    if content.is_empty() {
+        return None;
+    }
+    let leading = cell_width(&line[..line.len() - t.len()]);
+    Some((content.to_string(), leading + 1 + sep))
+}
+
+/// For a diff excerpt, find the changed span within each modified line by pairing an
+/// adjacent `-` line with the `+` line that follows it, then trimming their common prefix
+/// and suffix. Offsets are display cells into the line as shown, which is the same space the
+/// piece-splitting loop works in.
+///
+/// This is what turns "the whole line changed" into "these three characters changed", which
+/// is the difference between reading a diff and scanning it. Pairing is positional: a run of
+/// deletions and a run of insertions zip up in order, and unpaired leftovers get no span.
+fn diff_emphasis(lines: &[String]) -> Vec<Option<(usize, usize)>> {
+    let mut out = vec![None; lines.len()];
+    let mut i = 0;
+    while i < lines.len() {
+        let (Some((minus, minus_at)), Some((plus, plus_at))) = (
+            diff_content_at(&lines[i], '-'),
+            lines.get(i + 1).and_then(|l| diff_content_at(l, '+')),
+        ) else {
+            i += 1;
+            continue;
+        };
+        // Common prefix and suffix in chars, then converted to the cell offsets the renderer
+        // uses. Working in chars first keeps the trim from splitting a wide glyph.
+        let mc: Vec<char> = minus.chars().collect();
+        let pc: Vec<char> = plus.chars().collect();
+        let mut prefix = 0;
+        while prefix < mc.len() && prefix < pc.len() && mc[prefix] == pc[prefix] {
+            prefix += 1;
+        }
+        let mut suffix = 0;
+        while suffix < mc.len() - prefix
+            && suffix < pc.len() - prefix
+            && mc[mc.len() - 1 - suffix] == pc[pc.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        let cells_of = |chars: &[char]| cell_width(&chars.iter().collect::<String>());
+        let minus_start = minus_at + cells_of(&mc[..prefix]);
+        let minus_end = minus_at + cells_of(&mc[..mc.len().saturating_sub(suffix)]);
+        let plus_start = plus_at + cells_of(&pc[..prefix]);
+        let plus_end = plus_at + cells_of(&pc[..pc.len().saturating_sub(suffix)]);
+        // Only mark a genuinely *partial* change. A wholly rewritten line has no common
+        // prefix or suffix, so the "changed span" would be the entire line — which tells the
+        // reader nothing and competes with the red/green that already says "this line
+        // changed". Requiring some shared context is what makes the emphasis mean "these
+        // characters differ".
+        let partial = prefix > 0 || suffix > 0;
+        if partial && minus_end > minus_start {
+            out[i] = Some((minus_start, minus_end));
+        }
+        if partial && plus_end > plus_start {
+            out[i + 1] = Some((plus_start, plus_end));
+        }
+        i += 2;
+    }
+    out
+}
+
+/// Split one line into three pieces around a highlighted span, given the span in display
+/// cells. Concatenation is exact: the caller relies on it, because copy and the selection
+/// highlight reassemble these pieces by position.
+fn split_emphasis(line: &str, start: usize, end: usize, base: Style) -> Vec<crate::code::Piece> {
+    // Map display-cell offsets to byte offsets. A cell offset that lands inside a wide glyph
+    // takes the whole glyph, so the span never splits a character.
+    let byte_of = |target: usize| -> usize {
+        let mut cell = 0usize;
+        for (i, c) in line.char_indices() {
+            if cell >= target {
+                return i;
+            }
+            cell += cells(c, cell);
+        }
+        line.len()
+    };
+    let a = byte_of(start);
+    let b = byte_of(end);
+    if a >= b || b > line.len() {
+        return vec![(line.to_string(), base)];
+    }
+    let mut pieces = Vec::new();
+    if a > 0 {
+        pieces.push((line[..a].to_string(), base));
+    }
+    // The changed span keeps the line's red/green but gains weight, so the eye lands on it
+    // without losing which side of the diff it belongs to.
+    pieces.push((
+        line[a..b].to_string(),
+        base.add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED),
+    ));
+    if b < line.len() {
+        pieces.push((line[b..].to_string(), base));
+    }
+    pieces
+}
+
 /// An excerpt that may be source code: `lang` comes from the tool's path argument, so a
 /// `read` of `lib.rs` renders with Rust highlighting instead of flat grey.
 fn push_tool_excerpt(
@@ -530,12 +648,21 @@ fn push_tool_excerpt(
     let indent = " ".repeat(prefix_cells);
     let avail = width.saturating_sub(prefix_cells).max(1);
     let lines = clean(excerpt);
+    // Pair up deletions with insertions first: the changed span is a property of two lines,
+    // so it cannot be decided while streaming one line at a time.
+    let all_lines: Vec<String> = lines
+        .split('\n')
+        .flat_map(|l| l.split(" ⏎ "))
+        .map(str::to_string)
+        .collect();
+    let emphasis = diff_emphasis(&all_lines);
     let mut first = true;
     let mut in_code = false;
     // Stored excerpts join their lines with `⏎` (see `tool_finished`), so both that
     // separator and a real newline end a line. Splitting only on newlines would turn a
     // whole diff into one wrapped paragraph and lose its per-line colouring.
-    for para in lines.split('\n').flat_map(|l| l.split(" ⏎ ")) {
+    for (line_index, para) in all_lines.iter().map(String::as_str).enumerate() {
+        let this_emphasis = emphasis.get(line_index).copied().flatten();
         let trimmed = para.trim_start();
         let fence = trimmed.starts_with("```");
         if fence {
@@ -576,6 +703,13 @@ fn push_tool_excerpt(
             pieces.extend(crate::code::highlight(&code_part, lang));
             pieces
         });
+        // A modified diff line gets its changed span emphasised. This takes precedence over
+        // the plain red/green row, because pointing at the change is the whole reason to
+        // render a diff.
+        let styled = match (styled, this_emphasis) {
+            (None, Some((start, end))) => Some(split_emphasis(&shown, start, end, body_style)),
+            (other, _) => other,
+        };
         let mut pieces = styled.into_iter().flatten().peekable();
         // Wrap the *expanded* line, so the rows and the highlighted pieces are cut from
         // the same text. Wrapping `para` while lexing `display(para)` made a tab or a
@@ -1717,9 +1851,147 @@ mod diff_rendering_tests {
         );
         assert_eq!(
             style_of(&rows, "@@ -1,2"),
-            Some(theme::member_fg()),
+            Some(theme::member_fg().add_modifier(Modifier::BOLD)),
             "hunk headers stand out"
         );
+        // A deletion is red in the error slot, and a diff note is italic rather than
+        // counted as content.
+        assert_eq!(
+            style_of(&rows, "\\ No newline"),
+            None,
+            "a note line only appears when present"
+        );
+    }
+
+    /// Intra-line emphasis: a modified pair marks only the characters that changed, which is
+    /// the difference between reading a diff and scanning it. A wholly rewritten line is left
+    /// as a plain red/green row, because emphasising everything says nothing.
+    #[test]
+    fn a_modified_pair_emphasises_only_the_changed_span() {
+        let excerpt = "@@ -1 +1 @@\n-    let total = count + 1;\n+    let total = count + 2;";
+        let app = app_with_tool(excerpt);
+        let rows = app.transcript_rows(80);
+        let underlined = |needle: &str| -> String {
+            rows.iter()
+                .find(|r| r.raw.contains(needle) && r.raw.starts_with(['-', '+']))
+                .map(|r| {
+                    r.line
+                        .spans
+                        .iter()
+                        .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+                        .map(|s| s.content.to_string())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        assert_eq!(underlined("count + 1"), "1", "only the changed digit");
+        assert_eq!(underlined("count + 2"), "2");
+    }
+
+    /// A pair whose lines share nothing is a rewrite: no span, so the row stays plain
+    /// red/green and the emphasis does not claim a partial change.
+    #[test]
+    fn a_wholly_rewritten_line_is_not_emphasised() {
+        let excerpt = "@@ -1 +1 @@\n-alpha beta gamma\n+one two three";
+        let app = app_with_tool(excerpt);
+        let rows = app.transcript_rows(80);
+        for row in &rows {
+            if row.raw.starts_with(['-', '+']) {
+                let marked: String = row
+                    .line
+                    .spans
+                    .iter()
+                    .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+                    .map(|s| s.content.to_string())
+                    .collect();
+                assert!(
+                    marked.is_empty(),
+                    "a rewrite must not be emphasised: {marked:?}"
+                );
+            }
+        }
+    }
+
+    /// An unpaired deletion gets no emphasis: there is no insertion to compare against, so
+    /// the changed span is unknown.
+    #[test]
+    fn an_unpaired_line_gets_no_emphasis() {
+        let excerpt = "@@ -1 +1 @@\n-removed only";
+        let app = app_with_tool(excerpt);
+        for row in app.transcript_rows(80) {
+            if row.raw.starts_with("-removed") {
+                assert!(
+                    row.line
+                        .spans
+                        .iter()
+                        .all(|s| !s.style.add_modifier.contains(Modifier::UNDERLINED)),
+                    "nothing to compare against"
+                );
+            }
+        }
+    }
+
+    /// A diff file header is not a deletion: `--- a/x` must not be paired with a following
+    /// `+` line as if it were content.
+    #[test]
+    fn file_headers_are_not_treated_as_changed_lines() {
+        let excerpt = "--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-a\n+b";
+        let app = app_with_tool(excerpt);
+        let rows = app.transcript_rows(80);
+        let header = rows
+            .iter()
+            .find(|r| r.raw.starts_with("--- a/x.rs"))
+            .expect("the header row");
+        assert_eq!(
+            header.line.spans.last().map(|s| s.style),
+            Some(crate::code::diff_line_style("--- a/x.rs")),
+            "a header keeps its own style"
+        );
+    }
+
+    /// Emphasis offsets must not split a wide glyph: a changed CJK character is taken whole.
+    #[test]
+    fn emphasis_does_not_split_a_wide_character() {
+        let excerpt = "@@ -1 +1 @@\n-let x = \u{65e5}\u{672c};\n+let x = \u{65e5}\u{672c}\u{8a9e};";
+        let app = app_with_tool(excerpt);
+        for row in app.transcript_rows(80) {
+            // Whatever is underlined must be a whole number of characters.
+            let marked: String = row
+                .line
+                .spans
+                .iter()
+                .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
+                .map(|s| s.content.to_string())
+                .collect();
+            assert!(
+                !marked.is_empty() || !row.raw.starts_with("+let x"),
+                "the added character should be emphasised"
+            );
+        }
+    }
+
+    /// Both diff paths must agree: a fenced ```diff block and a raw patch use one style
+    /// function, so the same line cannot render two different ways.
+    #[test]
+    fn both_diff_paths_agree_on_a_line_style() {
+        use crate::code::{diff_line_style, highlight, Lang};
+        for line in [
+            "--- a/x",
+            "+++ b/x",
+            "@@ -1,3 +1,4 @@",
+            "-removed",
+            "+added",
+            "\\ No newline at end of file",
+            " context",
+        ] {
+            let lexed = highlight(line, Lang::Diff);
+            assert_eq!(lexed.len(), 1, "a diff line is one piece");
+            assert_eq!(
+                lexed[0].1,
+                diff_line_style(line),
+                "{line:?} must style the same in both paths"
+            );
+        }
     }
 
     #[test]

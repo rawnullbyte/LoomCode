@@ -850,6 +850,49 @@ pub fn punctuation_style() -> Style {
 /// One highlighted span: text plus its style.
 pub type Piece = (String, Style);
 
+/// Style for one line of a unified diff. Shared by both renderers (the fenced-code path here
+/// and `transcript::diff_style`), so a pasted patch looks the same wherever it appears.
+///
+/// The distinctions that matter: a **file header** (`--- a/x`) names the file, a **hunk
+/// header** (`@@ -1,4 +1,6 @@`) is structural, an **insertion** is green and a **deletion**
+/// red, and `\ No newline at end of file` is a note rather than content.
+pub fn diff_line_style(line: &str) -> Style {
+    let trimmed = line.trim_start();
+    // Every branch carries `bg = Reset`: a diff line may be drawn in prose or inside a
+    // fence, and the transparent-rendering invariant requires no application-owned fill.
+    let reset = Style::default().bg(Color::Reset);
+    if trimmed.starts_with("diff ") || trimmed.starts_with("index ") {
+        // `git diff` preamble: structural, not content.
+        reset.fg(Color::DarkGray)
+    } else if trimmed.starts_with("--- ") || trimmed.starts_with("+++ ") {
+        // The two file headers: bold accent so the filename stands out.
+        reset.fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with("@@") {
+        // A hunk header is the map of the diff: warn + bold, distinct from both sides.
+        reset.fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    } else if trimmed.starts_with("\\ ") {
+        // `\ No newline at end of file` is a note, not a line of the file.
+        reset.fg(Color::DarkGray).add_modifier(Modifier::ITALIC)
+    } else if trimmed.starts_with('+') {
+        reset.fg(Color::Green)
+    } else if trimmed.starts_with('-') {
+        reset.fg(Color::Red)
+    } else {
+        reset.fg(Color::Reset)
+    }
+}
+
+/// True when the line is a diff header (file or hunk), which carries no file content and so
+/// must not be counted as a changed line.
+pub fn is_diff_header(line: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with("@@")
+        || t.starts_with("diff ")
+        || t.starts_with("index ")
+        || t.starts_with("--- ")
+        || t.starts_with("+++ ")
+}
+
 /// Split a `read` result line into its line-number gutter and the code after it.
 ///
 /// The tool emits `{:>6}\t{line}`, and `display` turns the tab into spaces, so a
@@ -885,16 +928,7 @@ pub fn split_gutter(line: &str) -> Option<(&str, &str)> {
 /// on that, so dropping or reordering characters would corrupt copied text.
 pub fn highlight(line: &str, lang: Lang) -> Vec<Piece> {
     if lang == Lang::Diff {
-        let style = if line.starts_with("@@") || line.starts_with("diff ") {
-            keyword_style()
-        } else if line.starts_with('+') {
-            string_style()
-        } else if line.starts_with('-') {
-            Style::default().fg(Color::Red)
-        } else {
-            plain_style()
-        };
-        return vec![(line.into(), style)];
+        return vec![(line.into(), diff_line_style(line))];
     }
     let chars: Vec<char> = line.chars().collect();
     let mut out: Vec<Piece> = Vec::new();
