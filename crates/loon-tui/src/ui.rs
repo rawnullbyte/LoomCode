@@ -47,10 +47,15 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
     let spare = area.height.saturating_sub(footer_h + input_h);
     let transcript_min = spare.min(3);
     // Queued prompts sit as dim rows directly above the prompt, so what is waiting is
-    // visible instead of hidden behind a counter in the status bar.
-    let queue_rows = (app.queued.len() as u16)
-        .min(MAX_QUEUE_ROWS as u16)
-        .min(spare.saturating_sub(transcript_min));
+    // visible instead of hidden behind a counter in the status bar. The budget also covers
+    // the separator rule and, when prompts are clipped, the "+N earlier" line.
+    let queued_visible = (app.queued.len() as u16).min(MAX_QUEUE_ROWS as u16);
+    let queued_overflow = app.queued.len() as u16 > queued_visible;
+    let queue_rows = if queued_visible == 0 {
+        0
+    } else {
+        (queued_visible + 1 + u16::from(queued_overflow)).min(spare.saturating_sub(transcript_min))
+    };
     let popup_rows = desired_popup.min(spare.saturating_sub(transcript_min + queue_rows));
     let [transcript, queue, popup, input, footer] = Layout::vertical([
         Constraint::Min(transcript_min),
@@ -112,19 +117,42 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
 
     // ── queued prompts, dim, directly above the prompt bar ──────────────────────
     // Oldest at the top, newest nearest the input: Up on an empty input pulls back
-    // exactly the row sitting against the prompt.
+    // exactly the row sitting against the prompt. The first row is a dim rule so the
+    // waiting prompts do not read as part of the assistant's answer above them.
     if queue_rows > 0 && queue.height > 0 {
-        let skip = app.queued.len().saturating_sub(queue_rows as usize);
-        let rows: Vec<Line> = app
-            .queued
-            .iter()
-            .skip(skip)
-            .map(|text| {
-                let first = text.lines().next().unwrap_or("");
-                let more = if text.lines().count() > 1 { " …" } else { "" };
-                Line::from(Span::styled(format!("↳ {first}{more}"), theme.dim()))
-            })
-            .collect();
+        let visible = app.queued.len().min(MAX_QUEUE_ROWS);
+        let skip = app.queued.len().saturating_sub(visible);
+        let mut rows: Vec<Line> = Vec::new();
+        if queue.height > visible as u16 {
+            rows.push(Line::from(Span::styled(
+                "─".repeat(queue.width as usize),
+                theme.border(),
+            )));
+        }
+        // Tell the user when older prompts are not shown, rather than silently dropping
+        // them: the count in the status bar is the total, this is what fits.
+        let overflow = if skip > 0 {
+            format!("↳ +{skip} earlier")
+        } else {
+            String::new()
+        };
+        if !overflow.is_empty() && rows.len() + visible < queue.height as usize {
+            rows.push(Line::from(Span::styled(
+                clip_cells(&overflow, queue.width as usize),
+                theme.dim(),
+            )));
+        }
+        for text in app.queued.iter().skip(skip) {
+            let first = text.lines().next().unwrap_or("");
+            let more = if text.lines().count() > 1 { " …" } else { "" };
+            // A preview, not content: clip to the frame instead of letting the terminal
+            // cut the text at the edge with no ellipsis.
+            let label = format!("↳ {first}{more}");
+            rows.push(Line::from(Span::styled(
+                clip_cells(&label, queue.width as usize),
+                theme.dim(),
+            )));
+        }
         f.render_widget(Paragraph::new(rows).style(theme.base()), queue);
     }
 
@@ -415,20 +443,40 @@ fn apply_selection(line: &Line<'static>, abs_line: u64, sel: &crate::SelRange) -
 fn draw_status(f: &mut Frame, app: &App, theme: &theme::Theme, area: ratatui::layout::Rect) {
     use ratatui::layout::Alignment;
     if area.width < 55 {
-        let text = format!(
-            "{} {}",
-            if app.status.busy {
-                crate::motion::spinner(app.tick)
-            } else {
-                '●'
-            },
-            if app.request_rate.active() {
-                format!("{} · {}", app.request_rate.label(), app.activity)
-            } else {
-                app.activity.clone()
-            }
+        // Narrow terminals still have to answer the two questions worth a glance: is it
+        // working, and is anything waiting on me. Dropping the queue count here left a
+        // user with three queued prompts staring at "● Ready" and no sign of them.
+        let marker = if app.status.busy {
+            crate::motion::spinner(app.tick).to_string()
+        } else {
+            "●".to_string()
+        };
+        let state = if app.request_rate.active() {
+            format!("{} · {}", app.request_rate.label(), app.activity)
+        } else {
+            app.activity.clone()
+        };
+        let queue = match app.queued.len() {
+            0 => String::new(),
+            n if app.queue_paused => format!(" · {n} paused"),
+            n => format!(" · {n} queued"),
+        };
+        // Keep the queue when everything does not fit: the activity word truncates with an
+        // ellipsis, the count never does.
+        let tail = format!("{state}{queue}");
+        let budget = (area.width as usize).saturating_sub(marker.chars().count() + 1);
+        let shown = if tail.chars().count() <= budget {
+            tail
+        } else if queue.is_empty() {
+            clip_cells(&tail, budget)
+        } else {
+            let room = budget.saturating_sub(queue.chars().count());
+            format!("{}{queue}", clip_cells(&state, room))
+        };
+        f.render_widget(
+            Paragraph::new(format!("{marker} {shown}")).style(theme.accent()),
+            area,
         );
-        f.render_widget(Paragraph::new(text).style(theme.accent()), area);
         return;
     }
     let [identity, activity, resources] = Layout::horizontal([
@@ -541,6 +589,34 @@ fn format_elapsed(secs: u64) -> String {
     } else {
         format!("{}d{:02}h", secs / DAY, (secs % DAY) / HOUR)
     }
+}
+
+/// Clip plain text to a cell width, ending with an ellipsis when it does not fit. Used for
+/// one-row previews (queued prompts) where the terminal must not cut mid-word with no sign
+/// that more text exists.
+fn clip_cells(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width {
+            // Replace the last cell with the ellipsis so the row never overflows.
+            while used + 1 > width {
+                if out.pop().is_none() {
+                    break;
+                }
+                used -= 1;
+            }
+            out.push('…');
+            return out;
+        }
+        out.push(c);
+        used += w;
+    }
+    out
 }
 
 /// Clip styled segments to the terminal width, ending with an ellipsis.

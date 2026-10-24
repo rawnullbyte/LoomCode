@@ -256,3 +256,111 @@ fn a_fresh_chat_shows_banner_and_opener_not_phantom_content() {
         .iter()
         .any(|b| matches!(b, Block::Tool { .. } | Block::Assistant(_))));
 }
+
+/// Below 55 columns the bar used to collapse to just the activity word, dropping the
+/// queue count entirely: a user with three queued prompts saw "● Ready" and no sign that
+/// anything was waiting. The queue is the one field that must survive a narrow terminal.
+#[test]
+fn a_narrow_status_bar_keeps_the_queue_count() {
+    let mut a = app(false);
+    a.activity = "Ready".into();
+    a.queued = vec!["one".into(), "two".into(), "three".into()];
+    let bar = footer_at(&mut a, 34);
+    assert!(
+        bar.contains("3 queued"),
+        "the queue count must survive a narrow bar, got: {bar:?}"
+    );
+}
+
+/// A paused queue says so, rather than looking like ordinary pending work.
+#[test]
+fn a_narrow_status_bar_distinguishes_a_paused_queue() {
+    let mut a = app(false);
+    a.activity = "Ready".into();
+    a.queued = vec!["one".into(), "two".into()];
+    a.queue_paused = true;
+    let bar = footer_at(&mut a, 34);
+    assert!(bar.contains("2 paused"), "got: {bar:?}");
+}
+
+/// With nothing queued the narrow bar still names the state, and never shows a phantom
+/// count.
+#[test]
+fn a_narrow_status_bar_with_no_queue_shows_no_count() {
+    let mut a = app(false);
+    a.activity = "Ready".into();
+    let bar = footer_at(&mut a, 34);
+    assert!(bar.contains("Ready"), "{bar:?}");
+    assert!(!bar.contains("queued"), "no queue means no count: {bar:?}");
+    assert!(!bar.contains("paused"), "{bar:?}");
+}
+
+/// An activity string longer than the bar must not push the count off the edge: the word
+/// truncates, the count stays.
+#[test]
+fn a_long_activity_does_not_displace_the_queue_count() {
+    let mut a = app(true);
+    a.activity = "Running a very long tool description that will not fit".into();
+    a.queued = vec!["one".into()];
+    let bar = footer_at(&mut a, 30);
+    assert!(
+        bar.contains("1 queued"),
+        "the count must be kept when the activity word is too long, got: {bar:?}"
+    );
+}
+
+/// Queued prompts render as dim rows above the prompt bar. Two defects: a long prompt was
+/// cut by the frame edge with no ellipsis, and the rows sat directly under the assistant's
+/// last line with no separator, so they read as part of the answer.
+#[test]
+fn queued_prompts_are_clipped_with_an_ellipsis() {
+    let mut a = app(false);
+    a.queued = vec!["a queued prompt whose text is much longer than the narrow frame".into()];
+    let rows = frame(&mut a, 40, 20);
+    let queued = rows
+        .iter()
+        .find(|r| r.contains('↳'))
+        .expect("the queued prompt must be rendered");
+    assert!(
+        queued.contains('…'),
+        "an over-long preview must be clipped with an ellipsis: {queued:?}"
+    );
+    assert!(
+        queued.chars().count() <= 40,
+        "the row must not overflow the frame: {queued:?}"
+    );
+}
+
+/// A dim rule separates the queue from the transcript, so waiting prompts do not read as
+/// part of the assistant's answer above them.
+#[test]
+fn a_rule_separates_the_queue_from_the_transcript() {
+    let mut a = app(false);
+    a.blocks
+        .push(loon_tui::Block::Assistant("an answer".into()));
+    a.queued = vec!["pending".into()];
+    let rows = frame(&mut a, 40, 20);
+    let queued_at = rows
+        .iter()
+        .position(|r| r.contains('↳'))
+        .expect("the queue row");
+    let rule = rows[queued_at - 1].trim().to_string();
+    assert!(
+        !rule.is_empty() && rule.chars().all(|c| c == '─'),
+        "the row above the queue must be a drawn separator rule, got: {rule:?}"
+    );
+}
+
+/// When more prompts are waiting than fit, the hidden ones are counted rather than
+/// silently dropped — the status bar shows the total, this says what is not on screen.
+#[test]
+fn hidden_queued_prompts_are_counted() {
+    let mut a = app(false);
+    a.queued = (0..6).map(|n| format!("prompt {n}")).collect();
+    let rows = frame(&mut a, 40, 20);
+    let joined = rows.join("\n");
+    assert!(
+        joined.contains("+3 earlier"),
+        "the three prompts beyond the preview cap must be counted: {joined:?}"
+    );
+}
