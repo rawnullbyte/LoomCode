@@ -93,6 +93,9 @@ persistent_rotation = false  # per-session cursor; true keeps one cursor across 
 [ui]
 animations = true
 popup_rows = 6
+# Syntax highlighting in code excerpts and fenced blocks. Turn it off for a
+# plain transcript (also faster on very large outputs).
+syntax = true
 
 # HTTP MCP (or use /mcp add local 3000):
 # [mcp.servers.local]

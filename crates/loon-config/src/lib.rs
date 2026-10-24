@@ -258,6 +258,16 @@ mode = "bypass"
 # Model reference: a [models] key or "combo:NAME".
 model = "mock"
 
+[ui]
+# Syntax highlighting in code excerpts and fenced blocks. Set false for a plain
+# transcript — useful when a terminal theme fights the token colours, and faster
+# on very large outputs.
+syntax = true
+# Rotating placeholder tip in the prompt ("Try \"write a test for src/lib.rs\"").
+tips = true
+# Permission-mode footer row.
+footer = true
+
 # ── Providers: any number of OpenAI-compatible endpoints ─────────────────────────
 # [providers.ollama]
 # base_url = "http://127.0.0.1:11434/v1"
@@ -291,5 +301,36 @@ fn merge_settings(base: &mut toml::Value, overlay: toml::Value) {
         }
     } else {
         *base = overlay;
+    }
+}
+
+#[cfg(test)]
+mod example_config_tests {
+    use super::*;
+
+    /// `loom config init` writes `example_toml()`, so it must parse as a typed `Config` — a
+    /// comment or key that drifts out of sync with the schema would ship a broken starter
+    /// file to every new user.
+    #[test]
+    fn the_example_config_parses_into_a_typed_config() {
+        let cfg: Config = toml::from_str(example_toml())
+            .expect("the example config must parse against the current schema");
+        // Spot-check that the documented `[ui]` keys actually take effect.
+        assert!(cfg.ui.syntax, "the example turns syntax highlighting on");
+        assert!(cfg.ui.tips);
+        assert!(cfg.ui.footer);
+    }
+
+    /// Every key the ULTRA plan added must be reachable from the example, or a user cannot
+    /// discover the setting without reading the source.
+    #[test]
+    fn the_example_documents_the_ui_switches() {
+        let text = example_toml();
+        for key in ["syntax", "tips", "footer"] {
+            assert!(
+                text.contains(key),
+                "`{key}` must appear in the example config"
+            );
+        }
     }
 }

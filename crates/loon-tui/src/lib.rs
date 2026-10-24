@@ -212,6 +212,9 @@ pub struct App {
     pub settings_tool_cap: usize,
     /// `[ui] tips`: show the rotating input placeholder.
     pub tips: bool,
+    /// `[ui] syntax`: highlight code in excerpts and fenced blocks. Off renders code in the
+    /// plain body colour.
+    pub syntax: bool,
 }
 
 /// One line describing a background subagent's state change.
@@ -293,6 +296,7 @@ impl App {
             settings_effort: "medium".into(),
             settings_tool_cap: 65_536,
             tips: true,
+            syntax: true,
         }
     }
 
@@ -1238,6 +1242,7 @@ async fn run_inner(
         app.palette = loaded.appearance.palette;
         app.settings_effort = loaded.session.effort.unwrap_or("medium".into());
         app.tips = loaded.ui.tips;
+        app.syntax = loaded.ui.syntax;
         app.animations = loaded.ui.animations;
         app.popup_rows = loaded.ui.popup_rows as usize;
         app.tip_text = loaded.ui.tip_text;
@@ -1421,6 +1426,7 @@ async fn run_inner(
                     "context_window" => app.context_limit = value.parse().unwrap_or(0),
                     "autocompact" => app.settings_autocompact = value == "true",
                     "tips" => app.tips = value == "true",
+                    "syntax" => app.syntax = value == "true",
                     "tip_text" => app.tip_text = value,
                     "footer" => app.footer = value == "true",
                     "welcome_banner" => {

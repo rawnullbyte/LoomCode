@@ -252,6 +252,29 @@ motion. `/config popup_rows=10` adjusts slash suggestions. `/theme` previews ter
 light, ocean, violet, ember and graphite palettes while you navigate. Enter saves; Escape
 restores the prior palette.
 
+## Code and prose rendering
+
+Code is highlighted by language — 24 families with their own keywords, comment markers and
+string delimiters, including Go, Java, Kotlin, Swift, C, C++, C#, Ruby, Lua, YAML, Dockerfile
+and Makefile. A file named for its kind (`Makefile`, `Dockerfile.prod`) is recognised, not
+just one with an extension. Token classes are separated by colour *and* weight, so a keyword
+(accent, bold), a type (accent, italic), a function (its own palette slot) and an attribute
+(warn, bold) are all distinguishable.
+
+The colours come from the palette you chose: the lexer emits semantic slots and the renderer
+maps them onto the active theme, so highlighting follows `/theme` instead of fighting it.
+`[ui] syntax = false` turns highlighting off for a plain transcript — useful when a terminal
+theme fights the token colours, and faster on very large outputs.
+
+Diffs mark the *changed characters* within a modified line, not only the line: a `-`/`+` pair
+has its common prefix and suffix trimmed so the differing span stands out. A wholly rewritten
+line is left as a plain red/green row, because emphasising the entire line says nothing.
+
+Assistant answers render their structure: `**bold**`, `*italic*`, `[links](url)`, `- ` and
+`1.` lists (wrapped items align under their text), `> ` quotes with a rule down the left edge,
+and `---` rules. Markers only count where they mean something — `snake_case` is not italic,
+and `---` inside a fenced block stays a diff header.
+
 All management lists support typing to search, arrows, mouse wheel, Page Up/Down,
 Home/End, Enter or click, and Escape to clear search/go back. Editors support
 Tab/Shift+Tab, cursor movement, bracketed paste and **Ctrl+S to save**. API keys are masked.

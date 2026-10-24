@@ -1,4 +1,7 @@
-# Colour and syntax highlighting — plan
+# Colour and syntax highlighting — plan and record
+
+Status: **all five phases implemented.** Phase 1 `d022560`, 2 `c3208ee`, 3 `cfab7ea`,
+4 `4fdcc02`, 5 this commit.
 
 Goal: make code and prose in the transcript more readable, and let the palette express more
 than four distinguishable colours. This states what exists, what is actually wrong (verified,

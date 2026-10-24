@@ -10,6 +10,26 @@ pub struct TranscriptRow {
     pub prefix_cells: usize,
     pub soft: bool,
 }
+// Whether syntax highlighting is on for the current render pass, from `[ui] syntax`.
+//
+// A thread-local rather than a parameter: the transcript builder has a dozen entry points
+// (`push_text`, `push_calls`, `push_tool_excerpt`, …) and threading a bool through all of them
+// would add noise to every signature for one setting. It is thread-local rather than a plain
+// global because a global would let two threads rendering different settings observe each
+// other's value — the test suite renders on several threads at once, and the app renders on one.
+thread_local! {
+    static SYNTAX: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+fn syntax_enabled() -> bool {
+    SYNTAX.with(std::cell::Cell::get)
+}
+
+/// Set the highlighting switch for the current thread's render pass.
+fn set_syntax_enabled(on: bool) {
+    SYNTAX.with(|s| s.set(on));
+}
+
 pub fn clean(text: &str) -> String {
     let mut out = String::new();
     let mut it = text.chars().peekable();
@@ -185,6 +205,7 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
     let text = clean(text);
     let mut first = true;
     let markdown = style == theme::assistant_fg();
+    let highlight_code = syntax_enabled();
     let mut code = false;
     // The fence's info string picks the highlighting family; it is remembered until
     // the closing fence so every line of the block is tokenized the same way.
@@ -230,7 +251,8 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
         } else {
             indent.clone()
         };
-        let highlighted = (code && !fence).then(|| crate::code::highlight(para, lang));
+        let highlighted =
+            (highlight_code && code && !fence).then(|| crate::code::highlight(para, lang));
         let mut code_offset = 0;
         for (i, raw) in wrap(para, avail).into_iter().enumerate() {
             let lead = if first {
@@ -265,13 +287,13 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
                             spans.push(Span::styled(text, diff));
                         } else if markdown && !code && !fence {
                             push_inline_markdown(&mut spans, &text, body_style, line_class);
-                        } else if code && !fence {
+                        } else if code && !fence && highlighted.is_some() {
                             // Real syntax highlighting inside a fenced block: keywords,
                             // strings, numbers and comments are separated by language, so
                             // a Rust block does not read like a wall of one colour.
                             let mut column = 0;
                             for (piece, style) in crate::code::slice(
-                                highlighted.as_ref().unwrap(),
+                                highlighted.as_ref().expect("checked above"),
                                 code_offset,
                                 raw.chars().count(),
                             ) {
@@ -679,7 +701,8 @@ fn push_tool_excerpt(
         // A source file read is code even without a fence: the tool's path says what
         // language it is. Only plain (non-diff, non-fenced) lines are highlighted, so a
         // diff hunk keeps its red/green rather than being tokenized as source.
-        let as_code = lang != crate::code::Lang::Plain
+        let as_code = syntax_enabled()
+            && lang != crate::code::Lang::Plain
             && !fence
             && !in_code
             && diff_style(para).is_none()
@@ -1196,6 +1219,8 @@ impl App {
         if let Some(rows) = &self.selection_snapshot {
             return rows.clone();
         }
+        // Publish the `[ui] syntax` setting for this render pass.
+        set_syntax_enabled(self.syntax);
         let mut rows: Vec<TranscriptRow> = vec![];
         let width = width.max(1) as usize;
         let mut prev = None;

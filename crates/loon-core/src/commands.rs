@@ -1445,19 +1445,33 @@ impl Agent {
                 Ok(format!("deleted session {picked}"))
             }
             SlashCommand::Theme => {
+                // Each description says what the palette is actually good for, because the
+                // choice that matters is how *code* reads: a palette is judged on keywords,
+                // strings and comments, not on the menu swatch.
                 let items = [
-                    "terminal", "dark", "light", "ocean", "violet", "ember", "graphite",
+                    "terminal",
+                    "dark",
+                    "light",
+                    "ocean",
+                    "violet",
+                    "ember",
+                    "graphite",
                 ]
                 .into_iter()
                 .map(|n| crate::catalog::MenuItem {
                     label: n.into(),
                     detail: match n {
-                        "terminal" => "Transparent · terminal foreground and background",
-                        "dark" => "Graphite · cool blue accents",
-                        "light" => "Paper · dark text on light surface",
-                        _ => "Deep navy · teal accents",
-                    }
-                    .into(),
+                        "terminal" => {
+                            "transparent · keeps your terminal's colours and background".to_string()
+                        }
+                        "dark" => "cool blue accent · blue functions on a dark ground".to_string(),
+                        "light" => "dark text on paper · high-contrast for bright rooms".to_string(),
+                        "ocean" => "teal accent · blue functions, reads well for long sessions".to_string(),
+                        "violet" => "violet accent · cyan functions, high token contrast".to_string(),
+                        "ember" => "warm amber accent · magenta functions on a warm ground".to_string(),
+                        "graphite" => "neutral grey · violet functions, low saturation".to_string(),
+                        _ => "deep navy · teal accents".to_string(),
+                    },
                     command: format!("/theme {n}"),
                 })
                 .collect();
@@ -1465,7 +1479,7 @@ impl Agent {
                     title: "Appearance".into(),
                     items,
                 });
-                Ok("Choose /theme terminal|dark|light|ocean|violet|ember|graphite".into())
+                Ok("Choose /theme terminal|dark|light|ocean|violet|ember|graphite — the active theme previews live as you move".into())
             }
             SlashCommand::ThemeSet { name } => self.config_apply("theme", &name),
             SlashCommand::Todos { args } => self.worklog_command(false, args),

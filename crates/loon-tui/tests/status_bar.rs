@@ -364,3 +364,48 @@ fn hidden_queued_prompts_are_counted() {
         "the three prompts beyond the preview cap must be counted: {joined:?}"
     );
 }
+
+/// `[ui] syntax = false` must render code in the plain body colour, and must be reversible:
+/// the setting is a preference, not a one-way switch.
+#[test]
+fn the_syntax_switch_turns_highlighting_off_and_back_on() {
+    let mut a = app(false);
+    a.blocks.push(loon_tui::Block::Assistant(
+        "```rust\nfn main() { let x = 1; }\n```".into(),
+    ));
+
+    // On (the default): the keyword carries its own colour.
+    let rows = a.transcript_rows(70);
+    let highlighted = rows.iter().any(|r| {
+        r.line
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(ratatui::style::Color::Magenta))
+    });
+    assert!(highlighted, "syntax on must colour a keyword");
+
+    // Off: no token colour anywhere on the code row.
+    a.syntax = false;
+    let rows = a.transcript_rows(70);
+    let still_highlighted = rows.iter().any(|r| {
+        r.line.spans.iter().any(|s| {
+            matches!(
+                s.style.fg,
+                Some(ratatui::style::Color::Magenta | ratatui::style::Color::Blue)
+            )
+        })
+    });
+    assert!(!still_highlighted, "syntax off must render code plainly");
+
+    // Back on: highlighting returns, so the switch is not one-way.
+    a.syntax = true;
+    let rows = a.transcript_rows(70);
+    assert!(
+        rows.iter().any(|r| r
+            .line
+            .spans
+            .iter()
+            .any(|s| s.style.fg == Some(ratatui::style::Color::Magenta))),
+        "syntax on again must restore colour"
+    );
+}

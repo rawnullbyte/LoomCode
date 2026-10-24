@@ -352,6 +352,11 @@ pub struct UiCfg {
     /// Max visible rows in the slash-command popup.
     #[serde(default = "default_popup_rows")]
     pub popup_rows: u16,
+    /// Syntax highlighting in code excerpts and fenced blocks. Off renders code in the
+    /// plain body colour, which is easier to read on a terminal whose palette fights the
+    /// token colours, and faster on very large outputs.
+    #[serde(default = "yes")]
+    pub syntax: bool,
 }
 
 fn yes() -> bool {
@@ -371,6 +376,7 @@ impl Default for UiCfg {
             welcome_banner: true,
             spinner_verbs: vec![],
             popup_rows: default_popup_rows(),
+            syntax: true,
         }
     }
 }
