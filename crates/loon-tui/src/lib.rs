@@ -215,6 +215,9 @@ pub struct App {
     /// `[ui] syntax`: highlight code in excerpts and fenced blocks. Off renders code in the
     /// plain body colour.
     pub syntax: bool,
+    /// The background-subagent hub this session's tools share. `None` in tests that build
+    /// an `App` directly; present in a real session, where the panel reads running jobs.
+    pub background: Option<loon_core::subagent::BackgroundHub>,
 }
 
 /// One line describing a background subagent's state change.
@@ -297,6 +300,7 @@ impl App {
             settings_tool_cap: 65_536,
             tips: true,
             syntax: true,
+            background: None,
         }
     }
 
@@ -1175,6 +1179,8 @@ async fn run_inner(
     // Shared with the tools below so a background subagent's report reaches this
     // agent's turn loop, not a registry nobody reads.
     let background = loon_core::subagent::BackgroundHub::new();
+    // Keep a handle for the live panel before the hub is moved into the agent and tools.
+    let background_handle = background.clone();
     let agent = Arc::new(Mutex::new({
         let mut a = Agent::new_session(
             paths,
@@ -1231,6 +1237,8 @@ async fn run_inner(
         cwd: cwd.display().to_string(),
     };
     let mut app = App::new(transparent, status);
+    // The live subagent panel reads the same hub the background_* tools use.
+    app.background = Some(background_handle);
     // Prompt history survives a restart: recall is far less useful if quitting erases it.
     // Loading is best-effort — a missing or unreadable file just means no history yet.
     app.history_file = Some(history::history_path(&paths.state_dir));

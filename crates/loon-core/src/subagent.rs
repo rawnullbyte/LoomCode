@@ -112,6 +112,19 @@ fn background_agent_id(args: &Value, tool: &'static str) -> Result<u64, loon_too
     }
 }
 
+/// A short label for a child: the first line of its task, trimmed, capped.
+fn task_label(task: &str) -> String {
+    let first = task.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return "subagent".to_string();
+    }
+    let mut label: String = first.chars().take(40).collect();
+    if first.chars().count() > 40 {
+        label.push('…');
+    }
+    label
+}
+
 /// Everything needed to construct a child session. Shared by `delegate` (blocking)
 /// and `background_spawn` (non-blocking) so the two cannot drift apart in tool
 /// filtering, isolation or cancellation behaviour.
@@ -259,10 +272,13 @@ async fn build_child(
             child.effort = Some(effort.clone());
         }
     }
-    let label = profile
-        .as_ref()
-        .map(|p| p.name.clone())
-        .unwrap_or_else(|| "subagent".to_string());
+    // The label names the child in every surface that shows it (the live panel, the
+    // transcript, background_list). A bare "subagent" for every child made three parallel
+    // jobs indistinguishable; the first line of the task tells them apart.
+    let label = match profile.as_ref() {
+        Some(p) => p.name.clone(),
+        None => task_label(&task),
+    };
     let task = if let Some(profile) = &profile {
         format!(
             "Agent profile {}:\n{}\n\nTask:\n{task}",
@@ -401,6 +417,10 @@ impl loon_tools::Tool for LoopCancelTool {
 struct Job {
     label: String,
     status: JobStatus,
+    /// When the child was spawned, so a listing can show how long it has run: a parent
+    /// deciding between waiting and killing needs that, and "running" alone says nothing
+    /// about a child that has been stuck for ten minutes.
+    started: std::time::Instant,
     /// Queued messages reach the child at its next step boundary (the same channel
     /// steering uses), so a long-running child can be redirected mid-task.
     steering: mpsc::Sender<String>,
@@ -555,6 +575,7 @@ impl BackgroundHub {
                 Job {
                     label: label.clone(),
                     status: JobStatus::Running,
+                    started: std::time::Instant::now(),
                     steering,
                     cancel: cancel_tx,
                     report: None,
@@ -609,6 +630,7 @@ impl BackgroundHub {
                     Job {
                         label: label.clone(),
                         status,
+                        started: std::time::Instant::now(),
                         steering: mpsc::channel(1).0,
                         cancel: tokio::sync::watch::channel(false).0,
                         report: Some(text.clone()),
@@ -803,13 +825,37 @@ impl BackgroundHub {
         Ok(format!("background agent #{id} killed"))
     }
 
-    /// Snapshot of every job: id, label, status, and the report once finished.
-    pub fn listing(&self) -> Vec<(u64, String, JobStatus, Option<String>)> {
+    /// Snapshot of every job: id, label, status, the report once finished, and how long
+    /// the child has run (or ran) in whole seconds. Frozen at completion, so a finished
+    /// entry keeps reporting its lifetime instead of growing forever.
+    pub fn listing(&self) -> Vec<(u64, String, JobStatus, Option<String>, u64)> {
         self.lock()
             .jobs
             .iter()
-            .map(|(id, job)| (*id, job.label.clone(), job.status, job.report.clone()))
+            .map(|(id, job)| {
+                let secs = job.started.elapsed().as_secs();
+                (*id, job.label.clone(), job.status, job.report.clone(), secs)
+            })
             .collect()
+    }
+
+    /// The jobs currently running: id, label and seconds elapsed. This is the live panel's
+    /// data source — a finished child belongs in the transcript, not on a status row.
+    pub fn running(&self) -> Vec<(u64, String, u64)> {
+        self.lock()
+            .jobs
+            .iter()
+            .filter(|(_, job)| job.status == JobStatus::Running)
+            .map(|(id, job)| (*id, job.label.clone(), job.started.elapsed().as_secs()))
+            .collect()
+    }
+
+    /// Seconds the given job has run (or ran), or `None` when no such job exists.
+    pub fn elapsed_secs(&self, id: u64) -> Option<u64> {
+        self.lock()
+            .jobs
+            .get(&id)
+            .map(|job| job.started.elapsed().as_secs())
     }
 }
 
@@ -944,8 +990,10 @@ impl loon_tools::Tool for BackgroundListTool {
         // parent was waiting for and kept the stale ones it had already read.
         jobs.sort_by_key(|job| std::cmp::Reverse(job.0));
         let mut out = String::new();
-        for (id, label, status, report) in jobs {
-            out.push_str(&format!("#{id} {label} [{}]\n", status.as_str()));
+        for (id, label, status, report, secs) in jobs {
+            // Elapsed time is part of the decision the parent is making: "running" plus
+            // "3s" means wait, "running" plus "10m0s" means steer or kill.
+            out.push_str(&format!("#{id} {label} [{}] {secs}s\n", status.as_str()));
             match report {
                 Some(report) => {
                     // One long report must not starve every other outcome out of the
@@ -1175,7 +1223,7 @@ mod tests {
             1,
             "the orphaned report must be parked, not dropped"
         );
-        let (_, label, status, report) = &jobs[0];
+        let (_, label, status, report, _) = &jobs[0];
         assert_eq!(label, "orphaned work");
         assert_eq!(*status, JobStatus::Completed);
         assert_eq!(report.as_deref(), Some("done"));
@@ -1211,7 +1259,7 @@ mod tests {
         let listed: usize = hub
             .listing()
             .iter()
-            .filter_map(|(_, _, _, r)| r.as_ref().map(|r| r.len()))
+            .filter_map(|(_, _, _, r, _)| r.as_ref().map(|r| r.len()))
             .sum();
         let queued: usize = hub
             .drain_reports()

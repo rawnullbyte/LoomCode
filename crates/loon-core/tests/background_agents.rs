@@ -84,7 +84,7 @@ async fn a_report_dropped_by_the_entry_bound_is_announced_as_dropped() {
         if hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != JobStatus::Running)
         {
             break;
         }
@@ -120,7 +120,9 @@ async fn a_report_dropped_by_the_entry_bound_is_announced_as_dropped() {
     let listed = hub.listing();
     assert_eq!(listed.len(), 40, "every child must stay listed");
     assert!(
-        listed.iter().all(|(_, _, s, _)| *s == JobStatus::Completed),
+        listed
+            .iter()
+            .all(|(_, _, s, _, _)| *s == JobStatus::Completed),
         "every child must be recorded as completed"
     );
 }
@@ -405,7 +407,7 @@ async fn the_parent_turn_absorbs_a_finished_report_into_its_context() {
         if hub
             .listing()
             .iter()
-            .any(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .any(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -617,7 +619,7 @@ async fn a_huge_child_report_is_bounded_before_it_enters_the_parent_context() {
         if hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -704,7 +706,7 @@ async fn a_report_cut_at_a_multibyte_character_stays_valid_utf8() {
         if hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -787,7 +789,7 @@ async fn finished_reports_do_not_accumulate_without_bound() {
             .hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -802,13 +804,13 @@ async fn finished_reports_do_not_accumulate_without_bound() {
     );
     assert!(
         jobs.iter()
-            .all(|(_, _, s, _)| *s == subagent::JobStatus::Completed),
+            .all(|(_, _, s, _, _)| *s == subagent::JobStatus::Completed),
         "releasing a report must not disturb the job's status"
     );
 
     let retained: usize = jobs
         .iter()
-        .filter_map(|(_, _, _, r)| r.as_ref().map(|r| r.len()))
+        .filter_map(|(_, _, _, r, _)| r.as_ref().map(|r| r.len()))
         .sum();
     assert!(
         retained <= 64 * 1024,
@@ -865,7 +867,7 @@ async fn the_retention_bound_covers_the_undelivered_queue_too() {
             .hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -877,7 +879,7 @@ async fn the_retention_bound_covers_the_undelivered_queue_too() {
         .hub
         .listing()
         .iter()
-        .filter_map(|(_, _, _, r)| r.as_ref().map(|r| r.len()))
+        .filter_map(|(_, _, _, r, _)| r.as_ref().map(|r| r.len()))
         .sum();
     // One drain, held: calling it twice would measure an emptied queue the second time.
     let (delivered, _dropped) = fx.hub.drain_reports();
@@ -950,7 +952,7 @@ async fn the_retention_bound_holds_for_every_report_size() {
                 .hub
                 .listing()
                 .iter()
-                .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+                .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
             {
                 break;
             }
@@ -961,7 +963,7 @@ async fn the_retention_bound_holds_for_every_report_size() {
             .hub
             .listing()
             .iter()
-            .filter_map(|(_, _, _, r)| r.as_ref().map(|r| r.len()))
+            .filter_map(|(_, _, _, r, _)| r.as_ref().map(|r| r.len()))
             .sum();
         let queued: usize = fx
             .hub
@@ -1014,7 +1016,7 @@ async fn eviction_stops_once_the_survivors_fit_the_budget() {
             .hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -1025,7 +1027,7 @@ async fn eviction_stops_once_the_survivors_fit_the_budget() {
         .hub
         .listing()
         .iter()
-        .filter_map(|(_, _, _, r)| r.clone())
+        .filter_map(|(_, _, _, r, _)| r.clone())
         .collect();
     let kept = survivors.len();
     let retained: usize = survivors.iter().map(|r| r.len()).sum();
@@ -1071,7 +1073,7 @@ async fn an_injected_report_says_so_when_its_text_was_released() {
             .hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -1175,7 +1177,7 @@ async fn a_released_report_is_reported_as_released_not_as_silence() {
             .hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -1247,7 +1249,7 @@ async fn steering_past_capacity_is_refused_loudly_never_silently_dropped() {
         if f.hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -1310,7 +1312,7 @@ async fn the_listing_keeps_the_newest_outcome_when_it_is_truncated() {
             .hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -1372,7 +1374,7 @@ async fn a_named_child_can_be_read_even_when_the_full_listing_is_truncated() {
             .hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -1457,7 +1459,7 @@ async fn a_named_read_uses_the_full_output_budget_not_the_listing_clip() {
             .hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -1531,7 +1533,7 @@ async fn a_named_read_past_the_output_bound_admits_truncation() {
             .hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -1583,7 +1585,7 @@ async fn a_clipped_listing_points_at_the_named_read_that_recovers_it() {
             .hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -1628,7 +1630,7 @@ async fn a_negative_id_is_answered_as_unknown_not_as_an_unfiltered_listing() {
         if f.hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
         {
             break;
         }
@@ -1774,7 +1776,7 @@ async fn a_drop_notice_only_promises_reads_that_will_work() {
         if hub
             .listing()
             .iter()
-            .all(|(_, _, s, _)| *s != JobStatus::Running)
+            .all(|(_, _, s, _, _)| *s != JobStatus::Running)
         {
             break;
         }
@@ -1817,7 +1819,7 @@ async fn a_drop_notice_only_promises_reads_that_will_work() {
             .filter_map(|t| t.trim().parse::<u64>().ok())
         {
             promised += 1;
-            let readable = listed.iter().any(|(i, _, _, r)| *i == id && r.is_some());
+            let readable = listed.iter().any(|(i, _, _, r, _)| *i == id && r.is_some());
             assert!(
                 readable,
                 "the notice told the model to read #{id}, but its report was released: {note}"
@@ -1826,7 +1828,7 @@ async fn a_drop_notice_only_promises_reads_that_will_work() {
     }
     // In this shape both bounds fire, so there is nothing left to recover: the notice
     // must say that plainly rather than sending the model after released text.
-    let released = listed.iter().filter(|(_, _, _, r)| r.is_none()).count();
+    let released = listed.iter().filter(|(_, _, _, r, _)| r.is_none()).count();
     if released > 0 {
         assert!(
             note.contains("no longer readable"),
@@ -1886,7 +1888,7 @@ async fn a_drop_notice_decides_readability_when_it_is_built_not_when_dropped() {
             if hub
                 .listing()
                 .iter()
-                .all(|(_, _, s, _)| *s != JobStatus::Running)
+                .all(|(_, _, s, _, _)| *s != JobStatus::Running)
             {
                 return;
             }
@@ -1910,7 +1912,9 @@ async fn a_drop_notice_decides_readability_when_it_is_built_not_when_dropped() {
     );
     let listed_a = hub.listing();
     for (id, recorded_readable) in &dropped_a {
-        let actually_readable = listed_a.iter().any(|(i, _, _, r)| i == id && r.is_some());
+        let actually_readable = listed_a
+            .iter()
+            .any(|(i, _, _, r, _)| i == id && r.is_some());
         assert_eq!(
             *recorded_readable, actually_readable,
             "the notice's claim about #{id} must match what background_list can return now \
@@ -1944,7 +1948,9 @@ async fn a_drop_notice_decides_readability_when_it_is_built_not_when_dropped() {
     );
     let listed_b = hub.listing();
     for (id, recorded_readable) in &dropped_b {
-        let actually_readable = listed_b.iter().any(|(i, _, _, r)| i == id && r.is_some());
+        let actually_readable = listed_b
+            .iter()
+            .any(|(i, _, _, r, _)| i == id && r.is_some());
         assert_eq!(
             *recorded_readable, actually_readable,
             "the notice's claim about #{id} must match what background_list can return now \
@@ -1993,7 +1999,7 @@ async fn one_report_larger_than_the_budget_is_still_delivered() {
                 .hub
                 .listing()
                 .iter()
-                .all(|(_, _, s, _)| *s != subagent::JobStatus::Running)
+                .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
             {
                 break;
             }
@@ -2055,7 +2061,7 @@ async fn the_retention_peak_is_twice_the_budget_or_the_newest_report() {
             if hub
                 .listing()
                 .iter()
-                .all(|(_, _, s, _)| *s != loon_core::subagent::JobStatus::Running)
+                .all(|(_, _, s, _, _)| *s != loon_core::subagent::JobStatus::Running)
             {
                 return;
             }
@@ -2078,7 +2084,7 @@ async fn the_retention_peak_is_twice_the_budget_or_the_newest_report() {
     let listed: usize = hub
         .listing()
         .iter()
-        .filter_map(|(_, _, _, r)| r.as_ref().map(|r| r.len()))
+        .filter_map(|(_, _, _, r, _)| r.as_ref().map(|r| r.len()))
         .sum();
     let (delivered, _dropped) = hub.drain_reports();
     let queued: usize = delivered.iter().map(|(_, _, _, t)| t.len()).sum();
@@ -2106,7 +2112,7 @@ async fn the_retention_peak_is_twice_the_budget_or_the_newest_report() {
     let newest_len = hub2
         .listing()
         .iter()
-        .filter_map(|(_, _, _, r)| r.as_ref().map(|r| r.len()))
+        .filter_map(|(_, _, _, r, _)| r.as_ref().map(|r| r.len()))
         .sum::<usize>();
     assert!(
         newest_len > BUDGET,
@@ -2166,7 +2172,7 @@ async fn the_drop_notice_is_bounded_even_when_many_children_finish() {
             if hub
                 .listing()
                 .iter()
-                .all(|(_, _, s, _)| *s != JobStatus::Running)
+                .all(|(_, _, s, _, _)| *s != JobStatus::Running)
             {
                 break;
             }
@@ -2299,7 +2305,7 @@ async fn the_recovery_the_notice_names_actually_reaches_the_hidden_reports() {
             if hub
                 .listing()
                 .iter()
-                .all(|(_, _, s, _)| *s != JobStatus::Running)
+                .all(|(_, _, s, _, _)| *s != JobStatus::Running)
             {
                 break;
             }
@@ -2373,8 +2379,8 @@ async fn the_recovery_the_notice_names_actually_reaches_the_hidden_reports() {
         let expected = hub
             .listing()
             .into_iter()
-            .find(|(i, _, _, _)| i == id)
-            .and_then(|(_, _, _, r)| r)
+            .find(|(i, _, _, _, _)| i == id)
+            .and_then(|(_, _, _, r, _)| r)
             .unwrap_or_else(|| panic!("#{id} was named as readable but the hub has no report"));
         let probe: String = expected.chars().take(20).collect();
         let out = tools
@@ -2396,8 +2402,8 @@ async fn the_recovery_the_notice_names_actually_reaches_the_hidden_reports() {
     let readable_ids: Vec<u64> = hub
         .listing()
         .iter()
-        .filter(|(_, _, _, r)| r.is_some())
-        .map(|(i, _, _, _)| *i)
+        .filter(|(_, _, _, r, _)| r.is_some())
+        .map(|(i, _, _, _, _)| *i)
         .collect();
     let mut hidden: Vec<u64> = readable_ids;
     for id in &named {
@@ -2673,4 +2679,64 @@ async fn a_child_agent_inherits_the_evidence_and_tool_rules() {
         child_system.contains("Prefer the dedicated tool over a shell equivalent"),
         "the child must prefer dedicated tools as well"
     );
+}
+
+/// A running job reports how long it has run: the parent (and the user's live panel) need
+/// "3s means wait, 10m means steer or kill", which a bare "running" cannot give.
+#[tokio::test]
+async fn a_running_job_reports_elapsed_seconds() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let hub = BackgroundHub::new();
+
+    // The child sleeps briefly, so it is genuinely "running" when we check.
+    let child_registry = Arc::new(ProviderRegistry::with_mock(MockProvider::with_scripts(
+        vec![MockScript::new(vec![
+            MockStep::Delay(std::time::Duration::from_millis(400)),
+            MockStep::Text("done".into()),
+        ])],
+    )));
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let tools =
+        subagent::default_tools_with_hub(&paths, &ws, &cfg(), child_registry, None, hub.clone());
+    let ctx = tool_ctx(&ws);
+    tools
+        .get("background_spawn")
+        .unwrap()
+        .run(json!({"task": "slow job"}), &ctx)
+        .await
+        .expect("spawn succeeds");
+
+    // Immediately after spawn: running, with a small elapsed count.
+    let running = hub.running();
+    assert_eq!(running.len(), 1, "{running:?}");
+    let (id, label, secs) = running[0].clone();
+    assert!(secs <= 2, "freshly spawned: {secs}s");
+    assert_eq!(label, "slow job");
+
+    // `listing()` carries the same elapsed figure for the finished read.
+    for _ in 0..200 {
+        if hub
+            .listing()
+            .iter()
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let finished = hub.listing();
+    assert_eq!(finished.len(), 1);
+    assert!(
+        finished[0].4 <= 5,
+        "elapsed is frozen at completion, not growing: {:?}",
+        finished[0]
+    );
+    assert!(
+        hub.running().is_empty(),
+        "finished jobs leave the live view"
+    );
+    let _ = id;
 }

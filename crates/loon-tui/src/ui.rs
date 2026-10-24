@@ -17,6 +17,8 @@ use unicode_width::UnicodeWidthChar;
 const MAX_INPUT_LINES: usize = 8;
 /// Most queued prompts previewed above the input; the status bar carries the count.
 const MAX_QUEUE_ROWS: usize = 3;
+/// Most running background subagents shown in the live panel; the rest become a count.
+const MAX_AGENT_ROWS: u16 = 4;
 
 pub fn draw(f: &mut Frame, app: &mut App) {
     draw_inner(f, app);
@@ -49,12 +51,28 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
     // Queued prompts sit as dim rows directly above the prompt, so what is waiting is
     // visible instead of hidden behind a counter in the status bar. The budget also covers
     // the separator rule and, when prompts are clipped, the "+N earlier" line.
+    // Running background subagents get one row each (capped), above the queued prompts:
+    // a parent that spawned three children needs to see all three, with how long each has
+    // run, without asking the model to call background_list.
+    let running: Vec<(u64, String, u64)> = app
+        .background
+        .as_ref()
+        .map(|hub| hub.running())
+        .unwrap_or_default();
+    let agent_rows = (running.len() as u16).min(MAX_AGENT_ROWS);
+    let agent_overflow = running.len() as u16 > agent_rows;
+
     let queued_visible = (app.queued.len() as u16).min(MAX_QUEUE_ROWS as u16);
     let queued_overflow = app.queued.len() as u16 > queued_visible;
-    let queue_rows = if queued_visible == 0 {
+    let queue_rows = if queued_visible == 0 && agent_rows == 0 {
         0
     } else {
-        (queued_visible + 1 + u16::from(queued_overflow)).min(spare.saturating_sub(transcript_min))
+        let rows = queued_visible
+            + 1
+            + u16::from(queued_overflow)
+            + agent_rows
+            + u16::from(agent_overflow);
+        rows.min(spare.saturating_sub(transcript_min))
     };
     let popup_rows = desired_popup.min(spare.saturating_sub(transcript_min + queue_rows));
     let [transcript, queue, popup, input, footer] = Layout::vertical([
@@ -141,6 +159,24 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
                 clip_cells(&overflow, queue.width as usize),
                 theme.dim(),
             )));
+        }
+        // Running subagents first, oldest spawn at the top, with elapsed seconds so a
+        // stalled child is visible at a glance. Dim accent: live, but not user input.
+        if agent_rows > 0 {
+            let shown = running.len().min(MAX_AGENT_ROWS as usize);
+            for (id, label, secs) in running.iter().take(shown) {
+                rows.push(Line::from(Span::styled(
+                    clip_cells(&format!("⏳ #{id} {label} · {secs}s"), queue.width as usize),
+                    theme.dim(),
+                )));
+            }
+            if agent_overflow {
+                let more = running.len() - shown;
+                rows.push(Line::from(Span::styled(
+                    clip_cells(&format!("⏳ +{more} more agents"), queue.width as usize),
+                    theme.dim(),
+                )));
+            }
         }
         for text in app.queued.iter().skip(skip) {
             let first = text.lines().next().unwrap_or("");
