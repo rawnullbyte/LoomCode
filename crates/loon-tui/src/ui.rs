@@ -251,7 +251,28 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
     {
         app.input_view_start += 1;
     }
-    let shown: Vec<Line> = if app.input.is_empty() && app.tips {
+    let shown: Vec<Line> = if let Some(search) = &app.history_search {
+        // Reverse search is open: the prompt row becomes the search line, so it is visible
+        // that typing goes to the query rather than to the prompt. The whole row is clipped
+        // to the frame: on a narrow terminal the hint is dropped, never the query.
+        let matches = app.history_search_matches().len();
+        let status = if matches == 0 {
+            "no match".to_string()
+        } else {
+            format!("{matches} match{}", if matches == 1 { "" } else { "es" })
+        };
+        let label = "reverse-i-search › ";
+        let hint = format!("  ({status} · Ctrl+R older · Esc cancel)");
+        let width = input.width as usize;
+        let query_room = width.saturating_sub(label.chars().count());
+        let query = clip_cells(&search.query, query_room);
+        let used = label.chars().count() + query.chars().count();
+        vec![Line::from(vec![
+            Span::styled(label, theme.accent_bold()),
+            Span::styled(query, theme.base()),
+            Span::styled(clip_cells(&hint, width.saturating_sub(used)), theme.dim()),
+        ])]
+    } else if app.input.is_empty() && app.tips {
         vec![Line::from(vec![
             Span::styled(prompt.clone(), theme.accent_bold()),
             Span::styled(

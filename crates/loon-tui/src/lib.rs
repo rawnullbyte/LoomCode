@@ -19,6 +19,7 @@ use crossterm::event::{Event as CtEvent, EventStream, KeyCode, KeyEvent, KeyModi
 use futures::StreamExt;
 pub mod autocomplete;
 pub mod banner;
+pub mod history;
 pub mod queue;
 
 use loon_core::{Agent, AgentConfig, AgentEvent, TurnStatus};
@@ -32,6 +33,17 @@ use tokio::sync::{mpsc, Mutex};
 /// Most sent prompts kept for Up/Down recall. Enough for a long session's recent
 /// work without unbounded memory growth.
 pub const SENT_HISTORY_LIMIT: usize = 100;
+
+/// State for the Ctrl+R reverse search over prompt history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HistorySearch {
+    /// The text typed since the search opened; matching is a substring, case-insensitive.
+    pub query: String,
+    /// Index into `sent_history` of the match being shown, searching from the newest.
+    pub index: usize,
+    /// The draft that was in the input when the search opened, restored on cancel.
+    pub saved_input: String,
+}
 
 #[derive(Debug, Clone)]
 pub enum UiCommand {
@@ -153,6 +165,12 @@ pub struct App {
     /// The draft the user had typed before starting to browse `sent_history`
     /// with Up; restored when Down walks back past the newest entry.
     pub history_draft: Option<String>,
+    /// Where to persist `sent_history` so recall survives a restart. `None` keeps
+    /// history in memory only (tests, and any host without a state directory).
+    pub history_file: Option<std::path::PathBuf>,
+    /// Ctrl+R reverse search: the query typed since it opened, and which match of the
+    /// history is currently shown. `None` means the search is not open.
+    pub history_search: Option<HistorySearch>,
     /// Esc was pressed once while busy; the next Esc is a hard stop.
     pub cancel_armed: bool,
     /// Selected row in the slash-command popup; reset on input change.
@@ -249,6 +267,8 @@ impl App {
             sent_history: Vec::new(),
             history_pos: None,
             history_draft: None,
+            history_file: None,
+            history_search: None,
             cancel_armed: false,
             completion_selected: 0,
             popup_dismissed: false,
@@ -411,6 +431,13 @@ impl App {
             self.sent_history.remove(0);
         }
         self.sent_history.push(text.to_string());
+        // Persist so the next launch can recall it. Best-effort: a failure here must never
+        // affect sending the prompt itself.
+        if let Some(path) = &self.history_file {
+            if let Some(dir) = path.parent() {
+                crate::history::append(dir, text);
+            }
+        }
     }
 
     /// Up steps into the history when the caret is on the first input line; on any
@@ -477,6 +504,119 @@ impl App {
             self.show_recalled(draft);
         }
         true
+    }
+
+    /// Open Ctrl+R reverse search over the sent history, saving the current draft so Esc
+    /// can restore it. With an empty history there is nothing to search, so it reports
+    /// that it did not open.
+    pub fn open_history_search(&mut self) -> bool {
+        if self.sent_history.is_empty() {
+            return false;
+        }
+        let newest = self.sent_history.len() - 1;
+        self.history_search = Some(HistorySearch {
+            query: String::new(),
+            index: newest,
+            saved_input: self.input.clone(),
+        });
+        // Show the newest entry straight away, as a shell does: Ctrl+R is "the last prompt"
+        // before it is anything else, and an empty query matches everything anyway.
+        self.input = self.sent_history[newest].clone();
+        self.cursor = self.input.chars().count();
+        true
+    }
+
+    /// The history entries matching the open search, newest first. An empty query matches
+    /// everything, which is what makes Ctrl+R a plain "show me my last prompts".
+    pub fn history_search_matches(&self) -> Vec<usize> {
+        let Some(search) = &self.history_search else {
+            return Vec::new();
+        };
+        let needle = search.query.to_lowercase();
+        self.sent_history
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, text)| needle.is_empty() || text.to_lowercase().contains(&needle))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Show the current match in the input. When the query matches nothing, the previously
+    /// shown match is kept: an empty result must not blank the prompt the user is looking at
+    /// while they finish typing the query.
+    fn sync_history_search(&mut self, previous: String) {
+        let matches = self.history_search_matches();
+        let Some(&newest) = matches.first() else {
+            // Restore whatever was displayed before this keystroke.
+            self.input = previous;
+            self.cursor = self.input.chars().count();
+            return;
+        };
+        if let Some(search) = &mut self.history_search {
+            search.index = newest;
+            let text = self.sent_history[newest].clone();
+            self.input = text;
+            self.cursor = self.input.chars().count();
+        }
+    }
+
+    /// Add a character to the reverse-search query.
+    pub fn history_search_push(&mut self, c: char) {
+        let previous = self.input.clone();
+        if let Some(search) = &mut self.history_search {
+            search.query.push(c);
+            search.index = self.sent_history.len().saturating_sub(1);
+        }
+        self.sync_history_search(previous);
+    }
+
+    /// Backspace in the reverse-search query.
+    pub fn history_search_backspace(&mut self) {
+        let previous = self.input.clone();
+        if let Some(search) = &mut self.history_search {
+            search.query.pop();
+            search.index = self.sent_history.len().saturating_sub(1);
+        }
+        self.sync_history_search(previous);
+    }
+
+    /// Ctrl+R again: step to the next older match.
+    pub fn history_search_older(&mut self) -> bool {
+        let matches = self.history_search_matches();
+        let Some(search) = &mut self.history_search else {
+            return false;
+        };
+        if search.index == 0 {
+            return false;
+        }
+        // Walk to the next-older matching entry.
+        let Some(pos) = matches.iter().position(|&i| i == search.index) else {
+            return false;
+        };
+        let Some(&next) = matches.get(pos + 1) else {
+            return false;
+        };
+        search.index = next;
+        let text = self.sent_history[next].clone();
+        self.input = text;
+        self.cursor = self.input.chars().count();
+        true
+    }
+
+    /// Enter: accept the shown match and close the search.
+    pub fn history_search_accept(&mut self) {
+        if self.history_search.take().is_some() {
+            self.cursor = self.input.chars().count();
+        }
+    }
+
+    /// Esc: close the search and put back exactly what was being typed before it opened.
+    pub fn history_search_cancel(&mut self) {
+        if let Some(search) = self.history_search.take() {
+            self.input = search.saved_input;
+            self.cursor = self.input.chars().count();
+        }
     }
 
     /// Commands matching the current input (popup contents), or empty when hidden.
@@ -554,7 +694,9 @@ impl App {
         self.selection_snapshot = None;
         self.queued.clear();
         self.queue_paused = false;
-        self.sent_history.clear();
+        // Prompt history is deliberately NOT cleared: it lives in the state directory and
+        // is shared across sessions, the way shell history is. Clearing it here would only
+        // hide it until the next launch, since the file still holds it.
         self.history_pos = None;
         self.history_draft = None;
         self.status.busy = false;
@@ -1025,6 +1167,13 @@ async fn run_inner(
         cwd: cwd.display().to_string(),
     };
     let mut app = App::new(transparent, status);
+    // Prompt history survives a restart: recall is far less useful if quitting erases it.
+    // Loading is best-effort — a missing or unreadable file just means no history yet.
+    app.history_file = Some(history::history_path(&paths.state_dir));
+    app.sent_history = history::load(&paths.state_dir);
+    // The in-memory list is a view of the recent tail; keep it bounded the same way.
+    let keep = app.sent_history.len().saturating_sub(SENT_HISTORY_LIMIT);
+    app.sent_history.drain(..keep);
     if let Ok((loaded, _)) = loon_config::Config::load_effective(paths, &cwd) {
         app.palette = loaded.appearance.palette;
         app.settings_effort = loaded.session.effort.unwrap_or("medium".into());
@@ -1423,6 +1572,35 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         return;
     }
     if key.code == KeyCode::Esc && key.kind == crossterm::event::KeyEventKind::Repeat {
+        return;
+    }
+    // Ctrl+R reverse search is a modal prompt-line mode: while it is open, printable keys
+    // extend the query rather than the prompt, and Enter/Esc commit or abandon it. Handled
+    // before everything else so a stray shortcut cannot fire mid-search.
+    if app.history_search.is_some() {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            // Ctrl+R again walks to the next older match, as in a shell.
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                app.history_search_older();
+            }
+            KeyCode::Backspace => app.history_search_backspace(),
+            KeyCode::Esc if plain => app.history_search_cancel(),
+            KeyCode::Enter | KeyCode::Tab if plain => app.history_search_accept(),
+            KeyCode::Char(c) if plain => app.history_search_push(c),
+            _ => {}
+        }
+        return;
+    }
+    // Ctrl+R opens the search (the shell binding users reach for).
+    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        if !app.open_history_search() {
+            app.push_block(Block::System(
+                "no prompt history yet — send a prompt first".into(),
+            ));
+        }
         return;
     }
     // A double-Esc stop is armed by one Esc and disarmed by anything else.
@@ -2614,15 +2792,182 @@ mod prompt_history_tests {
         );
     }
 
-    /// `/new` starts a fresh session: history from the previous one must not leak
-    /// into the new conversation.
+    /// Prompt history is shared across sessions, like shell history: it is stored in the
+    /// state directory, so wiping it on `/new` would only hide it until the next launch
+    /// while the file still held it. A session switch must keep it recallable, and must
+    /// reset the browsing position so Down does not walk into the previous session's entry.
     #[test]
-    fn switching_sessions_clears_the_history() {
+    fn switching_sessions_keeps_the_history_but_resets_browsing() {
         let mut app = app_with_history(&["old session prompt"]);
         app.set_session_blocks(std::iter::empty());
-        assert!(app.sent_history.is_empty());
-        assert!(app.history_pos.is_none());
-        assert!(!app.recall_previous(), "nothing to recall after /new");
+        assert_eq!(
+            app.sent_history,
+            vec!["old session prompt".to_string()],
+            "history survives the switch"
+        );
+        assert!(app.history_pos.is_none(), "browsing position resets");
+        assert!(
+            app.recall_previous(),
+            "the prompt is still recallable in the new session"
+        );
+        assert_eq!(app.input, "old session prompt");
+    }
+
+    /// Persistence: a prompt recorded in one launch must be recallable in the next. The
+    /// history lives in the state directory, so this is what makes recall survive a restart
+    /// rather than only the current process.
+    #[test]
+    fn a_recorded_prompt_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::history::history_path(dir.path());
+
+        // First "launch": record two prompts through the real submit path.
+        let mut first = super::tests::app_for_test();
+        first.history_file = Some(path.clone());
+        first.sent_history = crate::history::load(dir.path());
+        first.record_sent("keep this prompt");
+        first.record_sent("and this one");
+
+        // Second "launch": a fresh App loading the same state directory.
+        let mut second = super::tests::app_for_test();
+        second.history_file = Some(path);
+        second.sent_history = crate::history::load(dir.path());
+
+        assert_eq!(
+            second.sent_history,
+            vec!["keep this prompt".to_string(), "and this one".to_string()],
+            "the next launch must see both prompts"
+        );
+        assert!(second.recall_previous());
+        assert_eq!(second.input, "and this one");
+    }
+
+    /// A prompt sent a moment ago must come back after quitting and reopening, which is the
+    /// user-visible promise of persistence.
+    #[tokio::test]
+    async fn a_prompt_sent_before_quitting_is_recallable_after_reopening() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = crate::history::history_path(dir.path());
+        let (tx, _rx) = mpsc::channel::<UiCommand>(8);
+
+        let mut first = super::tests::app_for_test();
+        first.history_file = Some(path.clone());
+        first.input = "the prompt I quit after".into();
+        first.cursor = first.input.chars().count();
+        handle_key(&mut first, key(KeyCode::Enter, KeyModifiers::NONE), &tx).await;
+
+        let mut second = super::tests::app_for_test();
+        second.history_file = Some(path);
+        second.sent_history = crate::history::load(dir.path());
+        assert!(second.recall_previous(), "history must survive the restart");
+        assert_eq!(second.input, "the prompt I quit after");
+    }
+
+    /// Ctrl+R is the binding people reach for; it must search the history rather than do
+    /// nothing, and typing must go to the query, not the prompt.
+    #[tokio::test]
+    async fn ctrl_r_searches_history_and_enter_accepts() {
+        let mut app = app_with_history(&[
+            "cargo test --workspace",
+            "explain the parser",
+            "cargo build --release",
+        ]);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        assert!(app.history_search.is_some(), "Ctrl+R must open the search");
+
+        // Typing narrows to the cargo entries, newest first.
+        for c in "cargo".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE).await;
+        }
+        assert_eq!(app.input, "cargo build --release", "newest match first");
+        assert_eq!(
+            app.history_search.as_ref().unwrap().query,
+            "cargo",
+            "the query holds what was typed"
+        );
+
+        // Enter accepts the shown prompt and closes the search.
+        press(&mut app, KeyCode::Enter, KeyModifiers::NONE).await;
+        assert!(app.history_search.is_none(), "Enter closes the search");
+        assert_eq!(app.input, "cargo build --release");
+    }
+
+    /// Esc must restore exactly what was being typed, so opening the search by accident
+    /// never loses the draft.
+    #[tokio::test]
+    async fn escaping_the_search_restores_the_draft() {
+        let mut app = app_with_history(&["an old prompt"]);
+        app.input = "my half-written draft".into();
+        app.cursor = app.input.chars().count();
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        press(&mut app, KeyCode::Char('o'), KeyModifiers::NONE).await;
+        assert!(app.history_search.is_some());
+        press(&mut app, KeyCode::Esc, KeyModifiers::NONE).await;
+        assert!(app.history_search.is_none());
+        assert_eq!(app.input, "my half-written draft", "the draft comes back");
+        assert_eq!(app.cursor, app.input.chars().count());
+    }
+
+    /// A second Ctrl+R walks to the next older match, like a shell.
+    #[tokio::test]
+    async fn a_second_ctrl_r_walks_older() {
+        let mut app = app_with_history(&["cargo one", "cargo two", "cargo three"]);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        for c in "cargo".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE).await;
+        }
+        assert_eq!(app.input, "cargo three");
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        assert_eq!(app.input, "cargo two", "the older match");
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        assert_eq!(app.input, "cargo one");
+        // At the oldest match there is nowhere older to go.
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        assert_eq!(app.input, "cargo one", "stays put");
+    }
+
+    /// Backspace edits the query and re-runs the search.
+    #[tokio::test]
+    async fn backspace_edits_the_search_query() {
+        let mut app = app_with_history(&["alpha", "beta"]);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        press(&mut app, KeyCode::Char('b'), KeyModifiers::NONE).await;
+        assert_eq!(app.input, "beta");
+        press(&mut app, KeyCode::Backspace, KeyModifiers::NONE).await;
+        assert_eq!(app.history_search.as_ref().unwrap().query, "");
+        assert_eq!(app.input, "beta", "an empty query shows the newest entry");
+    }
+
+    /// A query that matches nothing must not blank the prompt the user is looking at.
+    #[tokio::test]
+    async fn a_query_with_no_matches_keeps_the_current_text() {
+        let mut app = app_with_history(&["alpha", "beta"]);
+        press(&mut app, KeyCode::Char('r'), KeyModifiers::CONTROL).await;
+        for c in "zzz".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE).await;
+        }
+        assert_eq!(app.input, "beta", "the last match stays visible");
+        assert!(app.history_search_matches().is_empty());
+    }
+
+    /// With no history at all, Ctrl+R explains itself instead of silently doing nothing.
+    #[tokio::test]
+    async fn ctrl_r_without_history_explains_itself() {
+        let mut app = super::tests::app_for_test();
+        let (tx, _rx) = mpsc::channel(8);
+        handle_key(
+            &mut app,
+            key(KeyCode::Char('r'), KeyModifiers::CONTROL),
+            &tx,
+        )
+        .await;
+        assert!(app.history_search.is_none());
+        assert!(
+            app.blocks
+                .iter()
+                .any(|b| matches!(b, Block::System(s) if s.contains("no prompt history"))),
+            "the user must be told why nothing happened"
+        );
     }
 
     /// The queue still wins on an empty input: that text never ran, so editing it
