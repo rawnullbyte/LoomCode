@@ -210,71 +210,89 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
         } else {
             style
         };
+        // Block-level prose structure, decided from the whole logical line so a wrapped
+        // continuation keeps the same treatment as its first row.
+        let line_class = if markdown && !code && !fence {
+            prose_line_class(trimmed)
+        } else {
+            ProseLine::Body
+        };
+        let quote_prefix = if line_class == ProseLine::Quote {
+            Some(indent.clone())
+        } else {
+            None
+        };
+        // A wrapped list item continues under its text, not under the bullet, so the
+        // continuation reads as part of the item rather than a new line. The bullet is part
+        // of the wrapped source, so its width has to be measured from the line to align.
+        let continuation_indent = if line_class == ProseLine::ListItem {
+            format!("{indent}{}", " ".repeat(list_marker_width(trimmed)))
+        } else {
+            indent.clone()
+        };
         let highlighted = (code && !fence).then(|| crate::code::highlight(para, lang));
         let mut code_offset = 0;
         for (i, raw) in wrap(para, avail).into_iter().enumerate() {
             let lead = if first {
                 marker.clone()
             } else {
-                indent.clone()
+                continuation_indent.clone()
             };
             first = false;
+            // A quote gets a dim rule down its left edge on every row, so a wrapped quote
+            // still reads as quoted.
+            let lead = match &quote_prefix {
+                Some(base) => format!("{base}│ "),
+                None => lead,
+            };
             rows.push(TranscriptRow {
                 line: Line::from({
                     let mut spans = vec![Span::styled(lead, style)];
                     let text = display(&raw);
-                    // A diff line is unambiguous whatever the surrounding prose is:
-                    // colour it before any inline-code splitting can hide the prefix.
-                    let diff = if code || fence {
-                        None
+                    if line_class == ProseLine::Rule {
+                        // `---` is a horizontal rule: draw one across the frame rather than
+                        // showing the literal dashes.
+                        spans.push(Span::styled("─".repeat(avail), theme::system_fg()));
                     } else {
-                        diff_style(&text)
-                    };
-                    if let Some(diff) = diff {
-                        spans.push(Span::styled(text, diff));
-                    } else if markdown && !code && !fence {
-                        let mut inline = false;
-                        for (i, part) in text.split('`').enumerate() {
-                            if i > 0 {
-                                spans.push(Span::styled("`", theme::accent_fg()));
-                                inline = !inline;
-                            }
-                            spans.push(Span::styled(
-                                part.to_string(),
-                                if inline {
-                                    theme::accent_fg()
-                                } else {
-                                    body_style
-                                },
-                            ));
-                        }
-                    } else if code && !fence {
-                        // Real syntax highlighting inside a fenced block: keywords,
-                        // strings, numbers and comments are separated by language, so
-                        // a Rust block does not read like a wall of one colour.
-                        let mut column = 0;
-                        for (piece, style) in crate::code::slice(
-                            highlighted.as_ref().unwrap(),
-                            code_offset,
-                            raw.chars().count(),
-                        ) {
-                            let mut shown = String::new();
-                            for ch in piece.chars() {
-                                let n = cells(ch, column);
-                                if ch == '\t' {
-                                    shown.push_str(&" ".repeat(n));
-                                } else {
-                                    shown.push(ch);
+                        // A diff line is unambiguous whatever the surrounding prose is:
+                        // colour it before any inline-code splitting can hide the prefix.
+                        let diff = if code || fence {
+                            None
+                        } else {
+                            diff_style(&text)
+                        };
+                        if let Some(diff) = diff {
+                            spans.push(Span::styled(text, diff));
+                        } else if markdown && !code && !fence {
+                            push_inline_markdown(&mut spans, &text, body_style, line_class);
+                        } else if code && !fence {
+                            // Real syntax highlighting inside a fenced block: keywords,
+                            // strings, numbers and comments are separated by language, so
+                            // a Rust block does not read like a wall of one colour.
+                            let mut column = 0;
+                            for (piece, style) in crate::code::slice(
+                                highlighted.as_ref().unwrap(),
+                                code_offset,
+                                raw.chars().count(),
+                            ) {
+                                let mut shown = String::new();
+                                for ch in piece.chars() {
+                                    let n = cells(ch, column);
+                                    if ch == '\t' {
+                                        shown.push_str(&" ".repeat(n));
+                                    } else {
+                                        shown.push(ch);
+                                    }
+                                    column += n;
                                 }
-                                column += n;
+                                spans.push(Span::styled(shown, style));
                             }
-                            spans.push(Span::styled(shown, style));
+                        } else {
+                            // Diff lines inside prose keep their own colour: a pasted patch
+                            // in an answer reads like a patch.
+                            let line_style = diff_style(&text).unwrap_or(body_style);
+                            spans.push(Span::styled(text, line_style));
                         }
-                    } else {
-                        // Diff lines inside prose keep their own colour: a pasted patch
-                        // in an answer reads like a patch.
-                        let line_style = diff_style(&text).unwrap_or(body_style);
-                        spans.push(Span::styled(text, line_style));
                     }
                     spans
                 }),
@@ -288,6 +306,177 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
             code = !code;
         }
     }
+}
+
+/// Block-level kind of a prose line, decided from the whole logical line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProseLine {
+    /// An ordinary paragraph line.
+    Body,
+    /// `- `, `* `, `+ ` or `1. `: a list item.
+    ListItem,
+    /// `> `: a quotation.
+    Quote,
+    /// `---`, `***`, `___`: a horizontal rule.
+    Rule,
+}
+
+/// Classify one prose line. Only used outside fenced blocks, so a `---` inside a code block
+/// stays literal (and, in a diff, stays a file header).
+fn prose_line_class(trimmed: &str) -> ProseLine {
+    if is_rule(trimmed) {
+        return ProseLine::Rule;
+    }
+    if trimmed.starts_with("> ") || trimmed == ">" {
+        return ProseLine::Quote;
+    }
+    if is_list_item(trimmed) {
+        return ProseLine::ListItem;
+    }
+    ProseLine::Body
+}
+
+/// `---`, `***` or `___` on their own line (three or more), which is a horizontal rule.
+fn is_rule(trimmed: &str) -> bool {
+    let t = trimmed.trim_end();
+    t.len() >= 3
+        && (t.chars().all(|c| c == '-')
+            || t.chars().all(|c| c == '*')
+            || t.chars().all(|c| c == '_'))
+}
+
+/// Display width of a list marker at the start of `trimmed` (`"- "` → 2, `"12. "` → 4).
+fn list_marker_width(trimmed: &str) -> usize {
+    for marker in ["- ", "* ", "+ "] {
+        if trimmed.starts_with(marker) {
+            return cell_width(marker);
+        }
+    }
+    let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        let rest = &trimmed[digits.len()..];
+        if rest.starts_with(". ") || rest.starts_with(") ") {
+            return digits.len() + 2;
+        }
+    }
+    0
+}
+
+/// `- item`, `* item`, `1. item`, `1) item`. A bare `-` or `*` with nothing after it is not a
+/// list item, and `-` at the start of a diff line never reaches here (diffs are classified
+/// earlier).
+fn is_list_item(trimmed: &str) -> bool {
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(rest) = trimmed.strip_prefix(marker) {
+            if !rest.trim().is_empty() {
+                return true;
+            }
+        }
+    }
+    // An ordered item: digits, then `.` or `)`, then whitespace.
+    let digits: String = trimmed.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if !digits.is_empty() {
+        let rest = &trimmed[digits.len()..];
+        if let Some(after) = rest.strip_prefix(". ").or_else(|| rest.strip_prefix(") ")) {
+            return !after.trim().is_empty();
+        }
+    }
+    false
+}
+
+/// Emit inline-markdown spans for one display line.
+///
+/// Every branch pushes the literal source text, in order, with only its *style* changed —
+/// the same rule the inline-code splitter followed. `TranscriptRow::raw` is what copy uses,
+/// and the selection highlight maps columns onto these spans, so dropping or reordering a
+/// character here would corrupt a paste or misplace a selection.
+fn push_inline_markdown(spans: &mut Vec<Span<'static>>, text: &str, body: Style, class: ProseLine) {
+    let base = match class {
+        ProseLine::Quote => theme::system_fg(),
+        // A list marker is accent so the structure is visible; the item text stays body.
+        ProseLine::ListItem | ProseLine::Body | ProseLine::Rule => body,
+    };
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    let mut plain = String::new();
+    macro_rules! flush {
+        () => {
+            if !plain.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut plain), base));
+            }
+        };
+    }
+    while i < chars.len() {
+        // Inline code: `` `code` `` — backticks included, so copy matches the source.
+        if chars[i] == '`' {
+            if let Some(end) = (i + 1..chars.len()).find(|&j| chars[j] == '`') {
+                flush!();
+                let span: String = chars[i..=end].iter().collect();
+                spans.push(Span::styled(span.clone(), theme::accent_fg()));
+                i = end + 1;
+                continue;
+            }
+        }
+        // Bold: `**text**`.
+        if chars[i] == '*' && chars.get(i + 1) == Some(&'*') {
+            if let Some(end) = find_closing(&chars, i + 2, "**") {
+                flush!();
+                let span: String = chars[i..end + 2].iter().collect();
+                spans.push(Span::styled(span, base.add_modifier(Modifier::BOLD)));
+                i = end + 2;
+                continue;
+            }
+        }
+        // Italic: `*text*` or `_text_`, but not `_` inside a word (`snake_case`).
+        if chars[i] == '*' || chars[i] == '_' {
+            let marker = chars[i];
+            let word_boundary = marker != '_' || i == 0 || !chars[i - 1].is_alphanumeric();
+            if word_boundary {
+                if let Some(end) = find_closing(&chars, i + 1, &marker.to_string()) {
+                    if end > i + 1 {
+                        flush!();
+                        let span: String = chars[i..=end].iter().collect();
+                        spans.push(Span::styled(span, base.add_modifier(Modifier::ITALIC)));
+                        i = end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // A link: `[text](url)` — the text is accent, the URL dim. Nothing is dropped.
+        if chars[i] == '[' {
+            if let Some(close) = (i + 1..chars.len()).find(|&j| chars[j] == ']') {
+                if chars.get(close + 1) == Some(&'(') {
+                    if let Some(paren) = (close + 2..chars.len()).find(|&j| chars[j] == ')') {
+                        flush!();
+                        let label: String = chars[i..=close].iter().collect();
+                        let url: String = chars[close + 1..=paren].iter().collect();
+                        spans.push(Span::styled(label, theme::accent_fg()));
+                        spans.push(Span::styled(url, theme::system_fg()));
+                        i = paren + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        plain.push(chars[i]);
+        i += 1;
+    }
+    flush!();
+}
+
+/// Find the index of the opening char of `marker` after `from`, or `None` if it never closes
+/// on this line. `from` is a char index; the returned index is the marker's first char.
+fn find_closing(chars: &[char], from: usize, marker: &str) -> Option<usize> {
+    let m: Vec<char> = marker.chars().collect();
+    let mut i = from;
+    while i + m.len() <= chars.len() {
+        if chars[i..i + m.len()] == m[..] {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Style for one visual line of a diff, or `None` when it is not a diff line.
@@ -1290,6 +1479,191 @@ mod tool_group_visibility_tests {
             out.contains("could not compile"),
             "a failing call must stay visible: {out}"
         );
+    }
+}
+
+#[cfg(test)]
+/// Prose rendering: block structure (lists, quotes, rules) and inline emphasis (bold,
+/// italic, links). The hard rule for every one of these is that the rendered text still
+/// reassembles to the source, because that is what copy and the selection highlight use.
+#[cfg(test)]
+mod prose_rendering_tests {
+    use super::*;
+
+    fn prose_app(text: &str) -> crate::App {
+        let mut app = crate::tests::app_for_test();
+        app.blocks.clear();
+        app.blocks.push(crate::Block::Assistant(text.into()));
+        app
+    }
+
+    fn rows_text(app: &crate::App) -> Vec<String> {
+        app.transcript_lines(70)
+            .iter()
+            .map(|l| l.to_string())
+            .collect()
+    }
+
+    /// The rendered row text must still contain every source character, in order: a copy
+    /// from the transcript must reproduce what the model wrote.
+    #[test]
+    fn prose_still_contains_its_source_text() {
+        for source in [
+            "plain **bold** text",
+            "a *italic* word",
+            "`inline code` here",
+            "see [docs](https://example.com) now",
+            "- a list item",
+            "> a quote",
+            "1. ordered",
+        ] {
+            let app = prose_app(source);
+            let joined = rows_text(&app).join("\n");
+            // Strip the rendered row markers so only the content remains.
+            for piece in source.split_whitespace() {
+                assert!(
+                    joined.contains(piece),
+                    "{piece:?} from {source:?} is missing: {joined:?}"
+                );
+            }
+        }
+    }
+
+    /// Bold and italic must be *attributes*, not background fills: a background would
+    /// break the transparent-mode invariant.
+    #[test]
+    fn emphasis_uses_attributes_not_backgrounds() {
+        let app = prose_app("a **bold** and *italic* line");
+        let mut saw_bold = false;
+        let mut saw_italic = false;
+        for line in app.transcript_rows(70) {
+            for span in &line.line.spans {
+                if span.content.contains("bold") {
+                    assert!(span.style.add_modifier.contains(Modifier::BOLD), "{span:?}");
+                    // Reset is the transparent invariant, not a real fill.
+                    assert!(
+                        matches!(span.style.bg, None | Some(ratatui::style::Color::Reset)),
+                        "emphasis must not paint a background: {span:?}"
+                    );
+                    saw_bold = true;
+                }
+                if span.content.contains("italic") {
+                    assert!(
+                        span.style.add_modifier.contains(Modifier::ITALIC),
+                        "{span:?}"
+                    );
+                    assert!(matches!(
+                        span.style.bg,
+                        None | Some(ratatui::style::Color::Reset)
+                    ));
+                    saw_italic = true;
+                }
+            }
+        }
+        assert!(saw_bold && saw_italic, "both forms must render");
+    }
+
+    /// A horizontal rule is drawn as a line, not shown as its literal dashes.
+    #[test]
+    fn a_rule_draws_a_line() {
+        let app = prose_app("above\n\n---\n\nbelow");
+        let joined = rows_text(&app).join("\n");
+        assert!(joined.contains('─'), "the rule is drawn: {joined:?}");
+        assert!(
+            !joined.contains("---"),
+            "the literal dashes are replaced: {joined:?}"
+        );
+        assert!(joined.contains("above") && joined.contains("below"));
+    }
+
+    /// A `---` inside a fenced block is not a rule: in a diff it is a file header, and in
+    /// code it is literal text.
+    #[test]
+    fn a_rule_inside_a_fence_is_not_a_rule() {
+        let app = prose_app("```diff\n--- a/file.rs\n+++ b/file.rs\n```");
+        let joined = rows_text(&app).join("\n");
+        assert!(
+            joined.contains("--- a/file.rs"),
+            "a diff header must stay literal: {joined:?}"
+        );
+    }
+
+    /// A quote gets a left rule on every row, so a wrapped quote still reads as quoted.
+    #[test]
+    fn a_wrapped_quote_keeps_its_rule_on_every_row() {
+        let long = "> ".to_string() + &"word ".repeat(40);
+        let app = prose_app(&long);
+        let quoted: Vec<String> = rows_text(&app)
+            .into_iter()
+            .filter(|l| l.contains("word"))
+            .collect();
+        assert!(quoted.len() > 1, "the quote must wrap: {quoted:?}");
+        for row in &quoted {
+            assert!(row.contains('│'), "every row keeps the rule: {row:?}");
+        }
+    }
+
+    /// A wrapped list item is indented under its text, so the continuation is visually part
+    /// of the item.
+    #[test]
+    fn a_wrapped_list_item_aligns_under_its_text() {
+        let item = format!("- {}", "content ".repeat(30));
+        let app = prose_app(&item);
+        let rows: Vec<String> = rows_text(&app)
+            .into_iter()
+            .filter(|l| l.contains("content"))
+            .collect();
+        assert!(rows.len() > 1, "the item must wrap: {rows:?}");
+        // Measured in display cells, not bytes: `str::find` returns byte offsets and the
+        // row marker (`●`) is multi-byte, so byte offsets would compare the wrong thing.
+        let col = |row: &str, needle: &str| -> usize {
+            row.find(needle)
+                .map(|b| cell_width(&row[..b]))
+                .expect("needle present")
+        };
+        let bullet = col(&rows[0], "-");
+        let first_text = col(&rows[0], "content");
+        let cont_text = col(&rows[1], "content");
+        assert_eq!(bullet + 2, first_text, "`- ` is two cells: {rows:#?}");
+        assert_eq!(
+            first_text, cont_text,
+            "the continuation aligns under the item text: {rows:#?}"
+        );
+    }
+
+    /// `snake_case` must not be read as `_emphasis_`: an underscore inside a word is not a
+    /// marker, or every identifier in prose would turn italic.
+    #[test]
+    fn underscores_inside_words_are_not_emphasis() {
+        let app = prose_app("the snake_case_name stays plain");
+        for line in app.transcript_rows(70) {
+            for span in &line.line.spans {
+                if span.content.contains("snake_case_name") {
+                    assert!(
+                        !span.style.add_modifier.contains(Modifier::ITALIC),
+                        "an in-word underscore must not italicise: {span:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Unclosed markers are left literal rather than swallowing the rest of the line.
+    #[test]
+    fn unclosed_markers_stay_literal() {
+        for source in [
+            "a **bold with no close",
+            "an *italic with no close",
+            "[link with no url",
+        ] {
+            let app = prose_app(source);
+            let joined = rows_text(&app).join("\n");
+            let tail = source.split(' ').next_back().unwrap();
+            assert!(
+                joined.contains(tail),
+                "{source:?} must render literally: {joined:?}"
+            );
+        }
     }
 }
 
