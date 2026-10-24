@@ -21,6 +21,10 @@ pub struct Theme {
     fg_warn: Color,
     #[allow(dead_code)] // used by member_fg helper consumers in a later milestone
     fg_member: Color,
+    /// Function/method names in highlighted code. A distinct slot rather than reusing
+    /// accent: `normalize_line` maps both `Cyan` and `Magenta` to accent, so without a
+    /// separate colour a keyword and a function call render identically.
+    fg_fn: Color,
 }
 
 impl Theme {
@@ -36,6 +40,9 @@ impl Theme {
                 fg_err: Color::Red,
                 fg_warn: Color::Yellow,
                 fg_member: Color::Yellow,
+                // Blue is a distinct ANSI slot, so a function name stands apart from a
+                // keyword (Magenta → accent) even in a plain terminal.
+                fg_fn: Color::Blue,
             },
             AppearanceMode::Opaque => Theme {
                 transparent: false,
@@ -47,6 +54,7 @@ impl Theme {
                 fg_err: Color::Rgb(240, 113, 120),
                 fg_warn: Color::Rgb(235, 203, 139),
                 fg_member: Color::Rgb(235, 203, 139),
+                fg_fn: Color::Rgb(158, 190, 226),
             },
         }
     }
@@ -67,6 +75,7 @@ impl Theme {
                     t.fg_ok = Color::Rgb(25, 117, 66);
                     t.fg_err = Color::Rgb(184, 38, 56);
                     t.fg_warn = Color::Rgb(146, 101, 0);
+                    t.fg_fn = Color::Rgb(124, 58, 150);
                 }
                 "violet" => {
                     t.bg = Color::Rgb(25, 23, 37);
@@ -74,6 +83,7 @@ impl Theme {
                     t.fg_dim = Color::Rgb(151, 142, 171);
                     t.fg_accent = Color::Rgb(188, 155, 246);
                     t.fg_ok = Color::Rgb(149, 213, 178);
+                    t.fg_fn = Color::Rgb(126, 200, 227);
                 }
                 "ember" => {
                     t.bg = Color::Rgb(32, 25, 22);
@@ -81,18 +91,21 @@ impl Theme {
                     t.fg_dim = Color::Rgb(161, 145, 127);
                     t.fg_accent = Color::Rgb(240, 176, 109);
                     t.fg_ok = Color::Rgb(162, 204, 151);
+                    t.fg_fn = Color::Rgb(200, 160, 200);
                 }
                 "graphite" => {
                     t.bg = Color::Rgb(20, 22, 25);
                     t.fg_base = Color::Rgb(222, 228, 235);
                     t.fg_dim = Color::Rgb(139, 151, 167);
                     t.fg_accent = Color::Rgb(158, 190, 226);
+                    t.fg_fn = Color::Rgb(190, 160, 220);
                 }
                 "ocean" => {
                     t.bg = Color::Rgb(14, 28, 40);
                     t.fg_base = Color::Rgb(214, 231, 239);
                     t.fg_accent = Color::Rgb(91, 218, 200);
                     t.fg_warn = Color::Rgb(240, 200, 120);
+                    t.fg_fn = Color::Rgb(140, 170, 240);
                 }
                 _ => {}
             }
@@ -122,6 +135,28 @@ impl Theme {
     }
     pub fn warn(&self) -> Style {
         self.bg(Style::default().fg(self.fg_warn))
+    }
+    /// Function/method names in highlighted code.
+    pub fn func(&self) -> Style {
+        self.bg(Style::default().fg(self.fg_fn))
+    }
+    /// Type/trait names: accent, italic, so it reads apart from a keyword without a new
+    /// colour. Attributes (bold) and comments (italic) use the same trick.
+    pub fn type_style(&self) -> Style {
+        self.bg(Style::default()
+            .fg(self.fg_accent)
+            .add_modifier(Modifier::ITALIC))
+    }
+    /// `#[derive]`, `@decorator`: warn, bold.
+    pub fn attribute(&self) -> Style {
+        self.bg(Style::default()
+            .fg(self.fg_warn)
+            .add_modifier(Modifier::BOLD))
+    }
+    /// Operators and punctuation: dim, so structure is visible without competing with
+    /// keywords.
+    pub fn punctuation(&self) -> Style {
+        self.bg(Style::default().fg(self.fg_dim))
     }
     /// Permission-mode colour: bypass red, auto yellow, ask green, allowlist accent.
     pub fn mode_style(&self, mode: &str) -> Style {

@@ -199,9 +199,13 @@ fn push_text(rows: &mut Vec<TranscriptRow>, marker: &str, text: &str, style: Sty
                 crate::code::Lang::from_tag(trimmed.trim_start_matches(['`', '~']))
             };
         }
+        // `#` heading styling belongs to prose only. Inside a fenced block a `#` line is an
+        // attribute or preprocessor directive (`#[derive]`, `#include`), and a markdown
+        // heading rule applied there would paint the whole line as a heading and hide the
+        // syntax colouring the fence asked for.
         let body_style = if markdown && (fence || code) {
             theme::tool_ok_fg()
-        } else if markdown && trimmed.starts_with('#') {
+        } else if markdown && trimmed.starts_with('#') && !trimmed.starts_with("#[") {
             theme::accent_fg().add_modifier(Modifier::BOLD)
         } else {
             style

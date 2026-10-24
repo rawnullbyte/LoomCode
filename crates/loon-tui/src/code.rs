@@ -213,10 +213,30 @@ impl Lang {
             Lang::Sql | Lang::Diff | Lang::Plain => &['"', '\''],
         }
     }
+
+    /// True when `#`-prefixed text is an attribute or preprocessor directive rather than a
+    /// comment: Rust (`#[derive]`), C/C++/C# (`#include`, `#pragma`), SQL (`#temp` tables).
+    /// Python and Shell use `#` for comments, so treating it as an attribute there would
+    /// colour every comment as an attribute.
+    fn attribute_hash(self) -> bool {
+        matches!(self, Lang::Rust | Lang::JavaScript | Lang::Sql)
+    }
+
+    /// True when `@name` is a decorator or annotation: Python and JavaScript/TypeScript.
+    /// Not Rust, where `@` is a pattern binding, and not Shell, where it is part of a
+    /// variable expansion.
+    fn attribute_at(self) -> bool {
+        matches!(self, Lang::Python | Lang::JavaScript)
+    }
 }
 
 /// Colours for one highlighted line. Kept as free functions so the transcript can use
 /// them without threading a theme through the lexer.
+///
+/// These are ANSI *slots*, not final colours: `ui::normalize_line` translates each one onto
+/// the active palette at render time (Magenta/Cyan→accent, Green→ok, Blue→function colour,
+/// Yellow→warn, DarkGray→dim). That indirection is what makes highlighting follow the
+/// palette, so a new class must reuse an existing slot rather than invent an RGB value.
 pub fn keyword_style() -> Style {
     Style::default()
         .fg(Color::Magenta)
@@ -226,13 +246,37 @@ pub fn string_style() -> Style {
     Style::default().fg(Color::Green)
 }
 pub fn comment_style() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::ITALIC)
 }
 pub fn number_style() -> Style {
     Style::default().fg(Color::Yellow)
 }
 pub fn plain_style() -> Style {
     Style::default().fg(Color::Reset)
+}
+/// A function or method name — the identifier before `(`. `Blue` translates to the palette's
+/// dedicated function colour, so a call site reads apart from a keyword.
+pub fn func_style() -> Style {
+    Style::default().fg(Color::Blue)
+}
+/// A type, trait or constant: accent + italic, distinct from a keyword (accent + bold)
+/// without spending another colour slot.
+pub fn type_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::ITALIC)
+}
+/// `#[derive(...)]`, `@decorator`, `#include`: warn + bold.
+pub fn attribute_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+/// Operators and punctuation: dim, so structure is legible without competing with keywords.
+pub fn punctuation_style() -> Style {
+    Style::default().fg(Color::DarkGray)
 }
 
 /// One highlighted span: text plus its style.
@@ -343,7 +387,11 @@ pub fn highlight(line: &str, lang: Lang) -> Vec<Piece> {
         if chars[i].is_ascii_digit() && (i == 0 || !is_word(chars[i - 1])) {
             flush!();
             let mut text = String::new();
-            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') {
+            // A leading-dot float (`.5`) and underscores in literals (`1_000`) are part of
+            // the number; both are common and would otherwise split the token.
+            while i < chars.len()
+                && (chars[i].is_ascii_alphanumeric() || chars[i] == '.' || chars[i] == '_')
+            {
                 text.push(chars[i]);
                 i += 1;
             }
@@ -351,24 +399,79 @@ pub fn highlight(line: &str, lang: Lang) -> Vec<Piece> {
             continue;
         }
 
-        // Identifiers: keywords get their own style, everything else stays plain.
+        // Attributes and decorators: `#[derive(..)]`, `@Component`, `#include <x.h>`.
+        // Checked before identifiers so the marker is coloured with its name, and before
+        // punctuation so `#` does not become a lone dim glyph.
+        if chars[i] == '#' && i + 1 < chars.len() && (chars[i + 1] == '[' || lang.attribute_hash())
+        {
+            flush!();
+            let mut text = String::new();
+            text.push('#');
+            i += 1;
+            while i < chars.len() && chars[i] != ']' && chars[i] != '\n' {
+                text.push(chars[i]);
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == ']' {
+                text.push(']');
+                i += 1;
+            }
+            out.push((text, attribute_style()));
+            continue;
+        }
+        if chars[i] == '@' && lang.attribute_at() {
+            flush!();
+            let mut text = String::new();
+            text.push('@');
+            i += 1;
+            while i < chars.len() && (is_word(chars[i]) || chars[i] == '.' || chars[i] == ':') {
+                text.push(chars[i]);
+                i += 1;
+            }
+            out.push((text, attribute_style()));
+            continue;
+        }
+
+        // Identifiers: keywords, types and function names each get their own style so a
+        // line of code is readable rather than keywords-on-a-slab-of-plain.
         if is_word(chars[i]) {
             let start = i;
             while i < chars.len() && is_word(chars[i]) {
                 i += 1;
             }
             let word: String = chars[start..i].iter().collect();
-            if lang.keywords().contains(&word.as_str())
+            let is_keyword = lang.keywords().contains(&word.as_str())
                 || (lang == Lang::Sql
                     && lang
                         .keywords()
-                        .contains(&word.to_ascii_lowercase().as_str()))
-            {
+                        .contains(&word.to_ascii_lowercase().as_str()));
+            if is_keyword {
                 flush!();
                 out.push((word, keyword_style()));
+            } else if looks_like_type(&word) {
+                // UpperCamelCase and SCREAMING_CASE read as a type, trait or constant.
+                flush!();
+                out.push((word, type_style()));
+            } else if next_nonspace_is_open_paren(&chars, i) {
+                // A call site: the name before `(`, which is what makes code scannable.
+                flush!();
+                out.push((word, func_style()));
             } else {
                 buf.push_str(&word);
             }
+            continue;
+        }
+
+        // Operators and punctuation in a dim colour: braces, arrows and `::` show structure
+        // without shouting over the keywords.
+        if is_punctuation(chars[i]) && !chars[i].is_whitespace() {
+            flush!();
+            let start = i;
+            while i < chars.len() && is_punctuation(chars[i]) && !chars[i].is_whitespace() {
+                i += 1;
+            }
+            let text: String = chars[start..i].iter().collect();
+            out.push((text, punctuation_style()));
             continue;
         }
 
@@ -377,6 +480,67 @@ pub fn highlight(line: &str, lang: Lang) -> Vec<Piece> {
     }
     flush!();
     coalesce(out)
+}
+
+/// True when the identifier is conventionally a type, trait or constant: it starts with an
+/// uppercase letter, or is entirely uppercase with underscores (`MAX_BYTES`). A single
+/// uppercase letter is left alone because `T` in a generic is indistinguishable from a
+/// one-letter variable and colouring it as a type is more confusing than helpful.
+fn looks_like_type(word: &str) -> bool {
+    let mut chars = word.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_uppercase() {
+        return false;
+    }
+    if word.chars().count() == 1 {
+        return false;
+    }
+    true
+}
+
+/// True when the next non-space character after `from` is `(` — i.e. this identifier is
+/// being called. Bounded by the line, so the scan stays linear.
+fn next_nonspace_is_open_paren(chars: &[char], from: usize) -> bool {
+    let mut j = from;
+    while j < chars.len() && (chars[j] == ' ' || chars[j] == '\t') {
+        j += 1;
+    }
+    chars.get(j) == Some(&'(')
+}
+
+/// Characters rendered in the dim punctuation colour. Whitespace is excluded so runs of
+/// spaces stay plain and a leading indent never picks up a colour.
+fn is_punctuation(c: char) -> bool {
+    matches!(
+        c,
+        '{' | '}'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '<'
+            | '>'
+            | ','
+            | ';'
+            | ':'
+            | '='
+            | '+'
+            | '-'
+            | '*'
+            | '/'
+            | '%'
+            | '!'
+            | '&'
+            | '|'
+            | '^'
+            | '~'
+            | '?'
+            | '.'
+            | '@'
+            | '#'
+    )
 }
 
 pub fn slice(pieces: &[Piece], start: usize, len: usize) -> Vec<Piece> {
@@ -566,6 +730,148 @@ mod cost_tests {
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "highlighting 20 x 4.4k chars took {elapsed:?}; it must stay linear"
+        );
+    }
+}
+
+/// The new token classes must stay distinguishable. Two things could silently break that:
+/// a new class reusing a colour another class already has *with the same weight*, and a
+/// colour that `ui::normalize_line` does not translate (which would pass through raw and be
+/// remapped by some terminals).
+#[cfg(test)]
+mod token_class_tests {
+    use super::*;
+
+    /// Every class the lexer can emit, so a new one cannot be added without being checked.
+    fn classes() -> Vec<(&'static str, Style)> {
+        vec![
+            ("keyword", keyword_style()),
+            ("func", func_style()),
+            ("type", type_style()),
+            ("string", string_style()),
+            ("number", number_style()),
+            ("attribute", attribute_style()),
+            ("punctuation", punctuation_style()),
+            ("comment", comment_style()),
+            ("plain", plain_style()),
+        ]
+    }
+
+    /// Only these ANSI slots may be emitted. Anything else reaches `normalize_line`'s
+    /// fall-through arm and renders as a raw 8-bit colour that some terminals remap.
+    #[test]
+    fn every_class_uses_a_translated_colour_slot() {
+        for (name, style) in classes() {
+            let fg = style.fg.expect("a class must set a foreground");
+            assert!(
+                matches!(
+                    fg,
+                    Color::Reset
+                        | Color::Cyan
+                        | Color::Magenta
+                        | Color::Green
+                        | Color::Red
+                        | Color::Yellow
+                        | Color::DarkGray
+                        | Color::Blue
+                ),
+                "{name} uses {fg:?}, which ui::normalize_line does not translate"
+            );
+        }
+    }
+
+    /// No two classes may look identical: a shared colour is only acceptable when the
+    /// weight or slant differs, or the two would be indistinguishable on screen.
+    #[test]
+    fn no_two_classes_render_identically() {
+        let all = classes();
+        for (i, (an, a)) in all.iter().enumerate() {
+            for (bn, b) in all.iter().skip(i + 1) {
+                assert!(
+                    a != b,
+                    "{an} and {bn} have identical styles, so they cannot be told apart"
+                );
+            }
+        }
+    }
+
+    /// A function name is distinguished by colour, not only by weight (that is the whole
+    /// point of adding the palette slot).
+    #[test]
+    fn a_function_name_differs_from_a_keyword_by_colour() {
+        let k = keyword_style();
+        let f = func_style();
+        assert_ne!(k.fg, f.fg, "func must not reuse the keyword colour");
+        assert!(f.fg != keyword_style().fg && f.fg != string_style().fg);
+    }
+
+    /// `#[derive(..)]` and `@decorator` are attributes; a plain `# comment` in Python or
+    /// Shell is not, or every comment in those languages would colour as an attribute.
+    #[test]
+    fn attributes_are_not_confused_with_comments() {
+        let rust = highlight("#[derive(Debug)]", Lang::Rust);
+        assert!(
+            rust.iter().any(|(_, s)| *s == attribute_style()),
+            "a Rust attribute must be styled as one: {rust:?}"
+        );
+        let py = highlight("# a comment", Lang::Python);
+        assert!(
+            py.iter().all(|(_, s)| *s != attribute_style()),
+            "a Python comment must not be an attribute: {py:?}"
+        );
+        assert!(py.iter().any(|(_, s)| *s == comment_style()));
+        let at = highlight("@app.route(\"/\")", Lang::Python);
+        assert!(
+            at.iter().any(|(_, s)| *s == attribute_style()),
+            "a Python decorator must be styled as one: {at:?}"
+        );
+    }
+
+    /// The identifier before `(` is a call, so it gets the function colour; a bare word does
+    /// not, or every variable would look like a function.
+    #[test]
+    fn call_sites_are_functions_but_bare_names_are_not() {
+        let call = highlight("parse(input)", Lang::Rust);
+        assert!(
+            call.iter().any(|(t, s)| t == "parse" && *s == func_style()),
+            "{call:?}"
+        );
+        let bare = highlight("let total = 1;", Lang::Rust);
+        assert!(
+            bare.iter().all(|(_, s)| *s != func_style()),
+            "a plain identifier must not be a function: {bare:?}"
+        );
+    }
+
+    /// UpperCamelCase and SCREAMING_CASE read as types/constants; lowercase names do not.
+    #[test]
+    fn types_and_constants_are_recognised() {
+        for line in ["let x: Result<()>", "const MAX_BYTES = 1;"] {
+            let pieces = highlight(line, Lang::Rust);
+            assert!(
+                pieces.iter().any(|(_, s)| *s == type_style()),
+                "{line:?} should carry a type-styled word: {pieces:?}"
+            );
+        }
+        let lower = highlight("let total = 1;", Lang::Rust);
+        assert!(lower.iter().all(|(_, s)| *s != type_style()), "{lower:?}");
+        // A single uppercase letter is a generic parameter, not a type worth colouring.
+        let single = highlight("fn f<T>(x: T)", Lang::Rust);
+        assert!(
+            !single.iter().any(|(t, s)| t == "T" && *s == type_style()),
+            "one-letter generics are left plain: {single:?}"
+        );
+    }
+
+    /// Punctuation is dimmed, but a run of spaces is not punctuation — an indent must not
+    /// pick up a colour.
+    #[test]
+    fn indentation_is_not_punctuation() {
+        let pieces = highlight("    let x = 1;", Lang::Rust);
+        let leading = pieces.first().expect("pieces");
+        assert!(
+            !leading.0.starts_with(' ') || leading.1 != punctuation_style(),
+            "the indent must not be styled as punctuation: {pieces:?}"
         );
     }
 }

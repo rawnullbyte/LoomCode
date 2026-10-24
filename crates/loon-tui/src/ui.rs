@@ -386,6 +386,9 @@ fn normalize_line(mut line: Line<'static>, theme: &theme::Theme) -> Line<'static
     let base = theme.base();
     line.style = base;
     for span in &mut line.spans {
+        // Every colour the lexer can emit MUST be translated here. The match ends with
+        // `color => color`, so an unmapped colour passes through raw — and terminals that
+        // remap 8-bit palette entries (kitty) would render it as something else entirely.
         span.style.fg = match span.style.fg {
             Some(Color::Reset) => base.fg,
             Some(Color::Cyan | Color::Magenta) => theme.accent().fg,
@@ -393,6 +396,7 @@ fn normalize_line(mut line: Line<'static>, theme: &theme::Theme) -> Line<'static
             Some(Color::Red) => theme.err().fg,
             Some(Color::Yellow) => theme.warn().fg,
             Some(Color::DarkGray) => theme.dim().fg,
+            Some(Color::Blue) => theme.func().fg,
             color => color,
         };
         span.style.bg = base.bg;

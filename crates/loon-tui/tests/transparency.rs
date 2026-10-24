@@ -125,3 +125,75 @@ fn a02_theme_is_the_only_style_source() {
     assert_eq!(t.base().bg, Some(Color::Reset));
     assert_eq!(t.err().bg, Some(Color::Reset));
 }
+
+/// Syntax highlighting emits ANSI slots that `ui::normalize_line` translates onto the
+/// palette at render time. That indirection is what makes code follow the chosen theme, so
+/// two things must hold for every palette: the translation covers every slot the lexer can
+/// emit, and the translated colours stay distinguishable from each other.
+#[test]
+fn every_palette_translates_syntax_slots_to_distinct_colours() {
+    use loon_tui::code;
+    use loon_tui::theme::Theme;
+    use ratatui::style::Color;
+
+    // The classes the lexer emits, in the order the lexer uses them.
+    let classes = [
+        ("keyword", code::keyword_style()),
+        ("func", code::func_style()),
+        ("type", code::type_style()),
+        ("string", code::string_style()),
+        ("number", code::number_style()),
+        ("attribute", code::attribute_style()),
+        ("punctuation", code::punctuation_style()),
+        ("comment", code::comment_style()),
+    ];
+
+    for palette in [
+        "terminal", "dark", "light", "ocean", "violet", "ember", "graphite",
+    ] {
+        let t = Theme::from_palette(palette, palette == "terminal");
+        // Mirror of `normalize_line`'s foreground translation.
+        let translate = |fg: Color| match fg {
+            Color::Reset => t.base().fg,
+            Color::Cyan | Color::Magenta => t.accent().fg,
+            Color::Green => t.ok().fg,
+            Color::Blue => t.func().fg,
+            Color::Yellow => t.warn().fg,
+            Color::DarkGray => t.dim().fg,
+            // `normalize_line` passes anything else through untouched, which would be a raw
+            // 8-bit colour on a terminal that remaps palette entries.
+            other => Some(other),
+        };
+
+        let mut resolved: Vec<(String, Option<Color>, ratatui::style::Modifier)> = Vec::new();
+        for (name, style) in &classes {
+            let fg = style.fg.expect("every class sets a foreground");
+            resolved.push(((*name).to_string(), translate(fg), style.add_modifier));
+        }
+
+        // The lexer must not emit a slot the palette mapping does not know about: an
+        // untranslated slot is a colour that ignores the theme.
+        for (name, fg, _modifier) in &resolved {
+            assert!(
+                fg.is_some(),
+                "{palette}: {name} did not translate to a palette colour"
+            );
+        }
+
+        // Distinctness: colour plus weight/slant. Two classes that agree on both are
+        // indistinguishable on screen.
+        let mut seen: Vec<(Option<Color>, ratatui::style::Modifier)> = Vec::new();
+        for (name, fg, modifier) in &resolved {
+            assert!(
+                !seen.contains(&(*fg, *modifier)),
+                "{palette}: {name} renders identically to another class ({fg:?} {modifier:?})"
+            );
+            seen.push((*fg, *modifier));
+        }
+        assert!(
+            seen.len() >= 5,
+            "{palette}: expected at least five distinguishable token styles, got {}",
+            seen.len()
+        );
+    }
+}
