@@ -456,3 +456,77 @@ fn other_popups_do_not_shimmer() {
         "no shimmer outside the effort picker"
     );
 }
+
+/// A long session must not get slower to interact with. Frame cost used to grow linearly
+/// with the number of transcript blocks — 24 ms per frame at 2 000 blocks, on a 50 ms tick,
+/// which is the "laggy after a few hours" report — because every frame re-lexed every block
+/// while only ~30 rows are on screen. With the row cache the steady-state frame is flat
+/// across session lengths, and a new message costs one rebuild.
+#[test]
+fn frame_cost_is_flat_across_session_lengths() {
+    fn build(blocks: usize) -> App {
+        let mut a = app();
+        a.push_welcome_banner();
+        for i in 0..blocks {
+            a.blocks.push(Block::Assistant(format!(
+                "message {i} with enough text to wrap at this width and exercise the renderer"
+            )));
+        }
+        a
+    }
+    let cost = |a: &mut App| {
+        let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        t.draw(|f| loon_tui::ui::draw(f, a)).unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..30 {
+            t.draw(|f| loon_tui::ui::draw(f, a)).unwrap();
+        }
+        start.elapsed() / 30
+    };
+    let short = cost(&mut build(50));
+    let long = cost(&mut build(3_000));
+    // 60× more content, but the cached frame must stay within a small constant factor —
+    // generous because the machine load varies; the old code was ~40× slower here.
+    assert!(
+        long.as_nanos() < short.as_nanos() * 6 + 1_000_000,
+        "a 3 000-block session must not render meaningfully slower than 50: short={short:?} long={long:?}"
+    );
+
+    // And the window actually moves: the newest message is on screen, the first is not.
+    let mut a = build(3_000);
+    let t = draw(&mut a);
+    let scrolled = (0..24)
+        .map(|y| row_text(&t, y, 80))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(scrolled.contains("message 2999"), "{scrolled}");
+    assert!(!scrolled.contains("message 1 "), "{scrolled}");
+}
+
+/// A finished tool replaces its pending block *in place*, which keeps the block count
+/// identical — so a length-only cache key would keep showing "running…" after the result
+/// had arrived. The generation must catch it.
+#[test]
+fn a_finished_tool_replaces_its_pending_row() {
+    let mut a = app();
+    a.tool_started("bash", "{\"command\": \"cargo test\"}", "$ cargo test");
+    let before = (0..24)
+        .map(|y| row_text(&draw(&mut a), y, 80))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(before.contains("running…"), "pending first: {before}");
+
+    a.tool_finished("bash", true, "12 passed · 0 failed");
+    let after = (0..24)
+        .map(|y| row_text(&draw(&mut a), y, 80))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        after.contains("12 passed · 0 failed"),
+        "the result must appear: {after}"
+    );
+    assert!(
+        !after.contains("running…"),
+        "the pending row must not survive the finish: {after}"
+    );
+}

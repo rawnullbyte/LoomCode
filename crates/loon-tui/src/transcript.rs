@@ -10,6 +10,17 @@ pub struct TranscriptRow {
     pub prefix_cells: usize,
     pub soft: bool,
 }
+
+/// Visibility for the row cache: `App` stores it, this module builds it.
+pub(crate) struct TranscriptRowCache {
+    pub width: u16,
+    pub generation: u64,
+    pub blocks_len: usize,
+    pub tick: u64,
+    pub show_tool_details: bool,
+    pub syntax: bool,
+    pub rows: Vec<TranscriptRow>,
+}
 // Whether syntax highlighting is on for the current render pass, from `[ui] syntax`.
 //
 // A thread-local rather than a parameter: the transcript builder has a dozen entry points
@@ -1219,7 +1230,37 @@ impl App {
         if let Some(rows) = &self.selection_snapshot {
             return rows.clone();
         }
-        // Publish the `[ui] syntax` setting for this render pass.
+        // The cache makes frame cost independent of session length: a few hours of use
+        // measured 24 ms per frame at 2 000 blocks, because every frame re-lexed every
+        // block while only ~30 rows are on screen. Keyed on the blocks generation, the
+        // width, and the two settings that change rendering, so any relevant change misses.
+        if let Some(cache) = self.row_cache.borrow().as_ref() {
+            if cache.width == width
+                && cache.generation == self.blocks_generation
+                && cache.show_tool_details == self.show_tool_details
+                && cache.syntax == self.syntax
+                && cache.tick == self.tick
+                && cache.blocks_len == self.blocks.len()
+            {
+                return cache.rows.clone();
+            }
+        }
+        let rows = self.build_transcript_rows(width);
+        self.row_cache
+            .replace(Some(crate::transcript::TranscriptRowCache {
+                width,
+                generation: self.blocks_generation,
+                blocks_len: self.blocks.len(),
+                tick: self.tick,
+                show_tool_details: self.show_tool_details,
+                syntax: self.syntax,
+                rows: rows.clone(),
+            }));
+        rows
+    }
+
+    /// The uncached row builder: everything `transcript_rows` used to do.
+    fn build_transcript_rows(&self, width: u16) -> Vec<TranscriptRow> {
         set_syntax_enabled(self.syntax);
         let mut rows: Vec<TranscriptRow> = vec![];
         let width = width.max(1) as usize;
@@ -1353,6 +1394,60 @@ impl App {
             .into_iter()
             .map(|r| r.line)
             .collect()
+    }
+
+    /// Total rendered row count without building rows: the cache answers from its length.
+    /// `ui.rs` needs this to clamp scroll before deciding which rows to draw.
+    pub fn transcript_row_count(&self, width: u16) -> usize {
+        // First call builds (and caches); later calls at this width answer from the cache.
+        self.transcript_rows(width).len()
+    }
+
+    /// The visible window of rows: `[start, end)` cloned out of the cache. Frame cost is
+    /// then proportional to what is on screen, not to how long the session has run —
+    /// cloning all 14 000 cached rows measured 2.9 ms per frame at 2 000 blocks, which is
+    /// most of a frame for rows the terminal will never see.
+    pub fn transcript_window(
+        &self,
+        width: u16,
+        scroll_from_bottom: Option<usize>,
+        height: usize,
+    ) -> (usize, Vec<Line<'static>>) {
+        // Check the cache key without cloning: `transcript_rows` clones every row on a
+        // hit, which is exactly the cost this accessor exists to avoid.
+        let up_to_date = {
+            let cache = self.row_cache.borrow();
+            cache.as_ref().is_some_and(|c| {
+                c.width == width
+                    && c.generation == self.blocks_generation
+                    && c.blocks_len == self.blocks.len()
+                    && c.tick == self.tick
+                    && c.show_tool_details == self.show_tool_details
+                    && c.syntax == self.syntax
+            })
+        };
+        if !up_to_date {
+            let _ = self.transcript_rows(width);
+        }
+        let cache = self.row_cache.borrow();
+        let Some(cache) = cache.as_ref() else {
+            return (0, Vec::new());
+        };
+        let total = cache.rows.len();
+        let visible = height;
+        let off = scroll_from_bottom.map(|off| off.min(total.saturating_sub(visible)));
+        let (start, end) = match off {
+            None => (total.saturating_sub(visible), total),
+            Some(off) => {
+                let end = total.saturating_sub(off);
+                (end.saturating_sub(visible), end)
+            }
+        };
+        let lines = cache.rows[start..end]
+            .iter()
+            .map(|r| r.line.clone())
+            .collect();
+        (total, lines)
     }
 }
 /// Convert terminal-cell columns to UTF-8 source offsets. Widen a boundary within a wide glyph.

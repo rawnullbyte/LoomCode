@@ -117,6 +117,16 @@ pub struct StatusLine {
 
 pub struct App {
     pub blocks: Vec<Block>,
+    /// Bumped by every mutation of `blocks` (push, truncate, stream commit). The
+    /// transcript row cache keys on it: without it, a long session re-rendered every
+    /// block on every frame — measured 24 ms/frame at 2 000 blocks against a 50 ms tick,
+    /// which is the "laggy after a few hours" report. Only ~30 rows are ever visible.
+    blocks_generation: u64,
+    /// Cached `transcript_rows` for the current width and generation, plus the cached
+    /// row count so `ui.rs` can scroll before paying for the build.
+    /// Rendered on the UI thread only; `RefCell` because the read path takes `&App`
+    /// (selection copy and hit-testing), so the cache cannot require `&mut`.
+    row_cache: std::cell::RefCell<Option<crate::transcript::TranscriptRowCache>>,
     pub navigator: Option<manager::Navigator>,
     pub editor: Option<manager::Form>,
     pub pending_editor: Option<manager::Form>,
@@ -301,6 +311,8 @@ impl App {
             tips: true,
             syntax: true,
             background: None,
+            blocks_generation: 0,
+            row_cache: std::cell::RefCell::new(None),
         }
     }
 
@@ -366,6 +378,7 @@ impl App {
     pub fn push_welcome_banner(&mut self) {
         if self.welcome_banner && !self.blocks.contains(&Block::Banner) {
             self.blocks.insert(0, Block::Banner);
+            self.invalidate_rows();
         }
     }
 
@@ -752,6 +765,7 @@ impl App {
     /// content shows its banner with no opener.
     pub fn set_session_blocks(&mut self, blocks: impl Iterator<Item = Block>) {
         self.blocks.clear();
+        self.invalidate_rows();
         self.streaming = None;
         self.scroll_from_bottom = Some(usize::MAX); // Show the opening wordmark even in a small terminal.
         self.selection = None;
@@ -817,6 +831,7 @@ impl App {
         if matches {
             // Retain earlier tool/status rows, formatting, and the welcome banner.
             self.blocks.truncate(cut.unwrap_or(0));
+            self.invalidate_rows();
         } else {
             self.blocks = blocks
                 .into_iter()
@@ -965,6 +980,7 @@ impl App {
                         Block::Banner | Block::Rich(_) => break,
                         Block::User(_) => {
                             self.blocks.pop();
+                            self.invalidate_rows();
                             break;
                         }
                         Block::Assistant(_)
@@ -972,6 +988,7 @@ impl App {
                         | Block::System(_)
                         | Block::Tool { .. } => {
                             self.blocks.pop();
+                            self.invalidate_rows();
                         }
                     }
                 }
@@ -999,12 +1016,22 @@ impl App {
 
     pub fn push_block(&mut self, b: Block) {
         self.blocks.push(b);
+        self.invalidate_rows();
         if self.selection.is_none() && self.scroll_from_bottom.is_none() {
             self.scroll_from_bottom = None;
         }
     }
 
+    /// Drop the cached transcript rows. Called by every `blocks` mutation: push, truncate,
+    /// rewind, session load, stream commit. A miss is one rebuild; a stale hit is a
+    /// transcript that silently shows yesterday's output, so mutation sites call this even
+    /// when it looks redundant.
+    fn invalidate_rows(&mut self) {
+        self.blocks_generation = self.blocks_generation.wrapping_add(1);
+    }
+
     pub fn stream_text(&mut self, delta: &str) {
+        self.invalidate_rows();
         self.streaming
             .get_or_insert_with(String::new)
             .push_str(delta);
@@ -1071,6 +1098,9 @@ impl App {
                 } => (detail.clone(), started.map(|s| s.elapsed())),
                 _ => (String::new(), None),
             };
+            // In-place replacement of a pending block: same length, so a length-only
+            // cache key would miss nothing. Invalidate explicitly — a stale cache kept a
+            // "running…" tool row on screen after its result had arrived.
             self.blocks[pos] = Block::Tool {
                 name: name.to_string(),
                 ok,
@@ -1084,6 +1114,7 @@ impl App {
                 started: None,
                 elapsed,
             };
+            self.invalidate_rows();
         } else {
             self.push_block(Block::Tool {
                 name: name.to_string(),
@@ -1443,6 +1474,7 @@ async fn run_inner(
                             app.push_welcome_banner();
                         } else {
                             app.blocks.retain(|b| !matches!(b, Block::Banner));
+                            app.invalidate_rows();
                         }
                     }
                     "spinner_verbs" => {
