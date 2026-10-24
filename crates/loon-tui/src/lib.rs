@@ -1209,7 +1209,8 @@ async fn run_inner(
     let loop_registry = std::sync::Arc::new(loon_core::loops::LoopRegistry::new());
     // Shared with the tools below so a background subagent's report reaches this
     // agent's turn loop, not a registry nobody reads.
-    let background = loon_core::subagent::BackgroundHub::new();
+    let background =
+        loon_core::subagent::BackgroundHub::new_capped(loon_core::subagent::DEFAULT_MAX_RUNNING);
     // Keep a handle for the live panel before the hub is moved into the agent and tools.
     let background_handle = background.clone();
     let agent = Arc::new(Mutex::new({

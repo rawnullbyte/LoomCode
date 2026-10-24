@@ -463,6 +463,11 @@ pub type DeliveredReport = (u64, String, String, String);
 /// Registry of background subagents, shared between the parent's tools and the tasks
 /// those tools spawn. Deliberately plain: a mutex-guarded map, no runtime of its own.
 ///
+/// Default cap on concurrently running background children. Eight is enough to saturate
+/// most rate limits and to fan out over a real task graph, while bounding the blast radius
+/// of a parent that decides to spawn forty investigate-the-parser children.
+pub const DEFAULT_MAX_RUNNING: usize = 8;
+
 /// The parent learns outcomes two ways: `background_list` for the model, and the
 /// event sink for the user — `SubagentUpdate` when a child starts, is messaged or is
 /// killed (its steering is otherwise invisible), `SubagentFinished` when one reports.
@@ -474,6 +479,9 @@ pub struct BackgroundHub {
 #[derive(Default)]
 struct HubState {
     next_id: u64,
+    /// Concurrent-children cap. `None` means unbounded, which keeps the default
+    /// constructor compatible; real sessions build the hub capped.
+    max_running: Option<usize>,
     jobs: std::collections::BTreeMap<u64, Job>,
     /// Where finished reports are announced; set by the UI/headless owner.
     sink: Option<mpsc::Sender<AgentEvent>>,
@@ -490,6 +498,20 @@ struct HubState {
 impl BackgroundHub {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A hub that refuses to run more than `max` children at once. Parallel children are
+    /// useful up to a point and a resource problem past it: each is a full model loop, so
+    /// the cap is the difference between "fan out over my tasks" and "forty concurrent
+    /// inference sessions". Checked under the hub lock at spawn, so a fan-out of N cannot
+    /// overshoot it.
+    pub fn new_capped(max: usize) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HubState {
+                max_running: Some(max.max(1)),
+                ..HubState::default()
+            })),
+        }
     }
 
     /// Total report bytes the hub will retain for finished jobs, counting each report
@@ -557,6 +579,23 @@ impl BackgroundHub {
         let (mut child, task) = build_child(&spec, &args, cancel).await?;
         let id = {
             let mut state = self.lock();
+            // The cap is checked under the same lock that assigns the id, so a fan-out of
+            // N parallel spawns cannot race past it: each spawn sees the registrations of
+            // the others. Checked AFTER build_child so a failed build does not consume a
+            // slot, but BEFORE the id is assigned and the task launched.
+            if let Some(max) = state.max_running {
+                let running = state
+                    .jobs
+                    .values()
+                    .filter(|j| j.status == JobStatus::Running)
+                    .count();
+                if running >= max {
+                    return Err(loon_tools::ToolError::Other(format!(
+                        "background agent limit reached ({max} running) — wait for one to \
+                         finish or background_kill one before spawning more"
+                    )));
+                }
+            }
             state.next_id += 1;
             state.next_id
         };

@@ -329,7 +329,8 @@ async fn run_session(
     let loop_registry = std::sync::Arc::new(loon_core::loops::LoopRegistry::new());
     // One hub for the tools and the agent: the tools start background subagents and
     // the agent's turn loop collects their reports, so they must be the same registry.
-    let background = loon_core::subagent::BackgroundHub::new();
+    let background =
+        loon_core::subagent::BackgroundHub::new_capped(loon_core::subagent::DEFAULT_MAX_RUNNING);
     let tools = loon_core::subagent::default_tools_with_hub(
         &paths,
         &workspace,

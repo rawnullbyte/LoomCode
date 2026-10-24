@@ -2740,3 +2740,86 @@ async fn a_running_job_reports_elapsed_seconds() {
     );
     let _ = id;
 }
+
+/// The concurrent-children cap. Without it a parent could spawn forty "investigate the
+/// parser" children — forty concurrent model loops — with nothing refusing. The cap is
+/// checked under the hub lock at spawn, so a parallel fan-out cannot race past it, and a
+/// finished child frees its slot for the next spawn.
+#[tokio::test]
+async fn the_concurrency_cap_refuses_then_frees() {
+    use subagent::JobStatus;
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+
+    // Cap of 2, children that sleep so both slots stay occupied.
+    let hub = subagent::BackgroundHub::new_capped(2);
+    let mk_tools = || {
+        let child_registry = Arc::new(ProviderRegistry::with_mock(MockProvider::with_scripts(
+            vec![MockScript::new(vec![
+                MockStep::Delay(std::time::Duration::from_millis(300)),
+                MockStep::Text("done".into()),
+            ])],
+        )));
+        subagent::default_tools_with_hub(&paths, &ws, &cfg(), child_registry, None, hub.clone())
+    };
+    let ctx = tool_ctx(&ws);
+    let tools = mk_tools();
+
+    tools
+        .get("background_spawn")
+        .unwrap()
+        .run(json!({"task": "first"}), &ctx)
+        .await
+        .expect("first spawn fits the cap");
+    tools
+        .get("background_spawn")
+        .unwrap()
+        .run(json!({"task": "second"}), &ctx)
+        .await
+        .expect("second spawn fills the cap");
+
+    let third = tools
+        .get("background_spawn")
+        .unwrap()
+        .run(json!({"task": "third"}), &ctx)
+        .await;
+    match third {
+        Ok(out) => panic!("the third spawn must be refused: {}", out.text),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(msg.contains("limit reached (2 running)"), "{msg}");
+            assert!(
+                msg.contains("background_kill"),
+                "the refusal must say what to do about it: {msg}"
+            );
+        }
+    }
+    assert_eq!(
+        hub.running().len(),
+        2,
+        "the refused spawn must not have registered"
+    );
+
+    // Finish one child: its slot frees for the next spawn.
+    for _ in 0..200 {
+        if hub
+            .listing()
+            .iter()
+            .all(|(_, _, s, _, _)| *s != JobStatus::Running)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let tools = mk_tools();
+    tools
+        .get("background_spawn")
+        .unwrap()
+        .run(json!({"task": "fourth"}), &ctx)
+        .await
+        .expect("a finished child frees its slot");
+    assert_eq!(hub.running().len(), 1);
+}
