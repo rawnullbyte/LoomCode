@@ -1,9 +1,9 @@
 //! Persistent-shell, background-monitor and SSH tools: the property under test is
 //! *reuse* — state survives between calls instead of a fresh process each time.
 
-use loon_tools::{Tool, ToolCtx, ToolRegistry};
+use loon_tools::{ToolCtx, ToolRegistry};
 use serde_json::{json, Value};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 fn ctx(path: &std::path::Path) -> ToolCtx {
     ToolCtx {
@@ -12,21 +12,24 @@ fn ctx(path: &std::path::Path) -> ToolCtx {
     }
 }
 
-/// One registry for the whole test binary: tools hold live process state (sessions,
-/// monitors, SSH masters), so a fresh registry per call would discard it.
-fn registry() -> &'static ToolRegistry {
-    static REGISTRY: OnceLock<ToolRegistry> = OnceLock::new();
-    REGISTRY.get_or_init(ToolRegistry::standard)
+/// A registry per test, never one for the whole binary. These tools hold live process
+/// state (shell sessions, monitors, SSH masters) that must persist across the calls of a
+/// *single* test — but tests run in parallel in one process, so a shared registry would
+/// leak one test's sessions into another's view. State reuse is what these tests assert;
+/// cross-test bleed is not.
+fn registry() -> ToolRegistry {
+    ToolRegistry::standard()
 }
 
-fn tool(name: &str) -> Arc<dyn Tool> {
-    registry()
+async fn call(
+    reg: &ToolRegistry,
+    name: &str,
+    args: Value,
+    ctx: &ToolCtx,
+) -> loon_tools::ToolOutput {
+    let t = reg
         .get(name)
-        .unwrap_or_else(|| panic!("{name} must be registered"))
-}
-
-async fn call(name: &str, args: Value, ctx: &ToolCtx) -> loon_tools::ToolOutput {
-    let t = tool(name);
+        .unwrap_or_else(|| panic!("{name} must be registered"));
     loon_tools::validate_args(&t.spec(), &args).expect("valid args");
     t.run(args, ctx).await.expect("tool runs")
 }
@@ -37,9 +40,11 @@ async fn call(name: &str, args: Value, ctx: &ToolCtx) -> loon_tools::ToolOutput 
 async fn shell_session_reuses_state_across_calls() {
     let d = tempfile::tempdir().unwrap();
     let c = ctx(d.path());
+    let reg = registry();
     std::fs::create_dir_all(d.path().join("sub")).unwrap();
 
     let out = call(
+        &reg,
         "shell_session",
         json!({"action":"start","name":"reuse"}),
         &c,
@@ -49,6 +54,7 @@ async fn shell_session_reuses_state_across_calls() {
 
     // An exported variable persists: a fresh shell per call could not see it.
     let out = call(
+        &reg,
         "shell_session",
         json!({"action":"run","name":"reuse","command":"export LOON_MARK=kept; echo set"}),
         &c,
@@ -56,6 +62,7 @@ async fn shell_session_reuses_state_across_calls() {
     .await;
     assert!(out.text.contains("set"), "{}", out.text);
     let out = call(
+        &reg,
         "shell_session",
         json!({"action":"run","name":"reuse","command":"echo value=$LOON_MARK"}),
         &c,
@@ -69,13 +76,20 @@ async fn shell_session_reuses_state_across_calls() {
 
     // `cd` persists too, and the reported cwd follows it.
     let out = call(
+        &reg,
         "shell_session",
         json!({"action":"run","name":"reuse","command":"cd sub && pwd"}),
         &c,
     )
     .await;
     assert!(out.text.contains("sub"), "{}", out.text);
-    let out = call("shell_session", json!({"action":"cwd","name":"reuse"}), &c).await;
+    let out = call(
+        &reg,
+        "shell_session",
+        json!({"action":"cwd","name":"reuse"}),
+        &c,
+    )
+    .await;
     assert!(
         out.text.contains("sub"),
         "cwd must reflect the earlier cd: {}",
@@ -84,6 +98,7 @@ async fn shell_session_reuses_state_across_calls() {
 
     // Exit status is per call, not per session.
     let out = call(
+        &reg,
         "shell_session",
         json!({"action":"run","name":"reuse","command":"exit_code_marker=1; false"}),
         &c,
@@ -91,6 +106,7 @@ async fn shell_session_reuses_state_across_calls() {
     .await;
     assert!(!out.ok, "false must report failure: {}", out.text);
     let out = call(
+        &reg,
         "shell_session",
         json!({"action":"run","name":"reuse","command":"true"}),
         &c,
@@ -103,16 +119,17 @@ async fn shell_session_reuses_state_across_calls() {
     );
 
     // The session is listed and closable.
-    let out = call("shell_session", json!({"action":"list"}), &c).await;
+    let out = call(&reg, "shell_session", json!({"action":"list"}), &c).await;
     assert!(out.text.contains("reuse"), "{}", out.text);
     let out = call(
+        &reg,
         "shell_session",
         json!({"action":"close","name":"reuse"}),
         &c,
     )
     .await;
     assert!(out.text.contains("closed"), "{}", out.text);
-    let out = call("shell_session", json!({"action":"list"}), &c).await;
+    let out = call(&reg, "shell_session", json!({"action":"list"}), &c).await;
     assert!(out.text.contains("no sessions"), "{}", out.text);
 }
 
@@ -120,8 +137,9 @@ async fn shell_session_reuses_state_across_calls() {
 async fn shell_session_start_is_idempotent_and_run_requires_a_session() {
     let d = tempfile::tempdir().unwrap();
     let c = ctx(d.path());
+    let reg = registry();
     // Running before starting is an honest error, not a silent new shell.
-    let t = tool("shell_session");
+    let t = reg.get("shell_session").unwrap();
     let err = t
         .run(
             json!({"action":"run","name":"nope","command":"echo hi"}),
@@ -131,28 +149,49 @@ async fn shell_session_start_is_idempotent_and_run_requires_a_session() {
         .unwrap_err();
     assert!(err.to_string().contains("no session"), "{err}");
 
-    let out = call("shell_session", json!({"action":"start","name":"idem"}), &c).await;
+    let out = call(
+        &reg,
+        "shell_session",
+        json!({"action":"start","name":"idem"}),
+        &c,
+    )
+    .await;
     assert!(out.ok);
-    let out = call("shell_session", json!({"action":"start","name":"idem"}), &c).await;
+    let out = call(
+        &reg,
+        "shell_session",
+        json!({"action":"start","name":"idem"}),
+        &c,
+    )
+    .await;
     assert!(
         out.text.contains("already running"),
         "a second start reuses the shell: {}",
         out.text
     );
-    call("shell_session", json!({"action":"close","name":"idem"}), &c).await;
+    call(
+        &reg,
+        "shell_session",
+        json!({"action":"close","name":"idem"}),
+        &c,
+    )
+    .await;
 }
 
 #[tokio::test]
 async fn shell_session_timeout_closes_the_session_instead_of_desynchronising() {
     let d = tempfile::tempdir().unwrap();
     let c = ctx(d.path());
+    let reg = registry();
     call(
+        &reg,
         "shell_session",
         json!({"action":"start","name":"timeout"}),
         &c,
     )
     .await;
     let out = call(
+        &reg,
         "shell_session",
         json!({"action":"run","name":"timeout","command":"sleep 5","timeout_secs":1}),
         &c,
@@ -162,7 +201,7 @@ async fn shell_session_timeout_closes_the_session_instead_of_desynchronising() {
     assert!(out.text.contains("TIMEOUT"), "{}", out.text);
     assert_eq!(out.structured["closed"], true);
     // The session is retired, so the next run reports it rather than returning stale bytes.
-    let t = tool("shell_session");
+    let t = reg.get("shell_session").unwrap();
     let err = t
         .run(
             json!({"action":"run","name":"timeout","command":"echo hi"}),
@@ -179,7 +218,8 @@ async fn shell_session_timeout_closes_the_session_instead_of_desynchronising() {
 async fn monitor_polls_incrementally_and_reports_exit() {
     let d = tempfile::tempdir().unwrap();
     let c = ctx(d.path());
-    let out = call(
+    let reg = registry();
+    let out = call(&reg,
         "monitor",
         json!({"action":"start","label":"greeter","command":"echo first; sleep 0.2; echo second; exit 3"}),
         &c,
@@ -191,6 +231,7 @@ async fn monitor_polls_incrementally_and_reports_exit() {
     // The process starts asynchronously, so wait for its first line rather than
     // assuming output exists the instant `start` returns.
     let out = call(
+        &reg,
         "monitor",
         json!({"action":"wait_for","monitor_id":id,"pattern":"first","timeout_secs":10}),
         &c,
@@ -198,12 +239,19 @@ async fn monitor_polls_incrementally_and_reports_exit() {
     .await;
     assert!(out.structured["matched"].as_bool().unwrap(), "{}", out.text);
     // First poll (no cursor) reads from the beginning of the log.
-    let out = call("monitor", json!({"action":"poll","monitor_id":id}), &c).await;
+    let out = call(
+        &reg,
+        "monitor",
+        json!({"action":"poll","monitor_id":id}),
+        &c,
+    )
+    .await;
     assert!(out.text.contains("first"), "{}", out.text);
     let cursor = out.structured["cursor"].as_u64().unwrap();
 
     // wait_for finds the later line without re-reading the earlier one.
     let out = call(
+        &reg,
         "monitor",
         json!({"action":"wait_for","monitor_id":id,"pattern":"second","timeout_secs":10}),
         &c,
@@ -216,6 +264,7 @@ async fn monitor_polls_incrementally_and_reports_exit() {
     let mut last = out;
     for _ in 0..40 {
         last = call(
+            &reg,
             "monitor",
             json!({"action":"poll","monitor_id":id,"cursor":cursor}),
             &c,
@@ -233,7 +282,9 @@ async fn monitor_polls_incrementally_and_reports_exit() {
 async fn monitor_wait_for_times_out_honestly_and_matches_nothing_on_exit() {
     let d = tempfile::tempdir().unwrap();
     let c = ctx(d.path());
+    let reg = registry();
     let out = call(
+        &reg,
         "monitor",
         json!({"action":"start","label":"quiet","command":"sleep 30"}),
         &c,
@@ -241,6 +292,7 @@ async fn monitor_wait_for_times_out_honestly_and_matches_nothing_on_exit() {
     .await;
     let id = out.structured["monitor_id"].as_u64().unwrap();
     let out = call(
+        &reg,
         "monitor",
         json!({"action":"wait_for","monitor_id":id,"pattern":"never","timeout_secs":1}),
         &c,
@@ -249,10 +301,17 @@ async fn monitor_wait_for_times_out_honestly_and_matches_nothing_on_exit() {
     assert!(!out.ok, "{}", out.text);
     assert_eq!(out.structured["timed_out"], true);
     assert_eq!(out.structured["matched"], false);
-    call("monitor", json!({"action":"stop","monitor_id":id}), &c).await;
+    call(
+        &reg,
+        "monitor",
+        json!({"action":"stop","monitor_id":id}),
+        &c,
+    )
+    .await;
 
     // A process that exits without the pattern reports the exit, not a fake match.
     let out = call(
+        &reg,
         "monitor",
         json!({"action":"start","label":"short","command":"echo done"}),
         &c,
@@ -260,6 +319,7 @@ async fn monitor_wait_for_times_out_honestly_and_matches_nothing_on_exit() {
     .await;
     let id = out.structured["monitor_id"].as_u64().unwrap();
     let out = call(
+        &reg,
         "monitor",
         json!({"action":"wait_for","monitor_id":id,"pattern":"absent","timeout_secs":10}),
         &c,
@@ -272,7 +332,9 @@ async fn monitor_wait_for_times_out_honestly_and_matches_nothing_on_exit() {
 async fn monitor_logs_returns_the_retained_tail() {
     let d = tempfile::tempdir().unwrap();
     let c = ctx(d.path());
+    let reg = registry();
     let out = call(
+        &reg,
         "monitor",
         json!({"action":"start","label":"noisy","command":"printf 'a\\nb\\nc\\n'"}),
         &c,
@@ -281,6 +343,7 @@ async fn monitor_logs_returns_the_retained_tail() {
     let id = out.structured["monitor_id"].as_u64().unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     let out = call(
+        &reg,
         "monitor",
         json!({"action":"logs","monitor_id":id,"max_bytes":2}),
         &c,
@@ -302,7 +365,8 @@ async fn ssh_reports_a_failed_connection_instead_of_pretending() {
     // tool must say so rather than reporting a usable connection.
     let d = tempfile::tempdir().unwrap();
     let c = ctx(d.path());
-    let t = tool("ssh");
+    let reg = registry();
+    let t = reg.get("ssh").unwrap();
     let out = t
         .run(
             json!({"action":"connect","name":"nope","host":"127.0.0.1","port":1}),
@@ -313,7 +377,7 @@ async fn ssh_reports_a_failed_connection_instead_of_pretending() {
     assert!(!out.ok, "must not claim success: {}", out.text);
     assert_eq!(out.structured["connected"], false, "{}", out.text);
     // And no connection is listed afterwards.
-    let list = call("ssh", json!({"action":"list"}), &c).await;
+    let list = call(&reg, "ssh", json!({"action":"list"}), &c).await;
     assert!(list.text.contains("no open connections"), "{}", list.text);
 }
 
@@ -325,7 +389,8 @@ async fn ssh_reports_a_failed_connection_instead_of_pretending() {
 async fn ssh_refuses_a_host_that_looks_like_an_option() {
     let d = tempfile::tempdir().unwrap();
     let c = ctx(d.path());
-    let t = tool("ssh");
+    let reg = registry();
+    let t = reg.get("ssh").unwrap();
     for host in [
         "-oProxyCommand=touch /tmp/loom-pwned",
         "--host",
@@ -351,7 +416,8 @@ async fn ssh_refuses_a_host_that_looks_like_an_option() {
 async fn ssh_refuses_a_user_that_looks_like_an_option() {
     let d = tempfile::tempdir().unwrap();
     let c = ctx(d.path());
-    let t = tool("ssh");
+    let reg = registry();
+    let t = reg.get("ssh").unwrap();
     let err = t
         .run(
             json!({"action":"connect","name":"evil","host":"example.invalid","user":"-oProxyCommand=touch /tmp/loom-pwned2"}),
@@ -370,7 +436,8 @@ async fn ssh_refuses_a_user_that_looks_like_an_option() {
 async fn ssh_run_without_a_connection_is_an_honest_error() {
     let d = tempfile::tempdir().unwrap();
     let c = ctx(d.path());
-    let t = tool("ssh");
+    let reg = registry();
+    let t = reg.get("ssh").unwrap();
     let err = t
         .run(
             json!({"action":"run","name":"ghost","command":"uptime"}),
@@ -383,8 +450,9 @@ async fn ssh_run_without_a_connection_is_an_honest_error() {
 
 #[test]
 fn persistent_tools_are_registered_with_useful_specs() {
+    let reg = registry();
     for name in ["shell_session", "monitor", "ssh"] {
-        let spec = tool(name).spec();
+        let spec = reg.get(name).unwrap().spec();
         assert_eq!(spec.name, name);
         assert!(
             spec.description.len() > 80,
@@ -398,7 +466,7 @@ fn persistent_tools_are_registered_with_useful_specs() {
 async fn aborted_shell_command_is_retired_and_syntax_errors_do_not_desync_it() {
     let d = tempfile::tempdir().unwrap();
     let c = ctx(d.path());
-    let reg = ToolRegistry::standard();
+    let reg = registry();
     let shell = reg.get("shell_session").unwrap();
     shell
         .run(json!({"action":"start","name":"abort"}), &c)
