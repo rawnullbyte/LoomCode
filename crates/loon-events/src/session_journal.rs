@@ -37,6 +37,17 @@ pub struct PendingSession {
 }
 
 impl PendingSession {
+    /// Stamp the parent session id onto a not-yet-materialized row. Called by a subagent
+    /// constructor after `create_pending`: the child's journal needs a real row (its events
+    /// reference it), but the `parent` column marks it as not a resumable conversation.
+    /// A no-op after materialization — which cannot happen before the child's first event.
+    pub fn set_parent(&self, parent: crate::EvId) {
+        let mut guard = self.meta.lock().expect("journal state");
+        if let Some(meta) = guard.as_mut() {
+            meta.parent = Some(parent);
+        }
+    }
+
     /// Write the session row and header if they are not written yet.
     fn materialize(&self) -> Result<Journal> {
         let mut guard = self.meta.lock().expect("journal state");
@@ -76,6 +87,14 @@ impl Journal {
             meta: Mutex::new(Some(meta.clone())),
             header,
         }))
+    }
+
+    /// Stamp the parent on a pending session (subagent lineage). See
+    /// `PendingSession::set_parent`.
+    pub fn set_parent(&self, parent: crate::EvId) {
+        if let Journal::Pending(p) = self {
+            p.set_parent(parent);
+        }
     }
 
     /// Create a legacy per-directory JSONL session (kept for tests and migration tools).

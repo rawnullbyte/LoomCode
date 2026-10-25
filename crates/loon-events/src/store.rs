@@ -14,7 +14,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-pub const STORE_SCHEMA_VERSION: u32 = 2;
+pub const STORE_SCHEMA_VERSION: u32 = 3;
 
 const MIGRATIONS: &[&str] = &[
     // v1: initial schema
@@ -49,6 +49,12 @@ const MIGRATIONS: &[&str] = &[
     "ALTER TABLE sessions ADD COLUMN updated_ms INTEGER NOT NULL DEFAULT 0;
     UPDATE sessions SET updated_ms = MAX(created_ms, COALESCE((SELECT MAX(ts_ms) FROM events WHERE events.session = sessions.id), created_ms));
     CREATE INDEX IF NOT EXISTS idx_sessions_updated ON sessions(updated_ms DESC);",
+    // v3: parent lineage for subagent sessions. A child's journal must be real (its events
+    // reference its session row), but a child is not a resumable conversation: it lives and
+    // dies inside one parent turn, shares the parent's cwd, and its title is a task line.
+    // Listing it in /resume offered dozens of broken one-shot rows. The parent id makes the
+    // lineage explicit and filterable, and NULL means a top-level (resumable) session.
+    "ALTER TABLE sessions ADD COLUMN parent TEXT;",
 ];
 
 pub struct Store {
@@ -139,8 +145,8 @@ impl Store {
         // active as" its creation time, and leaving the column at its default would
         // make every reader depend on the `updated_ms > 0` fallback to sort it.
         conn.execute(
-            "INSERT INTO sessions(id, title, created_ms, updated_ms, cwd, schema_version, headless)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO sessions(id, title, created_ms, updated_ms, cwd, schema_version, headless, parent)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 meta.id.to_string(),
                 meta.title,
@@ -152,7 +158,8 @@ impl Store {
                 },
                 meta.cwd,
                 meta.schema_version,
-                meta.headless as i64
+                meta.headless as i64,
+                meta.parent.map(|p| p.to_string())
             ],
         )?;
         Ok(())
@@ -308,9 +315,12 @@ impl Store {
     /// minutes ago belongs above one created after it but never used. `updated_ms` is
     /// advanced by every append, so this is exactly the last-message order.
     pub fn list_sessions(&self) -> Result<Vec<SessionMeta>> {
+        // Subagent journals are excluded: a child lives inside one parent turn, shares the
+        // parent's cwd, and its title is a task line — listing it offered rows that could
+        // not be meaningfully resumed. `parent IS NULL` is a top-level session.
         let conn = self.conn.lock().expect("store lock");
         let mut stmt = conn.prepare(
-            "SELECT id, title, created_ms, cwd, schema_version, headless, updated_ms FROM sessions ORDER BY updated_ms DESC, created_ms DESC, id DESC",
+            "SELECT id, title, created_ms, cwd, schema_version, headless, updated_ms, parent FROM sessions WHERE parent IS NULL ORDER BY updated_ms DESC, created_ms DESC, id DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok((
@@ -321,16 +331,18 @@ impl Store {
                 r.get::<_, i64>(4)?,
                 r.get::<_, i64>(5)?,
                 r.get::<_, i64>(6)?,
+                r.get::<_, Option<String>>(7)?,
             ))
         })?;
         let mut out = Vec::new();
         for row in rows {
-            let (id, title, created_ms, cwd, schema_version, headless, updated_ms) = row?;
+            let (id, title, created_ms, cwd, schema_version, headless, updated_ms, parent) = row?;
             out.push(SessionMeta {
                 id: EvId::parse_str(&id).map_err(|e| EventsError::MalformedLine {
                     line: 0,
                     reason: format!("bad session id: {e}"),
                 })?,
+                parent: parent.and_then(|p| EvId::parse_str(&p).ok()),
                 title,
                 created_ms,
                 // Rows written before the column existed fall back to creation time.
@@ -379,7 +391,7 @@ impl Store {
         let conn = self.conn.lock().expect("store lock");
         let row = conn
             .query_row(
-                "SELECT title, created_ms, cwd, schema_version, headless, updated_ms FROM sessions WHERE id = ?1",
+                "SELECT title, created_ms, cwd, schema_version, headless, updated_ms, parent FROM sessions WHERE id = ?1",
                 params![id.to_string()],
                 |r| {
                     Ok((
@@ -389,12 +401,13 @@ impl Store {
                         r.get::<_, i64>(3)?,
                         r.get::<_, i64>(4)?,
                         r.get::<_, i64>(5)?,
+                        r.get::<_, Option<String>>(6)?,
                     ))
                 },
             )
             .optional()?;
         Ok(row.map(
-            |(title, created_ms, cwd, schema_version, headless, updated_ms)| SessionMeta {
+            |(title, created_ms, cwd, schema_version, headless, updated_ms, parent)| SessionMeta {
                 id,
                 title,
                 created_ms,
@@ -406,6 +419,7 @@ impl Store {
                 cwd,
                 schema_version: schema_version as u32,
                 headless: headless != 0,
+                parent: parent.and_then(|p| EvId::parse_str(&p).ok()),
             },
         ))
     }

@@ -21,6 +21,11 @@ pub struct SessionMeta {
     pub cwd: String,
     pub schema_version: u32,
     pub headless: bool,
+    /// Parent session id for a subagent's journal. A child is not a resumable
+    /// conversation — it lives inside one parent turn — so resume filters it out. `None`
+    /// is a top-level session the user started.
+    #[serde(default)]
+    pub parent: Option<EvId>,
 }
 
 impl SessionMeta {
@@ -40,6 +45,7 @@ impl SessionMeta {
             cwd: cwd.into(),
             schema_version: SCHEMA_VERSION,
             headless,
+            parent: None,
         }
     }
 }

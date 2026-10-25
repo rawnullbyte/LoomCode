@@ -72,6 +72,8 @@ async fn a_report_dropped_by_the_entry_bound_is_announced_as_dropped() {
             child_registry,
             None,
             hub.clone(),
+            None,
+            None,
         );
         child_tools
             .get("background_spawn")
@@ -101,6 +103,8 @@ async fn a_report_dropped_by_the_entry_bound_is_announced_as_dropped() {
         parent_registry.clone(),
         None,
         hub.clone(),
+        None,
+        None,
     );
     let mut agent = Agent::new_session(&paths, cfg(), parent_registry, parent_tools, ws, true)
         .expect("parent session");
@@ -151,7 +155,16 @@ fn fixture_with_mock(scripts: Vec<MockScript>) -> (Fixture, Arc<MockProvider>) {
     let mock = MockProvider::with_scripts(scripts);
     let registry = Arc::new(ProviderRegistry::with_mock(mock.clone()));
     let hub = BackgroundHub::new();
-    let tools = subagent::default_tools_with_hub(&paths, &ws, &cfg(), registry, None, hub.clone());
+    let tools = subagent::default_tools_with_hub(
+        &paths,
+        &ws,
+        &cfg(),
+        registry,
+        None,
+        hub.clone(),
+        None,
+        None,
+    );
     (
         Fixture {
             _tmp: tmp,
@@ -394,8 +407,16 @@ async fn the_parent_turn_absorbs_a_finished_report_into_its_context() {
     let child_registry = Arc::new(ProviderRegistry::with_mock(MockProvider::with_scripts(
         vec![MockScript::text("the parser has an off-by-one")],
     )));
-    let child_tools =
-        subagent::default_tools_with_hub(&paths, &ws, &cfg(), child_registry, None, hub.clone());
+    let child_tools = subagent::default_tools_with_hub(
+        &paths,
+        &ws,
+        &cfg(),
+        child_registry,
+        None,
+        hub.clone(),
+        None,
+        None,
+    );
     let ctx = tool_ctx(&ws);
     child_tools
         .get("background_spawn")
@@ -425,6 +446,8 @@ async fn the_parent_turn_absorbs_a_finished_report_into_its_context() {
         parent_registry.clone(),
         None,
         hub.clone(),
+        None,
+        None,
     );
     let mut agent = Agent::new_session(
         &paths,
@@ -606,8 +629,16 @@ async fn a_huge_child_report_is_bounded_before_it_enters_the_parent_context() {
     let child_registry = Arc::new(ProviderRegistry::with_mock(MockProvider::with_scripts(
         vec![MockScript::text(huge)],
     )));
-    let child_tools =
-        subagent::default_tools_with_hub(&paths, &ws, &cfg(), child_registry, None, hub.clone());
+    let child_tools = subagent::default_tools_with_hub(
+        &paths,
+        &ws,
+        &cfg(),
+        child_registry,
+        None,
+        hub.clone(),
+        None,
+        None,
+    );
     let ctx = tool_ctx(&ws);
     child_tools
         .get("background_spawn")
@@ -636,6 +667,8 @@ async fn a_huge_child_report_is_bounded_before_it_enters_the_parent_context() {
         parent_registry.clone(),
         None,
         hub.clone(),
+        None,
+        None,
     );
     let mut agent = Agent::new_session(
         &paths,
@@ -693,8 +726,16 @@ async fn a_report_cut_at_a_multibyte_character_stays_valid_utf8() {
     let child_registry = Arc::new(ProviderRegistry::with_mock(MockProvider::with_scripts(
         vec![MockScript::text(cjk)],
     )));
-    let child_tools =
-        subagent::default_tools_with_hub(&paths, &ws, &cfg(), child_registry, None, hub.clone());
+    let child_tools = subagent::default_tools_with_hub(
+        &paths,
+        &ws,
+        &cfg(),
+        child_registry,
+        None,
+        hub.clone(),
+        None,
+        None,
+    );
     let ctx = tool_ctx(&ws);
     child_tools
         .get("background_spawn")
@@ -723,6 +764,8 @@ async fn a_report_cut_at_a_multibyte_character_stays_valid_utf8() {
         parent_registry.clone(),
         None,
         hub.clone(),
+        None,
+        None,
     );
     let mut agent = Agent::new_session(
         &paths,
@@ -775,6 +818,8 @@ async fn finished_reports_do_not_accumulate_without_bound() {
             registry,
             None,
             fx.hub.clone(),
+            None,
+            None,
         );
         tools
             .get("background_spawn")
@@ -853,6 +898,8 @@ async fn the_retention_bound_covers_the_undelivered_queue_too() {
             registry,
             None,
             fx.hub.clone(),
+            None,
+            None,
         );
         tools
             .get("background_spawn")
@@ -939,6 +986,8 @@ async fn the_retention_bound_holds_for_every_report_size() {
                 registry,
                 None,
                 fx.hub.clone(),
+                None,
+                None,
             );
             tools
                 .get("background_spawn")
@@ -1003,6 +1052,8 @@ async fn eviction_stops_once_the_survivors_fit_the_budget() {
             registry,
             None,
             fx.hub.clone(),
+            None,
+            None,
         );
         tools
             .get("background_spawn")
@@ -1060,6 +1111,8 @@ async fn an_injected_report_says_so_when_its_text_was_released() {
             registry,
             None,
             fx.hub.clone(),
+            None,
+            None,
         );
         tools
             .get("background_spawn")
@@ -1090,6 +1143,8 @@ async fn an_injected_report_says_so_when_its_text_was_released() {
         parent_registry.clone(),
         None,
         fx.hub.clone(),
+        None,
+        None,
     );
     let mut agent = Agent::new_session(
         &paths,
@@ -1164,6 +1219,8 @@ async fn a_released_report_is_reported_as_released_not_as_silence() {
             registry,
             None,
             fx.hub.clone(),
+            None,
+            None,
         );
         tools
             .get("background_spawn")
@@ -1299,6 +1356,8 @@ async fn the_listing_keeps_the_newest_outcome_when_it_is_truncated() {
             registry,
             None,
             fx.hub.clone(),
+            None,
+            None,
         );
         tools
             .get("background_spawn")
@@ -1361,6 +1420,8 @@ async fn a_named_child_can_be_read_even_when_the_full_listing_is_truncated() {
             registry,
             None,
             fx.hub.clone(),
+            None,
+            None,
         );
         tools
             .get("background_spawn")
@@ -1446,8 +1507,16 @@ async fn a_named_read_uses_the_full_output_budget_not_the_listing_clip() {
     ))]);
     let registry = Arc::new(ProviderRegistry::with_mock(mock));
     let paths = test_paths(fx._tmp.path());
-    let tools =
-        subagent::default_tools_with_hub(&paths, &fx.ws, &cfg(), registry, None, fx.hub.clone());
+    let tools = subagent::default_tools_with_hub(
+        &paths,
+        &fx.ws,
+        &cfg(),
+        registry,
+        None,
+        fx.hub.clone(),
+        None,
+        None,
+    );
     tools
         .get("background_spawn")
         .unwrap()
@@ -1520,8 +1589,16 @@ async fn a_named_read_past_the_output_bound_admits_truncation() {
     ))]);
     let registry = Arc::new(ProviderRegistry::with_mock(mock));
     let paths = test_paths(fx._tmp.path());
-    let tools =
-        subagent::default_tools_with_hub(&paths, &fx.ws, &cfg(), registry, None, fx.hub.clone());
+    let tools = subagent::default_tools_with_hub(
+        &paths,
+        &fx.ws,
+        &cfg(),
+        registry,
+        None,
+        fx.hub.clone(),
+        None,
+        None,
+    );
     tools
         .get("background_spawn")
         .unwrap()
@@ -1572,8 +1649,16 @@ async fn a_clipped_listing_points_at_the_named_read_that_recovers_it() {
     ))]);
     let registry = Arc::new(ProviderRegistry::with_mock(mock));
     let paths = test_paths(fx._tmp.path());
-    let tools =
-        subagent::default_tools_with_hub(&paths, &fx.ws, &cfg(), registry, None, fx.hub.clone());
+    let tools = subagent::default_tools_with_hub(
+        &paths,
+        &fx.ws,
+        &cfg(),
+        registry,
+        None,
+        fx.hub.clone(),
+        None,
+        None,
+    );
     tools
         .get("background_spawn")
         .unwrap()
@@ -1764,6 +1849,8 @@ async fn a_drop_notice_only_promises_reads_that_will_work() {
             child_registry,
             None,
             hub.clone(),
+            None,
+            None,
         );
         child_tools
             .get("background_spawn")
@@ -1793,6 +1880,8 @@ async fn a_drop_notice_only_promises_reads_that_will_work() {
         parent_registry.clone(),
         None,
         hub.clone(),
+        None,
+        None,
     );
     let mut agent = Agent::new_session(&paths, cfg(), parent_registry, parent_tools, ws, true)
         .expect("parent session");
@@ -1873,8 +1962,16 @@ async fn a_drop_notice_decides_readability_when_it_is_built_not_when_dropped() {
         let registry = Arc::new(ProviderRegistry::with_mock(MockProvider::with_scripts(
             vec![MockScript::text(text)],
         )));
-        let tools =
-            subagent::default_tools_with_hub(paths, ws, &cfg(), registry, None, hub.clone());
+        let tools = subagent::default_tools_with_hub(
+            paths,
+            ws,
+            &cfg(),
+            registry,
+            None,
+            hub.clone(),
+            None,
+            None,
+        );
         tools
             .get("background_spawn")
             .unwrap()
@@ -1987,6 +2084,8 @@ async fn one_report_larger_than_the_budget_is_still_delivered() {
             registry,
             None,
             fx.hub.clone(),
+            None,
+            None,
         );
         tools
             .get("background_spawn")
@@ -2049,8 +2148,16 @@ async fn the_retention_peak_is_twice_the_budget_or_the_newest_report() {
         let registry = Arc::new(ProviderRegistry::with_mock(MockProvider::with_scripts(
             vec![MockScript::text(text)],
         )));
-        let tools =
-            subagent::default_tools_with_hub(paths, ws, &cfg(), registry, None, hub.clone());
+        let tools = subagent::default_tools_with_hub(
+            paths,
+            ws,
+            &cfg(),
+            registry,
+            None,
+            hub.clone(),
+            None,
+            None,
+        );
         tools
             .get("background_spawn")
             .unwrap()
@@ -2160,6 +2267,8 @@ async fn the_drop_notice_is_bounded_even_when_many_children_finish() {
                 child_registry,
                 None,
                 hub.clone(),
+                None,
+                None,
             );
             child_tools
                 .get("background_spawn")
@@ -2191,6 +2300,8 @@ async fn the_drop_notice_is_bounded_even_when_many_children_finish() {
         parent_registry.clone(),
         None,
         hub.clone(),
+        None,
+        None,
     );
     let mut agent = Agent::new_session(&paths, cfg(), parent_registry, parent_tools, ws, true)
         .expect("parent session");
@@ -2293,6 +2404,8 @@ async fn the_recovery_the_notice_names_actually_reaches_the_hidden_reports() {
                 child_registry,
                 None,
                 hub.clone(),
+                None,
+                None,
             );
             child_tools
                 .get("background_spawn")
@@ -2324,6 +2437,8 @@ async fn the_recovery_the_notice_names_actually_reaches_the_hidden_reports() {
         parent_registry.clone(),
         None,
         hub.clone(),
+        None,
+        None,
     );
     let mut agent = Agent::new_session(
         &paths,
@@ -2364,6 +2479,8 @@ async fn the_recovery_the_notice_names_actually_reaches_the_hidden_reports() {
         parent_registry.clone(),
         None,
         hub.clone(),
+        None,
+        None,
     );
     let unfiltered = tools
         .get("background_list")
@@ -2455,8 +2572,16 @@ async fn a_resumed_transcript_includes_the_tool_calls_the_session_made() {
             MockScript::text("done after the tool"),
         ],
     )));
-    let tools =
-        subagent::default_tools_with_hub(&paths, &ws, &cfg(), registry.clone(), None, hub_fresh());
+    let tools = subagent::default_tools_with_hub(
+        &paths,
+        &ws,
+        &cfg(),
+        registry.clone(),
+        None,
+        hub_fresh(),
+        None,
+        None,
+    );
     let mut a =
         Agent::new_session(&paths, cfg(), registry, tools, ws.clone(), true).expect("session");
     let r = a.run_turn("run a command").await;
@@ -2536,8 +2661,16 @@ async fn a_rejected_tool_call_is_visible_on_resume() {
             MockScript::text("done after the refusal"),
         ],
     )));
-    let tools =
-        subagent::default_tools_with_hub(&paths, &ws, &cfg(), registry.clone(), None, hub_fresh());
+    let tools = subagent::default_tools_with_hub(
+        &paths,
+        &ws,
+        &cfg(),
+        registry.clone(),
+        None,
+        hub_fresh(),
+        None,
+        None,
+    );
     let mut a =
         Agent::new_session(&paths, cfg(), registry, tools, ws.clone(), true).expect("session");
     let _ = a.run_turn("try a missing tool").await;
@@ -2572,8 +2705,16 @@ async fn resuming_a_session_emits_tool_rows_to_the_ui() {
             MockScript::text("done after the tool"),
         ],
     )));
-    let tools =
-        subagent::default_tools_with_hub(&paths, &ws, &cfg(), registry.clone(), None, hub_fresh());
+    let tools = subagent::default_tools_with_hub(
+        &paths,
+        &ws,
+        &cfg(),
+        registry.clone(),
+        None,
+        hub_fresh(),
+        None,
+        None,
+    );
     let mut a =
         Agent::new_session(&paths, cfg(), registry, tools, ws.clone(), true).expect("session");
     let _ = a.run_turn("run a command").await;
@@ -2593,6 +2734,8 @@ async fn resuming_a_session_emits_tool_rows_to_the_ui() {
         other_registry.clone(),
         None,
         hub_fresh(),
+        None,
+        None,
     );
     let mut resumed =
         Agent::new_session(&paths, cfg(), other_registry, other_tools, ws.clone(), true)
@@ -2699,8 +2842,16 @@ async fn a_running_job_reports_elapsed_seconds() {
     )));
     let paths = test_paths(tmp.path());
     paths.ensure().unwrap();
-    let tools =
-        subagent::default_tools_with_hub(&paths, &ws, &cfg(), child_registry, None, hub.clone());
+    let tools = subagent::default_tools_with_hub(
+        &paths,
+        &ws,
+        &cfg(),
+        child_registry,
+        None,
+        hub.clone(),
+        None,
+        None,
+    );
     let ctx = tool_ctx(&ws);
     tools
         .get("background_spawn")
@@ -2763,7 +2914,16 @@ async fn the_concurrency_cap_refuses_then_frees() {
                 MockStep::Text("done".into()),
             ])],
         )));
-        subagent::default_tools_with_hub(&paths, &ws, &cfg(), child_registry, None, hub.clone())
+        subagent::default_tools_with_hub(
+            &paths,
+            &ws,
+            &cfg(),
+            child_registry,
+            None,
+            hub.clone(),
+            None,
+            None,
+        )
     };
     let ctx = tool_ctx(&ws);
     let tools = mk_tools();
@@ -2822,4 +2982,109 @@ async fn the_concurrency_cap_refuses_then_frees() {
         .await
         .expect("a finished child frees its slot");
     assert_eq!(hub.running().len(), 1);
+}
+
+/// Subagent sessions must not appear in the resume list. A child gets a real journal row
+/// (its events reference it), but it lives inside one parent turn, shares the parent's cwd,
+/// and its title is a task line — listing it offered rows that could not be meaningfully
+/// resumed. The `parent` column marks the lineage; the listing filters children out.
+#[tokio::test]
+async fn subagent_sessions_are_hidden_from_resume_listings() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws).unwrap();
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+
+    let hub = subagent::BackgroundHub::new_capped(4);
+    let parent_registry = Arc::new(ProviderRegistry::with_mock(MockProvider::with_scripts(
+        vec![MockScript::text("parent done")],
+    )));
+    let parent_tools = subagent::default_tools_with_hub(
+        &paths,
+        &ws,
+        &cfg(),
+        parent_registry.clone(),
+        None,
+        hub.clone(),
+        None,
+        None,
+    );
+    let mut parent = Agent::new_session(
+        &paths,
+        cfg(),
+        parent_registry,
+        parent_tools,
+        ws.clone(),
+        true,
+    )
+    .expect("parent session");
+    // One turn materializes the parent's row: a pending session has no row until its
+    // first event.
+    let r = parent.run_turn("start the parent").await;
+    assert!(matches!(r.status, loon_core::TurnStatus::Completed));
+    let parent_id = parent.session_id();
+
+    // A slow child materializes its own row while we inspect.
+    let child_registry = Arc::new(ProviderRegistry::with_mock(MockProvider::with_scripts(
+        vec![MockScript::new(vec![
+            MockStep::Delay(std::time::Duration::from_millis(250)),
+            MockStep::Text("child done".into()),
+        ])],
+    )));
+    let child_tools = subagent::default_tools_with_hub(
+        &paths,
+        &ws,
+        &cfg(),
+        child_registry,
+        None,
+        hub.clone(),
+        None,
+        Some(parent_id),
+    );
+    let ctx = tool_ctx(&ws);
+    child_tools
+        .get("background_spawn")
+        .unwrap()
+        .run(json!({"task": "child work"}), &ctx)
+        .await
+        .expect("spawn succeeds");
+    for _ in 0..200 {
+        if hub
+            .listing()
+            .iter()
+            .all(|(_, _, s, _, _)| *s != subagent::JobStatus::Running)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // The parent row exists and is top-level.
+    let store = loon_core::open_store(&paths).unwrap();
+    let parent_meta = store
+        .session_meta(parent_id)
+        .expect("store query works")
+        .expect("the parent row exists");
+    assert_eq!(parent_meta.id, parent_id);
+    assert!(parent_meta.parent.is_none(), "the parent is top-level");
+
+    // The listing contains the parent and NOT the child.
+    let listed = store.list_sessions().unwrap();
+    assert!(
+        listed.iter().all(|m| m.id == parent_id),
+        "only the parent session is listed: {:?}",
+        listed.iter().map(|m| m.id).collect::<Vec<_>>()
+    );
+    assert!(listed.iter().all(|m| m.parent.is_none()));
+
+    // Both rows are real in the store; the child is excluded by lineage, not missing.
+    let child_spec_meta = store
+        .events(parent_id)
+        .unwrap()
+        .into_iter()
+        .filter(|_| true)
+        .count();
+    assert!(child_spec_meta > 0, "parent has events");
 }

@@ -1225,6 +1225,8 @@ async fn run_inner(
                 registry.clone(),
                 Some(loop_registry.clone()),
                 background.clone(),
+                None,
+                None,
             ),
             cwd.clone(),
             false,
@@ -1232,6 +1234,9 @@ async fn run_inner(
         .map_err(|e| anyhow::anyhow!("session init: {e}"))?;
         a.loops = loop_registry.clone();
         a.background = background;
+        // Link subagents to the shared task graph now that the session's worklog exists:
+        // children get a clone of it (same lock), so a fanned-out child marks its own task.
+        a.refresh_orchestration();
         a
     }));
     let (ev_tx, mut ev_rx) = mpsc::channel::<AgentEvent>(1024);

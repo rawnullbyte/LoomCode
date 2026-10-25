@@ -331,6 +331,8 @@ async fn run_session(
     // the agent's turn loop collects their reports, so they must be the same registry.
     let background =
         loon_core::subagent::BackgroundHub::new_capped(loon_core::subagent::DEFAULT_MAX_RUNNING);
+    // The worklog is created with the session; headless runs materialize on the first
+    // message, so construct the toolset after the agent exists (same as the TUI).
     let tools = loon_core::subagent::default_tools_with_hub(
         &paths,
         &workspace,
@@ -338,6 +340,8 @@ async fn run_session(
         registry.clone(),
         Some(loop_registry.clone()),
         background.clone(),
+        None,
+        None,
     )
     .with_extra(mcp_tools);
     let mut agent = match session {
@@ -352,6 +356,7 @@ async fn run_session(
             match Agent::new_session(&paths, agent_cfg, registry.clone(), tools, workspace, true) {
                 Ok(mut a) => {
                     a.loops = loop_registry.clone();
+                    a.refresh_orchestration();
                     a
                 }
                 Err(e) => {

@@ -11,6 +11,11 @@ pub struct Task {
     pub status: String,
     #[serde(default)]
     pub blocked_by: Vec<u64>,
+    /// Background agent working this task, when one was fanned out to it. Links the task
+    /// graph to the subagent hub so a finished child marks its task instead of the parent
+    /// correlating by memory.
+    #[serde(default)]
+    pub assignee: Option<u64>,
 }
 pub struct TaskTool {
     pub log: WorkLog,
@@ -42,6 +47,7 @@ impl TaskTool {
                             description: args["description"].as_str().unwrap_or("").into(),
                             status: "pending".into(),
                             blocked_by: Vec::new(),
+                            assignee: None,
                         });
                     }
                     "update" => {

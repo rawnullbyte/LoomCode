@@ -257,6 +257,7 @@ impl Agent {
                 description: format!("The stop review could not run: {reason}"),
                 status: "pending".into(),
                 blocked_by: Vec::new(),
+                assignee: None,
             });
             Ok(())
         });

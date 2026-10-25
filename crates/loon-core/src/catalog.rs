@@ -871,6 +871,14 @@ impl Agent {
         self.refresh_delegate();
         self.refresh_tool_search();
     }
+    /// Rebuild the subagent toolset against the CURRENT config and link it to the
+    /// session's task graph: children get a clone of the parent's worklog (same lock), so
+    /// `task_fanout` can hand tasks to children and those children can mark their own
+    /// task. Called once at session start, after the worklog exists.
+    pub fn refresh_orchestration(&mut self) {
+        self.refresh_delegate();
+    }
+
     pub(crate) fn refresh_delegate(&mut self) {
         self.cfg.extra_tools = self
             .tools
@@ -888,6 +896,10 @@ impl Agent {
                 cfg: self.cfg.clone(),
                 registry: self.registry.clone(),
                 cwd: self.ctx.ws.root().to_path_buf(),
+                // Children share the parent's task graph so a fanned-out child can mark
+                // its own task. The clone shares the lock, so writes are serialised.
+                tasks: Some(self.worklog.clone()),
+                parent: Some(self.session_id()),
             };
             self.tools = self
                 .tools
@@ -905,6 +917,7 @@ impl Agent {
                         spec.cfg.clone(),
                         spec.registry.clone(),
                         spec.cwd.clone(),
+                        Some(self.worklog.clone()),
                     ),
                     std::sync::Arc::new(crate::subagent::BackgroundSpawnTool {
                         spec,

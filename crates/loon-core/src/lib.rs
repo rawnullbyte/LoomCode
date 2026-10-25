@@ -573,14 +573,30 @@ impl Agent {
         cwd: PathBuf,
         headless: bool,
     ) -> loon_events::Result<Agent> {
+        Self::new_session_with_parent(paths, cfg, registry, tools, cwd, headless, None)
+    }
+
+    /// `new_session` with a parent session id: a subagent's journal. A child gets a real
+    /// journal row (its events reference it), but the `parent` column marks it as not a
+    /// resumable conversation, so it never appears in `/resume` or `sessions list`.
+    pub fn new_session_with_parent(
+        paths: &LoonPaths,
+        cfg: AgentConfig,
+        registry: Arc<ProviderRegistry>,
+        tools: ToolRegistry,
+        cwd: PathBuf,
+        headless: bool,
+        parent: Option<loon_events::EvId>,
+    ) -> loon_events::Result<Agent> {
         let session_id = loon_events::EvId::now_v7();
-        let meta = SessionMeta::fresh(
+        let mut meta = SessionMeta::fresh(
             session_id,
             "session",
             chrono_ms(),
             cwd.display().to_string(),
             headless,
         );
+        meta.parent = parent;
         let store = open_store(paths)?;
         // The session exists only in memory until its first write: no row, no events.
         // Opening the app and quitting without sending anything therefore leaves

@@ -134,6 +134,14 @@ pub struct ChildSpec {
     pub cfg: AgentConfig,
     pub registry: Arc<ProviderRegistry>,
     pub cwd: PathBuf,
+    /// The parent's durable task log, cloned so parent and children share one task graph:
+    /// a clone holds the same `Arc<Mutex<()>>`, so read-modify-write is serialised. A child
+    /// can mark its own task; plan/notes stay per-session by not being passed.
+    /// `None` for children of an uncapped, task-free hub (tests, default constructor).
+    pub tasks: Option<crate::worklog::WorkLog>,
+    /// The parent session id, recorded in the child's journal so resume can filter child
+    /// sessions out — a child is not a resumable conversation.
+    pub parent: Option<loon_events::EvId>,
 }
 
 /// A child session built and ready for exactly one turn.
@@ -233,19 +241,25 @@ async fn build_child(
     // The child's toolset mirrors the parent's minus delegation (no recursion):
     // background children are leaves as well, because a child owns a fresh hub
     // whose reports nobody would collect.
-    let tools = loon_tools::ToolRegistry::standard()
+    let mut tools = loon_tools::ToolRegistry::standard()
         .with_extra(spec.cfg.extra_tools.clone())
         .with_extra(vec![Arc::new(MemoryTool {
             paths: Arc::new(memory::MemoryPaths::resolve(&spec.paths.data_dir, &cwd)),
         })]);
+    // A task-linked child works on the parent's task graph: it can read its assignment and
+    // mark progress. The shared WorkLog clone serialises writes with the parent.
+    if let Some(log) = &spec.tasks {
+        tools = tools.with_extra(vec![Arc::new(crate::tasks::TaskTool { log: log.clone() })]);
+    }
     let workspace = cwd.clone();
-    let mut child = Agent::new_session(
+    let mut child = Agent::new_session_with_parent(
         &spec.paths,
         child_cfg,
         spec.registry.clone(),
         tools,
         cwd,
         true,
+        spec.parent,
     )
     .map_err(|e| loon_tools::ToolError::Other(format!("subagent session failed: {e}")))?;
     child.adopt_cancel_channel(cancel);
@@ -303,6 +317,7 @@ pub fn delegate_tool(
     cfg: AgentConfig,
     registry: Arc<ProviderRegistry>,
     cwd: PathBuf,
+    tasks: Option<crate::worklog::WorkLog>,
 ) -> Arc<dyn loon_tools::Tool> {
     Arc::new(DelegateTool {
         spec: ChildSpec {
@@ -310,6 +325,8 @@ pub fn delegate_tool(
             cfg,
             registry,
             cwd,
+            tasks,
+            parent: None,
         },
     })
 }
@@ -471,9 +488,21 @@ pub const DEFAULT_MAX_RUNNING: usize = 8;
 /// The parent learns outcomes two ways: `background_list` for the model, and the
 /// event sink for the user — `SubagentUpdate` when a child starts, is messaged or is
 /// killed (its steering is otherwise invisible), `SubagentFinished` when one reports.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct BackgroundHub {
     inner: Arc<Mutex<HubState>>,
+    /// The parent's durable task log, when the hub should link children to tasks. Set for
+    /// real sessions; `None` keeps the hub task-free (tests, default constructor).
+    tasks: Option<crate::worklog::WorkLog>,
+}
+
+impl Default for BackgroundHub {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HubState::default())),
+            tasks: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -511,7 +540,33 @@ impl BackgroundHub {
                 max_running: Some(max.max(1)),
                 ..HubState::default()
             })),
+            tasks: None,
         }
+    }
+
+    /// Link this hub to the parent's task log: spawned children may carry a task id, and
+    /// finishing updates that task's status so the parent reads state from the task list
+    /// instead of correlating reports by memory.
+    pub fn with_tasks(mut self, log: crate::worklog::WorkLog) -> Self {
+        self.tasks = Some(log);
+        self
+    }
+
+    /// Mark the task assigned to agent `id`, if the hub is task-linked. `completed` on
+    /// success, `blocked` on a failed/cancelled child — either way the parent sees the
+    /// state change on the task list. Fail-open: no linked task is not an error.
+    fn update_task_for_agent(&self, id: u64, ok: bool) {
+        let Some(log) = &self.tasks else { return };
+        let _ = log.update(|state| {
+            if let Some(task) = state
+                .tasks
+                .iter_mut()
+                .find(|t| t.assignee == Some(id) && t.status == "in_progress")
+            {
+                task.status = if ok { "completed" } else { "blocked" }.into();
+            }
+            Ok(())
+        });
     }
 
     /// Total report bytes the hub will retain for finished jobs, counting each report
@@ -573,6 +628,7 @@ impl BackgroundHub {
         spec: ChildSpec,
         args: Value,
         cancel: tokio::sync::watch::Receiver<bool>,
+        task_id: Option<u64>,
     ) -> Result<u64, loon_tools::ToolError> {
         // Build before returning: a bad cwd/profile/model must fail the tool call (the
         // parent needs to see it), not surface later as a background failure.
@@ -620,12 +676,28 @@ impl BackgroundHub {
                     report: None,
                 },
             );
+            if let Some(task_id) = task_id {
+                // The task graph is the parent's; the child reports into it. `ok` is
+                // decided at finish; here we only claim the assignment.
+                if let Some(log) = &self.tasks {
+                    let _ = log.update(|state| {
+                        if let Some(t) = state.tasks.iter_mut().find(|t| t.id == task_id) {
+                            t.status = "in_progress".into();
+                            t.assignee = Some(id);
+                        }
+                        Ok(())
+                    });
+                }
+            }
             if let Some(sink) = state.sink.clone() {
                 let _ = sink.try_send(AgentEvent::SubagentUpdate {
                     id,
                     label: label.clone(),
                     status: JobStatus::Running.as_str().to_string(),
-                    note: "started".into(),
+                    note: match task_id {
+                        Some(t) => format!("started (task #{t})"),
+                        None => "started".into(),
+                    },
                 });
             }
         }
@@ -642,7 +714,13 @@ impl BackgroundHub {
             } else {
                 result.assistant_text.clone()
             };
-            hub.finish(id, label, status, text);
+            hub.finish(
+                id,
+                label,
+                status,
+                text,
+                matches!(status, JobStatus::Completed),
+            );
         });
         Ok(id)
     }
@@ -651,7 +729,7 @@ impl BackgroundHub {
     /// The `label` travels with the task (rather than being read back from the map) so a
     /// finish can never be dropped even if the entry were somehow absent: it is parked as
     /// a pending report with an `unknown` entry rather than silently discarded.
-    fn finish(&self, id: u64, label: String, status: JobStatus, text: String) {
+    fn finish(&self, id: u64, label: String, status: JobStatus, text: String, ok_status: bool) {
         let mut state = self.lock();
         let label = match state.jobs.get_mut(&id) {
             Some(job) => {
@@ -687,6 +765,11 @@ impl BackgroundHub {
         // report released" and the next step boundary still injects the child's id and
         // status (with empty text) instead of silently saying nothing.
         Self::trim_reports(&mut state);
+        drop(state);
+        // A finished child marks its task, so the parent reads state from the task list
+        // and content from the report. Outside the hub lock: the task log has its own.
+        self.update_task_for_agent(id, ok_status);
+        let state = self.lock();
         if let Some(sink) = state.sink.clone() {
             // try_send: a full or dropped channel must not stall a finishing child.
             let _ = sink.try_send(AgentEvent::SubagentFinished {
@@ -931,7 +1014,7 @@ impl loon_tools::Tool for BackgroundSpawnTool {
     ) -> Result<loon_tools::ToolOutput, loon_tools::ToolError> {
         let id = self
             .hub
-            .spawn(self.spec.clone(), args, ctx.cancel.clone())
+            .spawn(self.spec.clone(), args, ctx.cancel.clone(), None)
             .await?;
         Ok(loon_tools::ToolOutput::ok(format!(
             "background agent #{id} started; it reports when done. Use background_list to read its result, background_message to steer it, background_kill to stop it."
@@ -951,6 +1034,150 @@ fn clip_to_char_boundary(text: &str, limit: usize) -> &str {
         cut -= 1;
     }
     &text[..cut]
+}
+
+/// `task_fanout`: one call that spawns a child per task from the shared task graph and
+/// links each child to its task. This is what makes an orchestrating parent one tool call
+/// instead of N: split the work into tasks, fan out, then read the task list for state and
+/// `background_list` for content.
+pub struct TaskFanoutTool {
+    pub spec: ChildSpec,
+    pub hub: BackgroundHub,
+}
+
+#[async_trait]
+impl loon_tools::Tool for TaskFanoutTool {
+    fn spec(&self) -> loon_tools::ToolSpec {
+        loon_tools::ToolSpec {
+            name: "task_fanout".into(),
+            description: "Spawn one background subagent per task from the task graph, linking each child to its task: the child is marked in_progress with the agent id as assignee, and finishing updates the task's status automatically. Tasks must exist (use `task create`) and be `pending`. Concurrency is capped — extra tasks are refused and can be fanned out in a later call as slots free. Use this to run many independent tasks in parallel; use `delegate` when you need one answer before continuing and `background_spawn` for a single child.".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "task_ids": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 16,
+                        "items": {"type": "integer", "minimum": 1},
+                        "description": "Task ids from the task graph to fan out over."
+                    },
+                    "agent": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "description": "Optional agent profile name from /agents."
+                    }
+                },
+                "required": ["task_ids"],
+                "additionalProperties": false
+            }),
+            effects: loon_tools::Effects::Mutating,
+        }
+    }
+
+    async fn run(
+        &self,
+        args: Value,
+        ctx: &loon_tools::ToolCtx,
+    ) -> Result<loon_tools::ToolOutput, loon_tools::ToolError> {
+        let Some(log) = &self.hub.tasks else {
+            return Err(loon_tools::ToolError::Other(
+                "task_fanout requires a task-linked hub (this session has no shared task graph)"
+                    .into(),
+            ));
+        };
+        let ids: Vec<u64> = args["task_ids"]
+            .as_array()
+            .ok_or_else(|| loon_tools::ToolError::InvalidArgs("task_ids array required".into()))?
+            .iter()
+            .map(|v| {
+                v.as_u64().ok_or_else(|| {
+                    loon_tools::ToolError::InvalidArgs("task ids must be positive integers".into())
+                })
+            })
+            .collect::<Result<_, _>>()?;
+        let profile = args["agent"].as_str().map(str::to_string);
+
+        // Snapshot the tasks first: subjects become the children's labels, and a missing
+        // or non-pending task is reported per task rather than failing the whole batch.
+        let state = log
+            .read()
+            .map_err(|e| loon_tools::ToolError::Other(e.to_string()))?;
+        let mut spawns = Vec::new();
+        let mut skipped: Vec<(u64, String)> = Vec::new();
+        for id in &ids {
+            match state.tasks.iter().find(|t| t.id == *id) {
+                None => skipped.push((*id, "no such task".into())),
+                Some(t) if t.status != "pending" => {
+                    skipped.push((*id, format!("already {}", t.status)));
+                }
+                Some(t) => spawns.push((*id, t.subject.clone())),
+            }
+        }
+
+        let mut spawned: Vec<(u64, u64)> = Vec::new();
+        let mut errors: Vec<(u64, String)> = Vec::new();
+        for (task_id, subject) in spawns {
+            // Each child's task is its own text: the subject names the row, the task text
+            // is what the child actually works on.
+            let task_text = {
+                let state = log
+                    .read()
+                    .map_err(|e| loon_tools::ToolError::Other(e.to_string()))?;
+                state
+                    .tasks
+                    .iter()
+                    .find(|t| t.id == task_id)
+                    .map(|t| {
+                        if t.description.trim().is_empty() {
+                            t.subject.clone()
+                        } else {
+                            format!("{}\n\n{}", t.subject, t.description)
+                        }
+                    })
+                    .unwrap_or_else(|| subject.clone())
+            };
+            let mut child_args = serde_json::json!({"task": task_text});
+            if let Some(name) = &profile {
+                child_args["agent"] = Value::String(name.clone());
+            }
+            match self
+                .hub
+                .spawn(
+                    self.spec.clone(),
+                    child_args,
+                    ctx.cancel.clone(),
+                    Some(task_id),
+                )
+                .await
+            {
+                Ok(agent_id) => spawned.push((task_id, agent_id)),
+                Err(e) => errors.push((task_id, e.to_string())),
+            }
+        }
+
+        let mut out = String::new();
+        for (task_id, agent_id) in &spawned {
+            out.push_str(&format!(
+                "task #{task_id} -> background agent #{agent_id}\n"
+            ));
+        }
+        for (task_id, reason) in &skipped {
+            out.push_str(&format!("task #{task_id} skipped: {reason}\n"));
+        }
+        for (task_id, error) in &errors {
+            out.push_str(&format!("task #{task_id} FAILED: {error}\n"));
+        }
+        if spawned.is_empty() {
+            out.push_str("no tasks were fanned out — resolve the errors above first\n");
+        } else {
+            out.push_str(&format!(
+                "\n{} agent(s) running; task statuses update automatically as they finish. \
+                 Read reports with background_list, state with task list.",
+                spawned.len()
+            ));
+        }
+        Ok(loon_tools::ToolOutput::ok(out))
+    }
 }
 
 /// `background_list`: the parent's view of the agents it started.
@@ -1178,10 +1405,20 @@ pub fn default_tools(
     registry: Arc<ProviderRegistry>,
     loops: Option<Arc<crate::loops::LoopRegistry>>,
 ) -> loon_tools::ToolRegistry {
-    default_tools_with_hub(paths, cwd, cfg, registry, loops, BackgroundHub::new())
+    default_tools_with_hub(
+        paths,
+        cwd,
+        cfg,
+        registry,
+        loops,
+        BackgroundHub::new(),
+        None,
+        None,
+    )
 }
 
 /// `default_tools` with an explicit hub, so the caller and the tools share one registry.
+#[allow(clippy::too_many_arguments)] // one per wiring input; a params struct would hide the shape
 pub fn default_tools_with_hub(
     paths: &LoonPaths,
     cwd: &std::path::Path,
@@ -1189,6 +1426,8 @@ pub fn default_tools_with_hub(
     registry: Arc<ProviderRegistry>,
     loops: Option<Arc<crate::loops::LoopRegistry>>,
     hub: BackgroundHub,
+    tasks: Option<crate::worklog::WorkLog>,
+    parent: Option<loon_events::EvId>,
 ) -> loon_tools::ToolRegistry {
     let mut extra: Vec<Arc<dyn loon_tools::Tool>> = vec![Arc::new(MemoryTool {
         paths: Arc::new(memory::MemoryPaths::resolve(&paths.data_dir, cwd)),
@@ -1201,6 +1440,8 @@ pub fn default_tools_with_hub(
         cfg: cfg.clone(),
         registry,
         cwd: cwd.to_path_buf(),
+        tasks: tasks.clone(),
+        parent,
     };
     extra.push(Arc::new(BackgroundSpawnTool {
         spec: spec.clone(),
@@ -1209,6 +1450,13 @@ pub fn default_tools_with_hub(
     extra.push(Arc::new(BackgroundListTool { hub: hub.clone() }));
     extra.push(Arc::new(BackgroundMessageTool { hub: hub.clone() }));
     extra.push(Arc::new(BackgroundKillTool { hub: hub.clone() }));
+    if tasks.is_some() {
+        // Fan-out is only offered when there is a task graph to fan out over.
+        extra.push(Arc::new(TaskFanoutTool {
+            spec: spec.clone(),
+            hub: hub.clone(),
+        }));
+    }
     loon_tools::ToolRegistry::standard()
         .with_extra(extra)
         .with_extra(vec![delegate_tool(
@@ -1216,6 +1464,7 @@ pub fn default_tools_with_hub(
             cfg.clone(),
             spec.registry,
             cwd.to_path_buf(),
+            tasks,
         )])
 }
 
@@ -1237,7 +1486,7 @@ mod tests {
         let registry = Arc::new(ProviderRegistry::with_mock(Arc::new(
             loon_providers::MockProvider::new(),
         )));
-        let tool = delegate_tool(paths, cfg, registry, tmp.path().to_path_buf());
+        let tool = delegate_tool(paths, cfg, registry, tmp.path().to_path_buf(), None);
         assert_eq!(tool.spec().name, "delegate");
         let params = &tool.spec().parameters;
         assert_eq!(params["required"][0], "task");
@@ -1254,6 +1503,7 @@ mod tests {
             "orphaned work".into(),
             JobStatus::Completed,
             "done".into(),
+            true,
         );
 
         let jobs = hub.listing();
@@ -1292,8 +1542,15 @@ mod tests {
             "verbose".into(),
             JobStatus::Completed,
             "x".repeat(50_000),
+            true,
         );
-        hub.finish(2, "modest".into(), JobStatus::Completed, "y".repeat(30_000));
+        hub.finish(
+            2,
+            "modest".into(),
+            JobStatus::Completed,
+            "y".repeat(30_000),
+            true,
+        );
 
         let listed: usize = hub
             .listing()
@@ -1334,6 +1591,7 @@ mod tests {
                 format!("job{i}"),
                 JobStatus::Completed,
                 "x".repeat(8),
+                true,
             );
         }
 
