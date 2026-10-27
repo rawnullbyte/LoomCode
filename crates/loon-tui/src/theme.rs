@@ -8,6 +8,13 @@
 use loon_config::AppearanceMode;
 use ratatui::style::{Color, Modifier, Style};
 
+/// Every palette the appearance picker offers, in display order. This is the single source of
+/// truth: the `/theme` picker, the settings choices, autocomplete and the command palette all
+/// read this list, so adding a palette cannot leave one surface behind.
+pub const PALETTE_NAMES: [&str; 7] = [
+    "terminal", "dark", "light", "ocean", "violet", "ember", "graphite",
+];
+
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
     /// True ⇒ all backgrounds are `Color::Reset`.

@@ -401,9 +401,45 @@ async fn run_session(
     let jsonl = mode == "jsonl";
     let json = mode == "json";
 
+    let session_id = agent.session_id();
+
+    // A slash command is a command, not a prompt. Sending "/agents" through `run_turn` would ask
+    // the model to guess; executing it through the same parser the TUI uses makes every command
+    // reachable headlessly with one implementation.
+    if let Some(parsed) = loon_core::commands::parse(&text) {
+        let outcome = match parsed {
+            Ok(command) => agent.run_slash(command).await,
+            Err(message) => Err(message),
+        };
+        agent.finish_session().await;
+        return match outcome {
+            Ok(out) => {
+                let out = out.trim_end();
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"v": 1, "type": "command", "session_id": session_id.to_string(), "command": text.trim(), "output": out})
+                    );
+                } else if jsonl {
+                    println!(
+                        "{}",
+                        serde_json::json!({"v": 1, "type": "command_result", "command": text.trim(), "output": out})
+                    );
+                } else if !out.is_empty() {
+                    println!("{out}");
+                }
+                0
+            }
+            Err(message) => {
+                eprintln!("loom: {message}");
+                // A usage error is distinct from a failed turn (1) and a cancellation (2).
+                64
+            }
+        };
+    }
+
     let (tx, mut rx) = tokio::sync::mpsc::channel::<AgentEvent>(1024);
     agent.set_event_sink(tx);
-    let session_id = agent.session_id();
 
     let cancel = agent.cancel_handle();
     let mut turn = tokio::spawn(async move {
@@ -622,6 +658,8 @@ fn event_type(ev: &AgentEvent) -> &'static str {
         AgentEvent::ContextUpdated { .. } => "context_updated",
         AgentEvent::ModelChanged { .. } => "model_changed",
         AgentEvent::EffortChanged { .. } => "effort_changed",
+        AgentEvent::KeymapChanged { .. } => "keymap_changed",
+        AgentEvent::ExecutionModeChanged { .. } => "execution_mode_changed",
         AgentEvent::SessionLoaded { .. } => "session_loaded",
         AgentEvent::ConversationRewound { .. } => "conversation_rewound",
         AgentEvent::WorkStateChanged { .. } => "work_state_changed",

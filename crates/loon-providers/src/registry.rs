@@ -81,6 +81,14 @@ impl ProviderRegistry {
         }
     }
 
+    /// Test helper: keep the configured providers/models but replace the mock's script queue.
+    /// This is what lets a test combine real configuration (aliases, combos) with scripted
+    /// responses instead of choosing one or the other.
+    pub fn with_mock_scripts(mut self, scripts: Vec<crate::mock::MockScript>) -> ProviderRegistry {
+        self.mock = crate::mock::MockProvider::with_scripts(scripts);
+        self
+    }
+
     /// Reload definitions without replacing pooled transports or the mock script queue.
     pub fn reconfigure(&mut self, cfg: &loon_config::Config) {
         self.providers = cfg.providers.clone();

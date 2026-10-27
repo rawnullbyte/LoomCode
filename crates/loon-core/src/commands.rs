@@ -141,6 +141,15 @@ pub enum SlashCommand {
     Effort {
         level: String,
     },
+    /// /keybind — list or change a binding: `list`, `ACTION CHORD`, `ACTION ""` (unbind),
+    /// `reset ACTION`, `reset all`, `profile NAME`, `export`.
+    Keybind {
+        args: Vec<String>,
+    },
+    /// /mode [NAME TASK] — execution strategy; with a task it starts immediately.
+    Mode {
+        args: Vec<String>,
+    },
     /// /goal <text|clear> — session goal, injected into every request.
     Goal {
         text: String,
@@ -315,6 +324,23 @@ pub fn parse(input: &str) -> Option<Result<SlashCommand, String>> {
         },
         "effort" => SlashCommand::Effort {
             level: args.first().copied().unwrap_or_default().to_string(),
+        },
+        "keybind" | "keybindings" | "keys" => SlashCommand::Keybind {
+            args: args.iter().map(|s| s.to_string()).collect(),
+        },
+        "mode" | "ultrawork" | "ulw" | "deepresearch" => SlashCommand::Mode {
+            // `/ultrawork fix X` is the same mode as `/mode ultrawork fix X`.
+            args: if name == "mode" {
+                args.iter().map(|s| s.to_string()).collect()
+            } else {
+                let mut all = vec![if name == "deepresearch" {
+                    "research".to_string()
+                } else {
+                    name.to_string()
+                }];
+                all.extend(args.iter().map(|s| s.to_string()));
+                all
+            },
         },
         "goal" => SlashCommand::Goal {
             text: args.join(" "),
@@ -582,6 +608,14 @@ pub fn command_list() -> Vec<(&'static str, &'static str)> {
             "effort [low|medium|high|xhigh|ultra]",
             "coding and reasoning effort",
         ),
+        (
+            "keybind [list|ACTION CHORD|reset ACTION|profile NAME|export]",
+            "inspect and change keyboard shortcuts",
+        ),
+        (
+            "mode [plan|execute|ultrawork|team|research|review|debug|security|ultracode|repair] [TASK]",
+            "execution strategy; a task starts immediately",
+        ),
         ("goal <text|clear>", "session goal, kept in context"),
         ("btw <text>", "record context without triggering a turn"),
         ("recap", "summarize the session so far"),
@@ -705,6 +739,27 @@ mod help_tests {
 /// One-line, length-bounded excerpt for list output. Flattening comes first: a
 /// multi-line message would otherwise continue onto following lines and forge
 /// extra hits in `/find` and `/sessions search`.
+/// Name every binding when an unknown action is asked for: the list is long, but a user who
+/// mistyped needs to find the right id without opening the UI.
+fn unknown_action_message(name: &str) -> String {
+    let closest: Vec<String> = loon_config::KeyAction::ALL
+        .iter()
+        .filter(|a| {
+            let id = a.id();
+            id.contains(name) || name.contains(id) || id.starts_with(name)
+        })
+        .map(|a| a.id().to_string())
+        .collect();
+    if closest.is_empty() {
+        format!("unknown action `{name}` — /keybind list shows every action")
+    } else {
+        format!(
+            "unknown action `{name}` — did you mean {}?",
+            closest.join(", ")
+        )
+    }
+}
+
 fn truncate_prompt(p: &str, max: usize) -> String {
     let flat = p.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
@@ -790,6 +845,8 @@ fn help_groups() -> Vec<(&'static str, Vec<&'static str>)> {
                 "autocompact [1m|200k|90%|on|off|auto]",
                 "model [REF]",
                 "effort [low|medium|high|xhigh|ultra]",
+                "keybind [list|ACTION CHORD|reset ACTION|profile NAME|export]",
+                "mode [plan|execute|ultrawork|team|research|review|debug|security|ultracode|repair] [TASK]",
                 "recap",
             ],
         ),
@@ -1208,14 +1265,60 @@ impl Agent {
                 self.emit(crate::AgentEvent::WorkStateChanged { state });
                 Ok(text)
             }
-            SlashCommand::Agents => Ok(crate::subagent::profiles(
-                &self.data_dir,
-                self.ctx.ws.root(),
-            )
-            .iter()
-            .map(|p| format!("{} — {}", p.name, p.description))
-            .collect::<Vec<_>>()
-            .join("\n")),
+            SlashCommand::Agents => {
+                // Built-in roles and project profiles in one list: the dispatcher accepts both,
+                // so showing only the files would hide most of what `agent` can name.
+                let profiles = crate::subagent::profiles(&self.data_dir, self.ctx.ws.root());
+                let roles = crate::roles::catalog(&self.data_dir, self.ctx.ws.root(), &profiles);
+                let (models, effort) = self.routing_tables();
+                let session = self.cfg.model_ref.clone();
+                let mut out = String::from("Agent roles (use `agent` in delegate/task_fanout):\n");
+                for role in &roles {
+                    let routed = crate::roles::resolve(
+                        Some(role),
+                        role.category,
+                        &models,
+                        &session,
+                        |m| self.registry.resolve(m).map(|_| ()),
+                    );
+                    let mark = if role.custom { " (project profile)" } else { "" };
+                    let write = if role.writes { "writes" } else { "read-only" };
+                    out.push_str(&format!(
+                        "  {} — {}{} · {} · {} · model {} ({})\n",
+                        role.id,
+                        role.description,
+                        mark,
+                        role.category.id(),
+                        write,
+                        routed.0.model,
+                        routed.0.why.describe()
+                    ));
+                    for note in routed.1 {
+                        out.push_str(&format!("    ! {note}\n"));
+                    }
+                }
+                out.push_str("Categories: ");
+                out.push_str(
+                    &crate::roles::Category::ALL
+                        .iter()
+                        .map(|c| c.id())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                out.push_str("\nRoute a category in [routing.models] / [routing.effort]. Effort routing: ");
+                if effort.is_empty() {
+                    out.push_str("none configured");
+                } else {
+                    out.push_str(
+                        &effort
+                            .iter()
+                            .map(|(c, e)| format!("{}={e}", c.id()))
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    );
+                }
+                Ok(out)
+            }
             SlashCommand::Skill { name, args } => {
                 self.skills = crate::skills::load_with_builtins(&self.data_dir, self.ctx.ws.root());
                 let Some(skill) = self.skills.iter().find(|s| s.name == name).cloned() else {
@@ -1240,6 +1343,8 @@ impl Agent {
                     result.assistant_text
                 ))
             }
+            SlashCommand::Keybind { args } => self.run_keybind_command(args),
+            SlashCommand::Mode { args } => self.run_mode_command(args).await,
             SlashCommand::Config { args } => Ok(self.run_config_command(args).await?),
             SlashCommand::New => {
                 let paths = self.loon_paths();
@@ -2031,6 +2136,316 @@ impl Agent {
     /// `/config <key>=<value>`, `/config <key> <value>` and `/config set <key> <value>`
     /// validate against the registry, apply live and persist. Unknown keys are refused
     /// with the list of valid ones.
+    /// `/mode` — select the execution strategy, optionally starting a task with it.
+    ///
+    /// Applying a mode writes the flags the rest of the runtime already reads (`plan_mode`,
+    /// `ultraloop`, effort), so the indicator and the behaviour cannot disagree. Selection is
+    /// durable: `/resume` restores it.
+    pub async fn run_mode_command(&mut self, args: Vec<String>) -> Result<String, String> {
+        let Some(first) = args.first() else {
+            if self.events.is_some() {
+                let items = crate::mode::Mode::ALL
+                    .into_iter()
+                    .map(|m| crate::catalog::MenuItem {
+                        label: format!("{}{}", if m == self.mode() { "● " } else { "  " }, m.id()),
+                        detail: m.description().into(),
+                        command: format!("/mode {}", m.id()),
+                    })
+                    .collect();
+                self.emit(crate::AgentEvent::OpenMenu {
+                    title: "Execution mode".into(),
+                    items,
+                });
+                return Ok(String::new());
+            }
+            return Ok(self.mode_report());
+        };
+        if first == "status" {
+            return Ok(self.mode_report());
+        }
+        let mode = crate::mode::Mode::parse(first).ok_or_else(|| {
+            format!(
+                "unknown mode `{first}` — use {}",
+                crate::mode::Mode::ALL
+                    .iter()
+                    .map(|m| m.id())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        let task = args[1..].join(" ");
+        let note = self.apply_mode(mode)?;
+        if task.trim().is_empty() {
+            return Ok(note);
+        }
+        // `/mode plan design the migration` starts that task under the new mode rather than
+        // only reporting the switch.
+        let result = self.run_turn(&task).await;
+        Ok(format!(
+            "{note}\n[mode {mode} {}] {}",
+            result.status.status_text(),
+            result.assistant_text
+        ))
+    }
+
+    /// The current execution mode.
+    pub fn mode(&self) -> crate::mode::Mode {
+        self.worklog
+            .read()
+            .map(|s| s.mode)
+            .unwrap_or(crate::mode::Mode::Normal)
+    }
+
+    /// Apply a mode's derived effects and report exactly what changed.
+    pub fn apply_mode(&mut self, mode: crate::mode::Mode) -> Result<String, String> {
+        let ultraloop_now = self.worklog.read().map(|s| s.ultraloop).unwrap_or(false);
+        let transition = mode.transition(ultraloop_now);
+        let state = self
+            .worklog
+            .update(|s| {
+                s.mode = mode;
+                s.plan_mode = transition.plan_mode;
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        if let Some(true) = transition.ultraloop {
+            self.worklog
+                .update(|s| {
+                    s.ultraloop = true;
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        if let Some(effort) = transition.effort {
+            self.effort = Some(effort.to_string());
+            self.worklog
+                .update(|s| {
+                    s.effort = Some(effort.to_string());
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?;
+            self.emit(crate::AgentEvent::EffortChanged {
+                level: effort.to_string(),
+            });
+        }
+        self.emit(crate::AgentEvent::WorkStateChanged { state });
+        self.emit(crate::AgentEvent::ModeChanged {
+            mode: format!("{:?}", self.cfg.permissions.mode).to_lowercase(),
+        });
+        self.emit(crate::AgentEvent::ExecutionModeChanged {
+            mode: mode.id().to_string(),
+        });
+        let mut note = format!("mode: {mode} — {}", mode.description());
+        if transition.plan_mode {
+            note.push_str("\nplan mode is on: workspace mutations are refused until /plan off or /mode normal");
+        }
+        if transition.ultraloop == Some(true) {
+            note.push_str("\nindependent completion review is on");
+        }
+        if transition.effort.is_some() {
+            note.push_str("\neffort raised to ultra");
+        }
+        Ok(note)
+    }
+
+    fn mode_report(&self) -> String {
+        let mode = self.mode();
+        let mut out = format!("mode: {mode} — {}\n", mode.description());
+        out.push_str(&format!(
+            "plan mode: {} · supervisor: {} · effort: {}\n",
+            if self.worklog.read().map(|s| s.plan_mode).unwrap_or(false) {
+                "on"
+            } else {
+                "off"
+            },
+            if self.worklog.read().map(|s| s.ultraloop).unwrap_or(false) {
+                "on"
+            } else {
+                "off"
+            },
+            self.effort.clone().unwrap_or_else(|| "medium".into()),
+        ));
+        out.push_str("modes: ");
+        out.push_str(
+            &crate::mode::Mode::ALL
+                .iter()
+                .map(|m| m.id())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        out.push_str(
+            "\nleading keyword: `ultrawork TASK` or `ulw TASK` starts a task in that mode",
+        );
+        out
+    }
+
+    /// `/keybind` — inspect and change keyboard shortcuts.
+    ///
+    /// Writes go through the ordinary user configuration file (`Config::save`, which preserves
+    /// comments and unknown fields), and the same validation the configuration browser uses
+    /// runs before anything is written. An invalid or conflicting chord is refused with the
+    /// reason; nothing is half-saved.
+    pub fn run_keybind_command(&mut self, args: Vec<String>) -> Result<String, String> {
+        let mut cfg = loon_config::Config::load_or_builtin(&self.loon_paths())
+            .map_err(|e| e.to_string())?
+            .0;
+        let effective_keys =
+            loon_config::Config::load_effective(&self.loon_paths(), self.ctx.ws.root())
+                .map(|(c, _)| c.keys)
+                .unwrap_or_else(|_| cfg.keys.clone());
+        let map = loon_config::KeyMap::from_config(&effective_keys);
+        let op = args.first().map(String::as_str).unwrap_or("list");
+        match op {
+            "list" => {
+                // Align on the widest action name and chord actually present, so the columns do
+                // not depend on a hard-coded width that drifts as actions are added.
+                let rows = map.rows();
+                let name_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0);
+                let chord_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0);
+                Ok(rows
+                    .into_iter()
+                    .map(|(action, chord, description, custom)| {
+                        format!(
+                            "{}{:<name_w$}  {:<chord_w$}  {}",
+                            if custom { "* " } else { "  " },
+                            action,
+                            chord,
+                            description
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+                    + "\n\n(* = changed from the default; /keybind ACTION <chord> to change, /keybindings for the editor)")
+            }
+            "export" => Ok(map.export()),
+            "profile" => {
+                let name = args.get(1).ok_or_else(|| {
+                    format!(
+                        "usage: /keybind profile {}",
+                        loon_config::KeyProfile::NAMES.join("|")
+                    )
+                })?;
+                let profile = loon_config::KeyProfile::parse(name).ok_or_else(|| {
+                    format!(
+                        "unknown profile `{name}` — use {}",
+                        loon_config::KeyProfile::NAMES.join(", ")
+                    )
+                })?;
+                cfg.keys.profile = profile;
+                // A profile switch resets per-action overrides: keeping overrides written for
+                // the old profile would produce a map the user never chose.
+                cfg.keys.bindings.clear();
+                let findings = loon_config::keymap::validate(&cfg.keys);
+                if let Some(error) = findings.first() {
+                    return Err(error.clone());
+                }
+                cfg.save(&self.loon_paths()).map_err(|e| e.to_string())?;
+                self.emit(crate::AgentEvent::KeymapChanged {
+                    profile: name.to_string(),
+                    bindings: cfg.keys.bindings.clone(),
+                });
+                Ok(format!(
+                    "keyboard profile `{name}` saved{}",
+                    if name == "emacs" {
+                        " (Ctrl+P/Ctrl+N walk history; the palette moved to Alt+P)"
+                    } else {
+                        ""
+                    }
+                ))
+            }
+            "reset" => {
+                let target = args.get(1).ok_or("usage: /keybind reset ACTION|all")?;
+                if target == "all" {
+                    cfg.keys.bindings.clear();
+                    cfg.save(&self.loon_paths()).map_err(|e| e.to_string())?;
+                    self.emit(crate::AgentEvent::KeymapChanged {
+                        profile: cfg.keys.profile.name_str().to_string(),
+                        bindings: cfg.keys.bindings.clone(),
+                    });
+                    return Ok("all keyboard shortcuts reset to the profile defaults".into());
+                }
+                let action = loon_config::KeyAction::parse(target)
+                    .ok_or_else(|| unknown_action_message(target))?;
+                cfg.keys.bindings.remove(action.id());
+                cfg.save(&self.loon_paths()).map_err(|e| e.to_string())?;
+                let restored = loon_config::KeyMap::from_config(&cfg.keys)
+                    .chord_for(action)
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "unbound".into());
+                self.emit(crate::AgentEvent::KeymapChanged {
+                    profile: cfg.keys.profile.name_str().to_string(),
+                    bindings: cfg.keys.bindings.clone(),
+                });
+                Ok(format!("{} restored to {restored}", action.id()))
+            }
+            // `ACTION CHORD` rebinds; `ACTION ""` unbinds.
+            action_name => {
+                let action = loon_config::KeyAction::parse(action_name)
+                    .ok_or_else(|| unknown_action_message(action_name))?;
+                let chord_text = args[1..].join(" ");
+                let chord_text = chord_text.trim();
+                if chord_text.is_empty() {
+                    return Ok(format!(
+                        "{} = {}",
+                        action.id(),
+                        map.chord_for(action)
+                            .map(|c| c.to_string())
+                            .unwrap_or_else(|| "unbound".into())
+                    ));
+                }
+                let mut taken_from: Option<String> = None;
+                if chord_text == "unbind" || chord_text == "\"\"" {
+                    cfg.keys.bindings.insert(action.id().into(), String::new());
+                } else {
+                    let chord = loon_config::Chord::parse(chord_text).map_err(|e| e.to_string())?;
+                    // An explicit `ACTION CHORD` is an instruction to take the key. Report who
+                    // loses it: silently shadowing another action is how a keymap becomes
+                    // inexplicable ("the palette stopped opening").
+                    taken_from = map
+                        .bindings()
+                        .iter()
+                        .find(|b| {
+                            b.action != action
+                                && b.chord == chord
+                                && b.action.scope() == action.scope()
+                        })
+                        .map(|b| b.action.id().to_string());
+                    let next = map.steal(action, chord).map_err(|e| e.to_string())?;
+                    // Persist only the difference from the profile defaults.
+                    let defaults = loon_config::KeyMap::new(
+                        cfg.keys.profile,
+                        &std::collections::BTreeMap::new(),
+                    );
+                    cfg.keys.bindings = defaults.overrides_of(&next);
+                }
+                let findings = loon_config::keymap::validate(&cfg.keys);
+                if let Some(error) = findings.first() {
+                    return Err(error.clone());
+                }
+                cfg.save(&self.loon_paths()).map_err(|e| e.to_string())?;
+                self.emit(crate::AgentEvent::KeymapChanged {
+                    profile: cfg.keys.profile.name_str().to_string(),
+                    bindings: cfg.keys.bindings.clone(),
+                });
+                let now = loon_config::KeyMap::from_config(&cfg.keys);
+                let mut note = format!(
+                    "{} = {} (saved)",
+                    action.id(),
+                    now.chord_for(action)
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "unbound".into())
+                );
+                if let Some(owner) = taken_from {
+                    note.push_str(&format!(
+                        "\n{} no longer has this key; /keybind reset {owner} restores it",
+                        owner
+                    ));
+                }
+                Ok(note)
+            }
+        }
+    }
+
     async fn run_config_command(&mut self, args: Vec<String>) -> Result<String, String> {
         let mut args = args;
         if args.first().is_some_and(|a| a == "ui") {

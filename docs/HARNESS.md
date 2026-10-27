@@ -11,6 +11,9 @@ The runtime owns tools, permissions, history, durable state and supervision. Bot
 | `/ultraloop limit 0` | Unlimited completion reviews; positive values impose a review budget |
 | `/ultraloop model REF` | Choose a separate configured supervisor model |
 | `/plan on`, `off`, `status` | Restrict the session to inspection/planning until you explicitly leave plan mode |
+| `/mode [NAME] [TASK]` | Execution strategy; derives plan mode, the supervisor and effort |
+| `/keybind [list\|ACTION CHORD\|reset ACTION\|profile NAME\|export]` | Inspect and change shortcuts |
+| `/keybindings` | Searchable keybinding editor with key capture and conflict checks |
 | `/tasks add TEXT` | Add a durable task |
 | `/tasks get ID`, `start ID`, `done ID`, `block ID`, `remove ID` | Inspect and update tasks |
 | `/autocompact 50000` or `/autocompact 50k` | Save a token threshold for automatic context compaction |
@@ -69,6 +72,27 @@ Saving refreshes provider/model routing, permissions/write roots, effort/context
 - Skill frontmatter supports a `description`; the command name comes from the filename/directory. Only names and descriptions enter the discovery catalog. `load_skill` returns the body, and active bodies are refreshed/re-injected after compaction (up to eight active skills, 8,000 characters each).
 - Frontmatter supports simple scalars and inline comma-separated lists. It is not a full YAML interpreter and never executes embedded substitutions.
 
+## Execution modes, roles and routing
+
+A mode derives the runtime switches it implies (`crates/loon-core/src/mode.rs`), so the indicator,
+the tool gate and the supervisor cannot disagree. `plan`/`review`/`security` set the `plan_mode`
+flag the existing gate reads, which hides mutating tools from the request *and* rejects them at
+execution; bookkeeping tools (`update_plan`, `note`, `task`, `todo_write`) stay available so a
+read-only pass can still record findings. `ultrawork`/`ultracode` enable the supervisor;
+`ultracode` also raises effort. Leaving a mode never disables a supervisor the user enabled
+explicitly.
+
+Implicit routing from a leading keyword is deliberately narrow (`ultrawork`, `ulw`, `ultracode`,
+`deepresearch`): the mode names that are ordinary English words are reachable only through
+`/mode`, because `review the parser` is a task. The keyword is stripped before the prompt is
+journaled, so the model is never asked to "ultrawork" anything.
+
+Roles (`crates/loon-core/src/roles.rs`) are the delegation profiles, not a second agent system: a
+project `.loon/agents/NAME.md` overrides the built-in role of the same name, including its
+category and write policy. `agent` accepts either id. Model choice resolves role → category →
+session, validates each candidate, and reports the chosen model and reason in the delegation
+result. A read-only role's child registry has no mutating tools at all.
+
 ## Subagent profiles
 
 Create `.loon/agents/reviewer.md` or `<data_dir>/agents/reviewer.md`:
@@ -79,6 +103,7 @@ name: reviewer
 description: Review Rust changes with file references
 model: local/code-model
 effort: high
+category: deep
 maxTurns: 20
 tools: [read, grep, glob, tree, note, task]
 disallowedTools: [bash, write, edit, apply_patch]
@@ -86,7 +111,9 @@ disallowedTools: [bash, write, edit, apply_patch]
 Inspect the supplied task and relevant code. Report verified defects and evidence.
 ```
 
-The model uses `delegate` with `{"agent":"reviewer","task":"..."}`. Profiles can set `isolation: worktree` to create a detached Git worktree. Worktrees are retained for review; the report includes their path and the child session ID. Inspect/cherry-pick needed changes and remove the worktree with Git when finished. A worktree starts from committed HEAD and does not include uncommitted parent changes.
+The model uses `delegate` with `{"agent":"reviewer","task":"..."}`. The same call accepts
+`category` (routing) and `model` (an explicit override), and `agent` also accepts a built-in role
+id such as `reviewer`, `explorer` or `debugger` with no profile file at all. Profiles can set `isolation: worktree` to create a detached Git worktree. Worktrees are retained for review; the report includes their path and the child session ID. Inspect/cherry-pick needed changes and remove the worktree with Git when finished. A worktree starts from committed HEAD and does not include uncommitted parent changes.
 
 Children have separate histories and journals, inherit the parent's permission rules, receive only the task text, and cannot recursively delegate. MCP tools may be inherited; profile tool restrictions still apply. `maxTurns` limits model requests, with a visible incomplete result on exhaustion. Parent cancellation propagates.
 

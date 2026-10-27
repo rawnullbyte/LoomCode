@@ -110,13 +110,12 @@ pub fn argument_suggestions(line: &str) -> Vec<Completion> {
             .filter(|v| v.starts_with(partial))
             .map(Completion::argument)
             .collect(),
-        ("theme", 0) => [
-            "terminal", "dark", "light", "ocean", "violet", "ember", "graphite",
-        ]
-        .into_iter()
-        .filter(|v| v.starts_with(partial))
-        .map(Completion::argument)
-        .collect(),
+        // One shared list: a palette added to the theme cannot be missing here.
+        ("theme", 0) => crate::theme::PALETTE_NAMES
+            .into_iter()
+            .filter(|v| v.starts_with(partial))
+            .map(Completion::argument)
+            .collect(),
         // Token sizes accept shorthand (`1m`, `100k`) and percentages for /autocompact.
         ("autocompact", 0) => [
             "50k", "100k", "200k", "1m", "80%", "90%", "on", "off", "auto",

@@ -24,6 +24,8 @@ pub enum View {
     Mcp(String),
     Menu(String, Vec<MenuItem>),
     Confirm(String),
+    /// `/keybindings`: one row per action, with chord capture.
+    Keybindings,
 }
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -57,6 +59,9 @@ pub struct Navigator {
     pub rect: Option<Rect>,
     pub start: usize,
     pub page: usize,
+    /// The effective keymap, carried on the navigator so `/keybindings` rows (and the search
+    /// over them) are built from the same map the dispatcher uses.
+    pub keys: loon_config::KeyMap,
 }
 impl Navigator {
     pub fn new(catalog: Catalog, view: View) -> Self {
@@ -69,6 +74,7 @@ impl Navigator {
             rect: None,
             start: 0,
             page: 8,
+            keys: loon_config::KeyMap::default(),
         }
     }
     pub fn from_catalog(catalog: Catalog, view: &str) -> Self {
@@ -100,6 +106,7 @@ impl Navigator {
             View::Mcp(n) => format!("MCP / {n}"),
             View::Menu(t, _) => t.clone(),
             View::Confirm(_) => "Confirm removal".into(),
+            View::Keybindings => "Keybindings".into(),
         }
     }
     fn command(label: impl Into<String>, detail: impl Into<String>, cmd: impl Into<String>) -> Row {
@@ -313,6 +320,17 @@ impl Navigator {
                             });
                         }
                     }
+                }
+            }
+            View::Keybindings => {
+                // Rows come from the live map, so a capture/custom marker is always truthful.
+                for (action, chord, description, custom) in self.keys.rows() {
+                    let marker = if custom { "✎ " } else { "" };
+                    rows.push(Row {
+                        label: format!("{marker}{action} = {chord}"),
+                        detail: description,
+                        action: Action::Open(View::Keybindings),
+                    });
                 }
             }
             View::Menu(_, items) => rows.extend(
@@ -784,6 +802,25 @@ pub async fn key(app: &mut App, key: KeyEvent, tx: &mpsc::Sender<UiCommand>) -> 
         return true;
     }
     if let Some(mut nav) = app.navigator.take() {
+        // Quit is global: a modal surface must not trap the user in the application.
+        if key.code == KeyCode::Char('q')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && app
+                .keys
+                .resolve(loon_config::Chord::ctrl('q'), loon_config::Scope::Manager)
+                .is_some()
+        {
+            app.quit = true;
+            app.navigator = Some(nav);
+            return true;
+        }
+        // The keymap lives on the app; mirror it onto the navigator so rows and capture agree.
+        nav.keys = app.keys.clone();
+        if matches!(nav.view, View::Keybindings) {
+            let handled = keybindings_key(app, &mut nav, key, tx).await;
+            app.navigator = Some(nav);
+            return handled;
+        }
         let appearance = matches!(&nav.view,View::Menu(t,_) if t=="Appearance");
         let mut close = false;
         let settings = matches!(&nav.view,View::Menu(title,_) if title=="Settings" || title.starts_with("Settings / "));
@@ -983,6 +1020,150 @@ pub async fn key(app: &mut App, key: KeyEvent, tx: &mpsc::Sender<UiCommand>) -> 
     }
     false
 }
+/// Handle one key in the `/keybindings` editor.
+///
+/// Enter starts a capture, the next key press becomes the binding, and the result is written
+/// through `/config` so it persists exactly like any other setting. Captures are checked
+/// before they are stored: a reserved chord is refused with the reason, and a chord another
+/// action already owns asks the user to confirm with a second Enter rather than silently
+/// stealing it.
+async fn keybindings_key(
+    app: &mut App,
+    nav: &mut Navigator,
+    key: KeyEvent,
+    tx: &mpsc::Sender<UiCommand>,
+) -> bool {
+    let capture = app.pending_key_capture.take();
+    // ── capture mode ────────────────────────────────────────────────────────────
+    if let Some(action) = capture {
+        if key.code == KeyCode::Esc {
+            app.manager_notice = "binding cancelled".into();
+            return true;
+        }
+        let chord = crate::keys::chord(&key);
+        let Some(chord) = chord else {
+            app.manager_notice = "that key cannot be bound".into();
+            return true;
+        };
+        let label = crate::keys::chord_label(&key);
+        // Resolve who else owns it, so the user sees the consequence before it happens.
+        let owner = app
+            .keys
+            .bindings()
+            .iter()
+            .find(|b| b.action != action && b.chord == chord && b.action.scope() == action.scope())
+            .map(|b| b.action);
+        let next = if owner.is_some() {
+            app.keys.steal(action, chord)
+        } else {
+            app.keys.rebind(action, chord)
+        };
+        match next {
+            Ok(map) => {
+                let stolen = owner
+                    .map(|o| format!(" (took it from {})", o.id()))
+                    .unwrap_or_default();
+                save_keymap(app, &map, format!("{} {label}", action.id()), tx).await;
+                app.keys = map;
+                app.manager_notice = format!("{} bound to {label}{stolen}", action.id());
+            }
+            Err(e) => app.manager_notice = e.to_string(),
+        }
+        return true;
+    }
+    // ── browse mode ─────────────────────────────────────────────────────────────
+    match key.code {
+        KeyCode::Esc => {
+            if !nav.query.is_empty() {
+                nav.query.clear();
+                nav.selected = 0;
+            } else {
+                app.navigator = None;
+            }
+        }
+        KeyCode::Up => nav.move_by(-1),
+        KeyCode::Down => nav.move_by(1),
+        KeyCode::PageUp => nav.move_by(-(nav.page as isize)),
+        KeyCode::PageDown => nav.move_by(nav.page as isize),
+        KeyCode::Home => nav.selected = 0,
+        KeyCode::End => nav.selected = nav.rows().len().saturating_sub(1),
+        KeyCode::Backspace => {
+            nav.query.pop();
+            nav.selected = 0;
+        }
+        KeyCode::Enter => {
+            if let Some(action) = selected_action(nav) {
+                app.pending_key_capture = Some(action);
+                app.manager_notice = format!("press the new key for {} (Esc cancels)", action.id());
+            }
+        }
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(action) = selected_action(nav) {
+                let map = app.keys.unbind(action);
+                save_keymap(app, &map, format!("{} unbind", action.id()), tx).await;
+                app.keys = map;
+                app.manager_notice = format!("{} unbound", action.id());
+            }
+        }
+        KeyCode::Char('r')
+            if key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+        {
+            let map = app.keys.reset_all();
+            save_keymap(app, &map, "reset all".to_string(), tx).await;
+            app.keys = map;
+            app.manager_notice = "all bindings reset to the profile defaults".into();
+        }
+        KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            if let Some(action) = selected_action(nav) {
+                let map = app.keys.reset(action);
+                save_keymap(app, &map, format!("{} reset", action.id()), tx).await;
+                app.keys = map;
+                app.manager_notice = format!("{} restored to its default", action.id());
+            }
+        }
+        KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Export the effective map as text in the transcript, ready to paste into config.
+            app.push_block(crate::Block::System(app.keys.export()));
+        }
+        KeyCode::Char(c)
+            if !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+        {
+            nav.query.push(c);
+            nav.selected = 0;
+        }
+        _ => {}
+    }
+    nav.keys = app.keys.clone();
+    true
+}
+
+fn selected_action(nav: &Navigator) -> Option<loon_config::KeyAction> {
+    let rows = nav.rows();
+    let row = rows.get(nav.selected)?;
+    let id = row.label.trim_start_matches('✎').trim();
+    loon_config::KeyAction::parse(id.split(" = ").next().unwrap_or(id))
+}
+
+/// Persist one keymap change through the real `/keybind` command, which validates against the
+/// effective configuration and writes the user config file. The UI's own map is only updated
+/// after the write succeeds — the agent answers through the slash-result channel, and a refusal
+/// leaves the old map in place.
+async fn save_keymap(
+    app: &mut App,
+    _map: &loon_config::KeyMap,
+    argument: String,
+    tx: &mpsc::Sender<UiCommand>,
+) {
+    let args: Vec<String> = argument.split_whitespace().map(str::to_string).collect();
+    let _ = tx
+        .send(UiCommand::Slash(SlashCommand::Keybind { args }))
+        .await;
+    app.manager_notice = "saving…".into();
+}
+
 /// Consume mouse events while a modal is open; never select transcript through it.
 pub fn mouse(app: &mut App, m: MouseEvent) -> bool {
     if let Some(form) = app.editor.as_mut() {

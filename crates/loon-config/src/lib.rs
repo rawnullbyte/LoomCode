@@ -5,11 +5,13 @@
 //! and unknown extension fields survive a round trip.
 
 pub mod editor;
+pub mod keymap;
 pub mod paths;
 pub mod schema;
 pub mod tokens;
 pub mod validate;
 
+pub use keymap::{Action as KeyAction, Chord, KeyMap, Keys, Mods, Profile as KeyProfile, Scope};
 pub use paths::LoonPaths;
 pub use schema::{
     ApiFamily, Appearance, AppearanceMode, CapState, CapabilityOverrides, Combo, ComboMember,
@@ -48,6 +50,12 @@ pub struct Config {
     /// Lifecycle hooks keyed by event name.
     #[serde(default)]
     pub hooks: std::collections::BTreeMap<String, Vec<schema::Hook>>,
+    /// Configurable keybindings. Absent means the default profile.
+    #[serde(default)]
+    pub keys: keymap::Keys,
+    /// Category-aware model/effort routing for delegated work.
+    #[serde(default)]
+    pub routing: schema::Routing,
 }
 
 impl Config {
@@ -92,6 +100,8 @@ impl Config {
             mcp: Mcp::default(),
             context7: Default::default(),
             hooks: Default::default(),
+            keys: Default::default(),
+            routing: Default::default(),
         }
     }
 
@@ -268,6 +278,32 @@ tips = true
 # Permission-mode footer row.
 footer = true
 
+# ── Keybindings ──────────────────────────────────────────────────────────────────
+# profile picks a starting point (default | emacs | vim); bindings override individual
+# actions. `action = "chord"` rebinds, `action = ""` unbinds. Chords are written as
+# ctrl+p, alt+left, shift+enter, f1, space. Open /keybindings to edit these interactively.
+[keys]
+# profile = "default"
+
+# [keys.bindings]
+# open_palette = "ctrl+p"
+# history_search = "ctrl+r"
+# open_sessions = "ctrl+g"
+
+# ── Category routing for delegated work ─────────────────────────────────────────
+# Roles (reviewer, explorer, debugger, …) resolve a model in this order: the role's own
+# `model`, then its category here, then the session model. A route that no longer resolves
+# is skipped with the reason reported, never silently applied. /agents shows the result.
+# [routing.models]
+# quick = "local/small"          # exploration, routine lookups
+# deep = "cloud/strong"
+# ultrabrain = "cloud/reasoner"
+# security = "cloud/reviewer"
+#
+# [routing.effort]
+# quick = "low"
+# deep = "high"
+
 # ── Providers: any number of OpenAI-compatible endpoints ─────────────────────────
 # [providers.ollama]
 # base_url = "http://127.0.0.1:11434/v1"
@@ -332,5 +368,46 @@ mod example_config_tests {
                 "`{key}` must appear in the example config"
             );
         }
+    }
+
+    /// The keybinding section is discoverable from the starter file, and the example's own
+    /// `[keys]` table validates — a documented chord that conflicts would teach a broken
+    /// keymap.
+    /// The routing tables are documented in the starter file and round-trip through the schema,
+    /// so a user does not have to read the source to find them.
+    #[test]
+    fn the_example_documents_category_routing() {
+        let text = example_toml();
+        for key in ["[routing.models]", "[routing.effort]", "ultrabrain"] {
+            assert!(text.contains(key), "`{key}` must be in the example config");
+        }
+        let cfg: Config = toml::from_str(
+            "schema_version = 1\n\
+             [routing.models]\nquick = 'local/small'\n\
+             [routing.effort]\nquick = 'low'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.routing.models.get("quick").map(String::as_str),
+            Some("local/small")
+        );
+        assert_eq!(
+            cfg.routing.effort.get("quick").map(String::as_str),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn the_example_documents_valid_keybindings() {
+        let text = example_toml();
+        assert!(text.contains("[keys]"), "the keys table must be documented");
+        for chord in ["ctrl+p", "alt+left", "shift+enter"] {
+            assert!(
+                text.contains(chord),
+                "the chord syntax `{chord}` needs an example"
+            );
+        }
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert!(crate::keymap::validate(&cfg.keys).is_empty());
     }
 }

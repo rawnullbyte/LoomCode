@@ -18,12 +18,14 @@ pub mod loops;
 pub mod mcp;
 mod mcp_http;
 pub mod memory;
+pub mod mode;
 pub mod oneshot;
 pub mod output;
 pub mod permissions;
 pub mod prompt;
 pub mod replay;
 pub mod rewind;
+pub mod roles;
 pub mod skills;
 pub mod subagent;
 pub mod supervisor;
@@ -166,6 +168,17 @@ pub enum AgentEvent {
     },
     TurnFinished {
         status: TurnStatus,
+    },
+    /// `/keybind` changed the effective keymap. The UI swaps its dispatcher map so the new
+    /// chords work immediately, without a restart.
+    KeymapChanged {
+        profile: String,
+        bindings: std::collections::BTreeMap<String, String>,
+    },
+    /// `/mode` or a task keyword changed the execution strategy. The status bar shows it, so
+    /// the indicator always reflects the mode the runtime is actually enforcing.
+    ExecutionModeChanged {
+        mode: String,
     },
 }
 
@@ -1157,6 +1170,32 @@ impl Agent {
             self.ctx.ws.root(),
             &memory::MemoryPaths::resolve(&self.data_dir, self.ctx.ws.root()),
         );
+        // A leading mode keyword ("ultrawork fix the parser", "ulw: add a test") selects the
+        // strategy and is stripped before the prompt is journaled or sent. Routing happens
+        // here so the TUI and the headless CLI behave identically; an explicit /mode always
+        // wins, because it is applied before this text ever arrives.
+        let routed = mode::route(user_text);
+        if let Some((chosen, _rest)) = &routed {
+            if *chosen != self.mode() {
+                if let Ok(note) = self.apply_mode(*chosen) {
+                    self.emit(AgentEvent::Warning(note));
+                }
+            }
+        }
+        let user_text: &str = match &routed {
+            Some((_, rest)) => rest.as_str(),
+            None => user_text,
+        };
+        if user_text.trim().is_empty() {
+            return TurnResult {
+                status: TurnStatus::Failed(
+                    "the mode keyword was the whole prompt; add a task".into(),
+                ),
+                assistant_text: String::new(),
+                steps: 0,
+                usage: Usage::default(),
+            };
+        }
         self.repair_interrupted_calls();
         let _ = self.cancel_tx.send(false);
         self.emit_async(AgentEvent::TurnStarted).await;
@@ -1908,11 +1947,8 @@ impl Agent {
             };
         }
 
-        if self.worklog.read().map(|s| s.plan_mode).unwrap_or(false)
-            && spec.spec().effects == Effects::Mutating
-            && !["update_plan", "note", "task", "todo_write"].contains(&spec.spec().name.as_str())
-        {
-            let reason="Plan mode blocks workspace mutations. Continue inspection/planning; only the user can leave plan mode with /plan off.".to_string();
+        if let Some(reason) = self.mutation_refusal(&spec.spec()) {
+            let reason = reason.to_string();
             let _ = self.journal.append(
                 Some(*call_event_id),
                 EventKind::ToolCallRejected {
@@ -2159,6 +2195,82 @@ impl Agent {
         self.history.push(loon_providers::ChatMessage::user(text));
     }
 
+    /// The configured category routing (models and effort), read from effective configuration.
+    /// A configuration error yields empty tables rather than failing delegation: a typo in one
+    /// routing entry must not make subagents unusable.
+    pub fn routing_tables(
+        &self,
+    ) -> (
+        roles::RoutingTable,
+        std::collections::BTreeMap<roles::Category, String>,
+    ) {
+        subagent::routing_from_config(&self.loon_paths(), self.ctx.ws.root())
+    }
+
+    /// The single place that decides whether the current session strategy forbids a tool.
+    ///
+    /// Returns the refusal message, so the model is told *why* and what to do instead. Plan mode
+    /// and read-only execution modes both land here; the message names the actual reason rather
+    /// than always saying "plan mode", and the bookkeeping tools stay available so a read-only
+    /// pass can still record findings.
+    pub(crate) fn mutation_refusal(&self, spec: &loon_tools::ToolSpec) -> Option<String> {
+        const BOOKKEEPING: [&str; 4] = ["update_plan", "note", "task", "todo_write"];
+        if spec.effects != Effects::Mutating || BOOKKEEPING.contains(&spec.name.as_str()) {
+            return None;
+        }
+        let plan_mode = self.worklog.read().map(|s| s.plan_mode).unwrap_or(false);
+        if !plan_mode {
+            return None;
+        }
+        let mode = self.mode();
+        Some(if mode.read_only() && mode != mode::Mode::Plan {
+            format!(
+                "{mode} mode is read-only: this tool would change the workspace. Report findings \
+                 instead; /mode normal leaves the mode."
+            )
+        } else {
+            "Plan mode blocks workspace mutations. Continue inspection/planning; only the user \
+             can leave plan mode with /plan off or /mode normal."
+                .to_string()
+        })
+    }
+
+    /// The messages that would be sent to the provider right now. Test seam: it exercises the
+    /// real assembly, so a test can assert on the guidance the model would actually receive.
+    #[doc(hidden)]
+    pub fn messages_for_test(&self) -> Vec<loon_providers::ChatMessage> {
+        self.assemble_messages()
+    }
+
+    /// Run one tool call through the real gate (validation, permissions, strategy restriction)
+    /// and return the text the model would have received. Test seam: it exercises the same
+    /// `execute_tool` a model-initiated call takes, so a strategy test cannot bypass the gate by
+    /// calling the tool directly.
+    #[doc(hidden)]
+    pub async fn call_tool_for_test(&self, name: &str, arguments: serde_json::Value) -> String {
+        let call = loon_providers::ToolCallReq {
+            id: "test-call".into(),
+            name: name.to_string(),
+            arguments_json: arguments.to_string(),
+        };
+        let id = loon_events::EvId::now_v7();
+        self.execute_tool(&id, &call).await.model_text
+    }
+
+    /// Journaled user prompts, oldest first. Test seam for asserting what was actually sent.
+    #[doc(hidden)]
+    pub fn user_prompts_for_test(&self) -> Vec<String> {
+        self.journal
+            .events()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| match e.kind {
+                EventKind::UserMessage { text } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn assemble_messages(&self) -> Vec<loon_providers::ChatMessage> {
         let mut v = vec![loon_providers::ChatMessage::system(
             self.system_prompt.clone(),
@@ -2194,6 +2306,14 @@ impl Agent {
         }
         let effort = loon_config::Effort::parse(self.effort.as_deref().unwrap_or("medium"))
             .unwrap_or_default();
+        // The active mode's guidance is injected fresh each request: it reflects `/mode` and a
+        // keyword change immediately, and costs nothing when the mode is normal.
+        let active_mode = self.mode();
+        if let Some(guidance) = active_mode.guidance() {
+            v.push(loon_providers::ChatMessage::system(format!(
+                "Execution mode: {active_mode}. {guidance}"
+            )));
+        }
         v.push(loon_providers::ChatMessage::system(format!(
             "Coding effort: {}",
             effort.guidance()

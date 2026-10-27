@@ -72,6 +72,9 @@ async fn main() {
         "context7",
         "thinking",
         "appearance",
+        "modes",
+        "keybindings",
+        "palette",
     ] {
         let mut app = App::new(
             false,
@@ -122,7 +125,38 @@ async fn main() {
             app.request_rate.add_chars(12400 + 1600);
             app.turn_started = Some(std::time::Instant::now() - std::time::Duration::from_secs(12));
         }
+        if view == "palette" {
+            // The real palette, built from the real command table, with a query typed in.
+            app.open_palette();
+            if let Some(palette) = &mut app.command_palette {
+                for c in "key".chars() {
+                    palette.push(c);
+                }
+            }
+        }
         app.navigator = match view {
+            "modes" => Some(Navigator::new(
+                Default::default(),
+                View::Menu(
+                    "Execution mode".into(),
+                    loon_core::mode::Mode::ALL
+                        .iter()
+                        .map(|m| MenuItem {
+                            label: format!(
+                                "{}{}",
+                                if *m == loon_core::mode::Mode::Ultrawork {
+                                    "● "
+                                } else {
+                                    "  "
+                                },
+                                m.id()
+                            ),
+                            detail: m.description().into(),
+                            command: format!("/mode {}", m.id()),
+                        })
+                        .collect(),
+                ),
+            )),
             "appearance" => Some(Navigator::new(
                 Default::default(),
                 View::Menu(
@@ -147,6 +181,23 @@ async fn main() {
             }
             _ => None,
         };
+        if view == "keybindings" {
+            // Set after the navigator assignment, so the editor is what the frame renders.
+            app.keys = loon_config::KeyMap::new(
+                loon_config::KeyProfile::Emacs,
+                &std::collections::BTreeMap::from([(
+                    "open_sessions".to_string(),
+                    "ctrl+shift+s".to_string(),
+                )]),
+            );
+            app.open_keybindings();
+            if let Some(nav) = &mut app.navigator {
+                nav.keys = app.keys.clone();
+                // Page to the prompt bindings so the preview shows real chords, not the
+                // alphabetical tail of the list.
+                nav.selected = 3;
+            }
+        }
         let (w, h) = (110, 30);
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| loon_tui::ui::draw(f, &mut app)).unwrap();

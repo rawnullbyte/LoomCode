@@ -85,6 +85,10 @@ mockup. Regenerate them with `cargo run -p loon-tui --example preview -- docs/pr
 | **Appearance** — seven palettes preview live | **Activity** — thinking, writing and tools distinguished |
 | ![Workspace](docs/previews/workspace.svg) | ![Context7](docs/previews/context7.svg) |
 | **Workspace** — what this session changed | **Documentation** — library docs with masked keys |
+| ![Command palette](docs/previews/palette.svg) | ![Keybindings](docs/previews/keybindings.svg) |
+| **Palette** — one search over commands, models, modes | **Keybindings** — rebind, reset, conflict-checked |
+| ![Execution modes](docs/previews/modes.svg) | |
+| **Modes** — strategy, with what each one enforces | |
 
 ## Management
 
@@ -102,6 +106,8 @@ mockup. Regenerate them with `cargo run -p loon-tui --example preview -- docs/pr
 | `/providers key-clear NAME` | Remove saved inline/environment credentials for that provider |
 | `/combos` | Manage ordered fallback or round-robin groups |
 | `/combos add NAME round_robin provider/model provider/model` | Create a rotating group; `fallback` is also supported |
+| `/mode`, `/mode NAME [TASK]` | Execution strategy; a task starts immediately under it |
+| `/keybindings`, `/keybind ACTION CHORD` | Keymap editor, or rebind one action (persisted) |
 | `/settings`, `/config` | Quick preferences and a complete configuration browser; arrows adjust values, Enter edits |
 | `/config KEY=VALUE` | Validate, apply and persist a setting (`/config tips=true`) |
 | `/config KEY VALUE` | Same, for values containing spaces; `/config set KEY VALUE` also works |
@@ -471,6 +477,108 @@ context estimate refreshes at every step boundary, not only when the turn ends �
 turn shows the size it has actually grown to. Reasoning events show thinking
 activity when the provider supplies them; waiting, writing and tool execution are
 distinguished. The UI does not invent progress percentages.
+
+## Execution modes, keybindings and the command palette
+
+Three layers decide *how* a request runs, and each is explicit rather than inferred.
+
+**Execution modes** (`/mode`, or a leading keyword) set the strategy and the runtime switches it
+implies. A mode is not a label: `plan`, `review` and `security` really disable mutating tools
+through the same gate plan mode already used, `ultrawork` really turns on the independent
+completion supervisor, and `ultracode` really raises effort to `ultra`.
+
+| Mode | Effect |
+| --- | --- |
+| `normal` (default) | Direct, proportionate execution |
+| `plan` | Inspect and plan; workspace mutations are refused |
+| `execute` | Execute the approved plan, tracking every item |
+| `ultrawork` (keyword `ultrawork`/`ulw`) | Autonomous coordination + independent completion review |
+| `team` | Parallel specialists with one owner per file |
+| `research` (keyword `deepresearch`) | Documentation research before implementing |
+| `review` | Read-only review of changes |
+| `debug` | Reproduce and trace before changing code |
+| `security` | Read-only risk audit with attack paths |
+| `ultracode` | Highest configured effort + completion review |
+| `repair` | Retry incomplete work with new evidence |
+
+```text
+/mode                        # picker (or a status report headlessly)
+/mode plan design the migration   # switch, and start that task under the new mode
+ulw: add a regression test    # the same, from a leading keyword
+```
+
+Only unambiguous keywords route implicitly (`ultrawork`, `ulw`, `ultracode`, `deepresearch`).
+`review the parser` is a task, not a mode change — the mode names that are ordinary English words
+are reachable only through `/mode`, where you have said the next word is a mode. The mode is
+journaled with the session, so `/resume` restores it.
+
+**Keybindings** are data, not `KeyCode` matches scattered through the code. Every command key is
+resolved through one map in `[keys]`, with context-dependent scopes (the same Escape stops a turn
+in the prompt and dismisses a dialog in a list).
+
+| Action | Default |
+| --- | --- |
+| Submit / newline / interrupt-and-send | Enter / Shift+Enter / Ctrl+Enter |
+| Stop the turn | Esc, Esc |
+| Command palette | **Ctrl+P** |
+| Help | F1 |
+| History reverse search | Ctrl+R |
+| Expand tool output / copy last answer | Ctrl+O / Ctrl+Y |
+| Toggle work details | Ctrl+T |
+| Sessions / themes / models / settings | Ctrl+G / Alt+T / Alt+M / Alt+S |
+| Keybinding editor | F2 |
+| Word motion / delete word | Ctrl+← → / Ctrl+Backspace |
+| Cycle permission mode | Shift+Tab |
+
+```text
+/keybindings                      # searchable editor: Enter captures a key
+/keybind list                     # effective binding for every action
+/keybind open_palette ctrl+k      # rebind (names the action that lost the key, if any)
+/keybind reset all                # back to the profile defaults
+/keybind profile emacs            # default | emacs | vim
+```
+
+Chords are written `ctrl+p`, `alt+left`, `shift+enter`, `f1`, `space`. Conflict detection runs
+before anything is saved: a chord another action owns in the same scope is refused (or, for an
+explicit `/keybind ACTION CHORD`, taken over with the displaced action named), and a chord the
+terminal needs (`ctrl+z`, `ctrl+\`, `ctrl+s`) is rejected with the reason. Bad entries in
+`[keys]` make `loom config validate` fail rather than silently doing nothing.
+
+**The command palette** (Ctrl+P) searches every slash command, configured model, saved session,
+theme, setting, execution mode and bound shortcut with subsequence scoring. Accepting an entry
+submits the real command through the ordinary path, so the palette cannot drift from what the
+application does — there is no second command registry.
+
+## Roles and category-aware model routing
+
+`delegate`, `background_spawn` and `task_fanout` accept a role, a task category and an optional
+explicit model. Roles ship in the binary and are overridable by `.loon/agents/*.md`:
+
+```text
+orchestrator  planner  explorer  librarian  architect  implementer  frontend  backend
+debugger      tester   reviewer  security   documentation          release
+```
+
+Read-only roles (`reviewer`, `security`, `planner`, `explorer`, `librarian`, `architect`) have
+mutating tools removed from the child's registry, so "do not modify files" is enforced rather than
+requested. Model choice is resolved in a fixed order — the role's model, then the category's route,
+then the session model — and the delegation result names the model and the reason:
+
+```toml
+[routing.models]
+quick = "local/small"        # exploration, routine lookups
+deep = "cloud/strong"
+ultrabrain = "cloud/reasoner"
+security = "cloud/reviewer"
+
+[routing.effort]
+quick = "low"
+deep = "high"
+```
+
+A stale route (a model that no longer resolves) is skipped with the reason reported rather than
+breaking delegation. `/agents` shows each role's category, write policy and the model it would
+actually use, with why.
 
 ## Copying and controls
 

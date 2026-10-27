@@ -328,6 +328,22 @@ pub struct SessionCfg {
     pub autocompact: bool,
 }
 
+/// Task-category routing: which model and effort to use for each kind of work.
+///
+/// Categories are stable identifiers (`quick`, `deep`, `ultrabrain`, `visual-engineering`,
+/// `artistry`, `writing`, `testing`, `security`, `documentation`). An entry is a model reference
+/// exactly like `[session].model`, so `cloud/strong` and `combo:daily` both work. A reference
+/// that does not resolve is skipped with a note rather than breaking delegation.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Routing {
+    /// `category = "model reference"`.
+    #[serde(default)]
+    pub models: BTreeMap<String, String>,
+    /// `category = "low|medium|high|xhigh|ultra"`.
+    #[serde(default)]
+    pub effort: BTreeMap<String, String>,
+}
+
 /// UI/behavior settings (the `[ui]` table). Defaults mirror Claude-Code's feel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UiCfg {

@@ -32,7 +32,18 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
     app.viewport_area = Some(area);
     crate::manager::preview_theme(app);
     let completions = app.visible_completions();
-    let desired_popup = completions.len().min(app.popup_rows.clamp(3, 20)) as u16;
+    // The command palette and the slash-command popup share the row above the prompt: at most
+    // one of them can be open, and both answer "what can I run next".
+    let palette_hits = app
+        .command_palette
+        .as_ref()
+        .map(|p| p.hits().len())
+        .unwrap_or(0);
+    let desired_popup = if app.palette_open {
+        palette_hits.min(app.popup_rows.clamp(3, 20)) as u16
+    } else {
+        completions.len().min(app.popup_rows.clamp(3, 20)) as u16
+    };
     // The banner lives in the transcript, so there is no fixed header: the transcript
     // owns everything between the top of the screen and the input.
     let footer_h = if app.footer && area.height >= 2 { 1 } else { 0 };
@@ -194,7 +205,70 @@ fn draw_inner(f: &mut Frame, app: &mut App) {
     // [CC] style: borderless list, "❯ " marker on the hovered/selected row, name
     // column padded to a common width, description dimmed beside it. Hovering
     // highlights only; Enter/click picks.
-    if popup_rows > 0 && popup.height > 0 {
+    if popup_rows > 0 && popup.height > 0 && app.palette_open {
+        app.popup_rect = Some((popup.x, popup.y, popup.height));
+        let mut rows: Vec<Line> = Vec::new();
+        if let Some(palette) = &app.command_palette {
+            let hits = palette.hits();
+            let selected = palette.selected.min(hits.len().saturating_sub(1));
+            // Width budget for the label column: the hint must still have room, and a very
+            // long model reference must not push it off the frame.
+            let label_w = hits
+                .iter()
+                .map(|h| h.entry.label.chars().count())
+                .max()
+                .unwrap_or(0)
+                .min((popup.width as usize * 3 / 5).max(12));
+            for (idx, hit) in hits.iter().enumerate() {
+                let marker = if idx == selected { "❯ " } else { "  " };
+                let label = if hit.entry.label.chars().count() > label_w {
+                    hit.entry
+                        .label
+                        .chars()
+                        .take(label_w.saturating_sub(1))
+                        .collect::<String>()
+                        + "…"
+                } else {
+                    hit.entry.label.clone()
+                };
+                let pad = label_w.saturating_sub(label.chars().count());
+                let style = if idx == selected {
+                    theme.accent_bold()
+                } else {
+                    theme.base()
+                };
+                rows.push(Line::from(vec![
+                    Span::styled(marker, theme.accent_bold()),
+                    Span::styled(label, style),
+                    Span::styled(" ".repeat(pad), theme.base()),
+                    Span::styled("  ", theme.base()),
+                    Span::styled(
+                        clip_cells(
+                            &hit.entry.hint,
+                            (popup.width as usize).saturating_sub(2 + label_w + 2),
+                        ),
+                        theme.dim(),
+                    ),
+                ]));
+            }
+        }
+        // The query sits in its own dim row so the palette reads as a search box rather than
+        // a plain list; Empty means "everything", which is what an empty query lists.
+        rows.insert(
+            0,
+            Line::from(vec![
+                Span::styled("⌕ ", theme.accent_bold()),
+                Span::styled(
+                    app.command_palette
+                        .as_ref()
+                        .map(|p| p.query.clone())
+                        .unwrap_or_default(),
+                    theme.base(),
+                ),
+            ]),
+        );
+        f.render_widget(Paragraph::new(rows).style(theme.base()), popup);
+    } else if popup_rows > 0 && popup.height > 0 {
         app.popup_rect = Some((popup.x, popup.y, popup.height));
         let selected = app.completion_selected.min(completions.len() - 1);
         // window the list so the selection stays visible when there are more rows
@@ -550,13 +624,22 @@ fn draw_status(f: &mut Frame, app: &App, theme: &theme::Theme, area: ratatui::la
         .rsplit('/')
         .next()
         .unwrap_or(&app.status.model);
-    let left = vec![
+    let mut left = vec![
         (
             format!(" {} ", app.status.mode),
             theme.mode_style(&app.status.mode),
         ),
         (format!("│ {model}"), theme.accent_bold()),
     ];
+    // The execution mode is a separate axis from the permission mode, and only worth a badge
+    // when it is not the default: `normal` on every row would be noise.
+    if app.execution_mode != "normal" {
+        let style = match app.execution_mode.as_str() {
+            "plan" | "review" | "security" => theme.accent_bold(),
+            _ => theme.warn(),
+        };
+        left.push((format!(" · {} ", app.execution_mode.to_uppercase()), style));
+    }
     f.render_widget(
         Paragraph::new(Line::from(clip_spans(left, identity.width))),
         identity,

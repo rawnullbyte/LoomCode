@@ -20,6 +20,8 @@ use futures::StreamExt;
 pub mod autocomplete;
 pub mod banner;
 pub mod history;
+pub mod keys;
+pub mod palette;
 pub mod queue;
 
 use loon_core::{Agent, AgentConfig, AgentEvent, TurnStatus};
@@ -109,6 +111,7 @@ pub struct SelRange {
 pub struct StatusLine {
     pub model: String,
     pub member: Option<String>,
+    /// Permission mode (`bypass`, `ask`, ...).
     pub mode: String,
     pub context_est: u64,
     pub busy: bool,
@@ -145,6 +148,26 @@ pub struct App {
     pub ascii_only: bool,
     pub color_mode: String,
     pub show_tool_details: bool,
+    /// Ctrl+T: expand the background-task and work panel instead of a truncated count.
+    pub details_open: bool,
+    /// Configurable keybindings, resolved from `[keys]` and updated live when configuration
+    /// changes. Every command key goes through this map.
+    pub keys: loon_config::KeyMap,
+    /// Command palette state (Ctrl+P). `None` means closed.
+    pub command_palette: Option<palette::Palette>,
+    /// `palette.is_some()`, mirrored as a plain flag so key scoping stays cheap.
+    pub palette_open: bool,
+    /// Model references and recent selections, kept in sync with the catalog so the palette
+    /// can offer "switch to this model" without asking the agent.
+    pub catalog_models: Vec<String>,
+    pub recent_models: Vec<String>,
+    /// Session ids with their titles, so the palette can offer a resume target by name.
+    pub catalog_sessions: Vec<(String, String)>,
+    /// Set while `/keybindings` waits for the next key press; the action being rebound.
+    pub pending_key_capture: Option<loon_config::KeyAction>,
+    /// Execution mode (`normal`, `plan`, `ultrawork`, …) as last reported by the agent. Shown
+    /// beside the permission mode, so the strategy in force is never ambiguous.
+    pub execution_mode: String,
     pub request_rate: request_rate::RequestRate,
     pub modal_age: u64,
     pub work_state: loon_core::worklog::WorkState,
@@ -268,6 +291,15 @@ impl App {
             ascii_only: false,
             color_mode: "auto".into(),
             show_tool_details: false,
+            details_open: false,
+            keys: loon_config::KeyMap::default(),
+            command_palette: None,
+            palette_open: false,
+            catalog_models: Vec::new(),
+            recent_models: Vec::new(),
+            catalog_sessions: Vec::new(),
+            pending_key_capture: None,
+            execution_mode: "normal".into(),
             request_rate: Default::default(),
             modal_age: 0,
             work_state: Default::default(),
@@ -355,6 +387,45 @@ impl App {
         }
         self.navigator = Some(manager::Navigator::new(Default::default(), next));
     }
+    /// Open the command palette (Ctrl+P). Entries come from the live command table, the
+    /// configured models, saved sessions, palettes, settings and bound shortcuts, so the
+    /// palette never offers something the application cannot actually do.
+    pub fn open_palette(&mut self) {
+        let commands = loon_core::commands::command_list();
+        let bound =
+            |action: loon_config::KeyAction| self.keys.chord_for(action).map(|c| c.to_string());
+        let modes: Vec<(&'static str, &'static str)> = loon_core::mode::Mode::ALL
+            .iter()
+            .map(|m| (m.id(), m.description()))
+            .collect();
+        let settings: Vec<(&'static str, &'static str)> = loon_core::commands::settings_registry()
+            .iter()
+            .map(|d| (d.key, d.description))
+            .collect();
+        let entries = palette::entries(&palette::Sources {
+            commands: &commands,
+            models: &self.catalog_models,
+            recent_models: &self.recent_models,
+            themes: &crate::theme::PALETTE_NAMES,
+            sessions: &self.catalog_sessions,
+            settings: &settings,
+            modes: &modes,
+            bound: &bound,
+        });
+        self.command_palette = Some(palette::Palette::new(entries));
+        self.palette_open = true;
+        self.cancel_armed = false;
+    }
+
+    /// Open `/keybindings`: one searchable row per action, Enter captures the next chord,
+    /// Ctrl+D unbinds, Ctrl+R resets one default and Ctrl+Shift+R resets the profile.
+    pub fn open_keybindings(&mut self) {
+        self.navigator = Some(manager::Navigator::new(
+            loon_core::catalog::Catalog::default(),
+            manager::View::Keybindings,
+        ));
+    }
+
     pub fn slash_result(&mut self, out: String) {
         if let Some(mut form) = self.pending_editor.take() {
             if let Some(error) = out.strip_prefix("Error: ") {
@@ -1365,11 +1436,17 @@ async fn run_inner(
                     app.push_block(Block::System(note));
                 }
                 AgentEvent::CatalogUpdated { catalog } => {
+                    // The palette offers the same live model list the browser does, so a
+                    // provider refresh is searchable without reopening anything.
+                    app.catalog_models = catalog.models.clone();
+                    app.recent_models = catalog.recent.clone();
                     if let Some(nav) = &mut app.navigator {
                         nav.catalog = catalog;
                     }
                 }
                 AgentEvent::OpenCatalog { view, catalog } => {
+                    app.catalog_models = catalog.models.clone();
+                    app.recent_models = catalog.recent.clone();
                     if app.navigator.as_ref().is_some_and(
                         |n| matches!(&n.view,manager::View::Menu(t,_) if t=="Settings" || t.starts_with("Settings / ")),
                     ) {
@@ -1502,6 +1579,21 @@ async fn run_inner(
                     app.tool_finished(&name, ok, &excerpt)
                 }
                 AgentEvent::ModeChanged { mode } => app.status.mode = mode,
+                AgentEvent::ExecutionModeChanged { mode } => {
+                    app.execution_mode = mode;
+                    app.activity = format!("Mode: {}", app.execution_mode);
+                }
+                AgentEvent::KeymapChanged { profile, bindings } => {
+                    // Apply immediately: the new chords work on the next key press, with no
+                    // restart, and the keybinding editor re-renders from the new map.
+                    let profile = loon_config::KeyProfile::parse(&profile)
+                        .unwrap_or(loon_config::KeyProfile::Default);
+                    app.keys = loon_config::KeyMap::new(profile, &bindings);
+                    if let Some(nav) = &mut app.navigator {
+                        nav.keys = app.keys.clone();
+                    }
+                    app.pending_key_capture = None;
+                }
                 AgentEvent::ToggleTheme => app.transparent = !app.transparent,
                 AgentEvent::SetTransparent { transparent } => app.transparent = transparent,
                 AgentEvent::OpenConfigMenu => {
@@ -1679,11 +1771,24 @@ async fn run_inner(
     Ok(())
 }
 
+/// Press one key, exactly as the event loop does. Exposed for behavioural tests that need to
+/// drive the real dispatcher rather than a copy of it.
+pub async fn press_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiCommand>) {
+    handle_key(app, key, cmd_tx).await
+}
+
 async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiCommand>) {
     if key.kind == crossterm::event::KeyEventKind::Release {
         return;
     }
     if key.code == KeyCode::Esc && key.kind == crossterm::event::KeyEventKind::Repeat {
+        return;
+    }
+    // ── 1. modal surfaces own the keyboard while they are open ──────────────────────
+    // The command palette is a modal search box: printable keys extend the query, arrows
+    // move the selection, Enter accepts and Esc closes. Nothing else may fire.
+    if app.command_palette.is_some() {
+        palette_key(app, key, cmd_tx).await;
         return;
     }
     // Ctrl+R reverse search is a modal prompt-line mode: while it is open, printable keys
@@ -1694,8 +1799,9 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match key.code {
-            // Ctrl+R again walks to the next older match, as in a shell.
-            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // The same chord that opened the search walks to the next older match, as in a
+            // shell. Checked through the keymap so a rebind moves both directions together.
+            _ if keys::chord(&key) == app.keys.chord_for(loon_config::KeyAction::HistorySearch) => {
                 app.history_search_older();
             }
             KeyCode::Backspace => app.history_search_backspace(),
@@ -1706,19 +1812,11 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         }
         return;
     }
-    // Ctrl+R opens the search (the shell binding users reach for).
-    if key.code == KeyCode::Char('r') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        if !app.open_history_search() {
-            app.push_block(Block::System(
-                "no prompt history yet — send a prompt first".into(),
-            ));
-        }
-        return;
-    }
     // A double-Esc stop is armed by one Esc and disarmed by anything else.
     if key.code != KeyCode::Esc {
         app.cancel_armed = false;
     }
+    // The navigator/form/keybinding editor has its own modal handling.
     if app.pending_approval.is_none() && manager::key(app, key, cmd_tx).await {
         return;
     }
@@ -1753,22 +1851,9 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         }
         return;
     }
-    if key.code == KeyCode::Char('o') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.show_tool_details = !app.show_tool_details;
-        app.selection = None;
-        app.selection_snapshot = None;
-        return;
-    }
-    if key.code == KeyCode::Char('y') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        app.pending_copy = app.blocks.iter().rev().find_map(|b| {
-            if let Block::Assistant(s) = b {
-                Some(s.clone())
-            } else {
-                None
-            }
-        });
-        return;
-    }
+    // ── 2. copy of a live selection ─────────────────────────────────────────────────
+    // This is not a command binding: what Ctrl+C means depends on whether a selection
+    // exists, so it must be decided before the configurable action runs.
     if key.code == KeyCode::Char('c')
         && key.modifiers.contains(KeyModifiers::CONTROL)
         && (app.selection.is_some() || app.input_selection().is_some())
@@ -1785,89 +1870,29 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         app.input_anchor = None;
         return;
     }
+    // ── 3. configurable actions ─────────────────────────────────────────────────────
+    // Shift is a modifier on the same command (Ctrl+Shift+Left selects a word), so the
+    // lookup ignores it: `chord` keeps shift only for named keys, and the selection flag is
+    // carried separately into the action.
+    match keys::dispatch(app, &key, cmd_tx).await {
+        Ok(keys::Handled::Action(_)) => return,
+        Ok(keys::Handled::Unbound) => {}
+        Err(message) => {
+            app.push_block(Block::System(message));
+            return;
+        }
+    }
+    // ── 4. fixed text editing in the prompt ─────────────────────────────────────────
+    // Characters, caret motion, selection and completion are editing primitives rather
+    // than commands; they stay fixed so typing behaves the same way for every keymap.
     match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.status.busy {
-                let _ = cmd_tx.send(UiCommand::Cancel).await;
-                if !app.cancel_hint_shown {
-                    app.push_block(Block::System("stopping…".into()));
-                    app.cancel_hint_shown = true;
-                }
-            } else if app.cancel_hint_shown {
-                app.quit = true;
-            } else {
-                app.cancel_hint_shown = true;
-                app.push_block(Block::System("press Ctrl+C again to quit".into()));
-            }
-        }
-        KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => app.quit = true,
-        // Ctrl+Enter (Alt+Enter as a terminal fallback): send now, ahead of the queue.
-        // Ctrl+Enter: stop what is running and take over. With text, it sends that now
-        // and the queued prompts follow; with an empty input it just stops the turn so
-        // the queue drains. Doing nothing when both are empty would be a dead key.
-        KeyCode::Enter
-            if key.modifiers.contains(KeyModifiers::CONTROL)
-                || key.modifiers.contains(KeyModifiers::ALT) =>
-        {
-            let text = app.input.trim().to_string();
-            if text.is_empty() && app.queued.is_empty() && !app.status.busy {
-                return;
-            }
-            app.input.clear();
-            app.cursor = 0;
-            app.input_anchor = None;
-            app.cancel_armed = false;
-            if text.is_empty() {
-                let _ = cmd_tx.send(UiCommand::SendNow(String::new())).await;
-                app.push_block(Block::System("stopped — running the queue".into()));
-                return;
-            }
-            submit(app, cmd_tx, text, true).await;
-        }
-        // Shift+Enter starts a new line; the input grows instead of sending.
-        KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
-            let byte = app.cursor_byte_offset(app.cursor);
-            app.input.insert(byte, '\n');
-            app.cursor += 1;
-            app.input_changed();
-        }
-        KeyCode::Enter
-            if !key.modifiers.contains(KeyModifiers::ALT)
-                && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-        {
-            let text = app.input.trim().to_string();
-            app.input.clear();
-            app.cursor = 0;
-            app.input_anchor = None;
-            if text.is_empty() {
-                if app.queue_paused && !app.queued.is_empty() {
-                    app.queue_paused = false;
-                    app.begin_turn();
-                    app.status.busy = true;
-                    let _ = cmd_tx.send(UiCommand::SendNow(String::new())).await;
-                }
-                return;
-            }
-            submit(app, cmd_tx, text, false).await;
-        }
-        // Ctrl/Alt+Backspace deletes the word before the caret (and the whitespace
-        // after it); a newline is a hard stop so a line break is never eaten silently.
+        // Shift+Backspace is a plain backspace, not a second word-delete binding: word
+        // deletion is bound to Ctrl/Alt+Backspace through the keymap.
         KeyCode::Backspace
-            if key
+            if !key
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
         {
-            if app.cursor > 0 {
-                let start = word_left(&app.input, app.cursor);
-                let from = app.cursor_byte_offset(start);
-                let to = app.cursor_byte_offset(app.cursor);
-                app.input.replace_range(from..to, "");
-                app.cursor = start;
-            }
-            app.input_changed();
-        }
-        KeyCode::Backspace => {
-            // Backspace on a selection deletes the selection, not one more character.
             if let Some((lo, hi)) = app.input_selection() {
                 let from = app.cursor_byte_offset(lo);
                 let to = app.cursor_byte_offset(hi);
@@ -1882,26 +1907,29 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             }
             app.input_changed();
         }
-        // Arrow keys: plain moves one char, Ctrl moves a whole word (matching
-        // Ctrl+Backspace's word boundaries), Shift extends a selection. The three
-        // combine: Ctrl+Shift+Left selects the word to the left.
+        KeyCode::Delete => {
+            if let Some((lo, hi)) = app.input_selection() {
+                let from = app.cursor_byte_offset(lo);
+                let to = app.cursor_byte_offset(hi);
+                app.input.replace_range(from..to, "");
+                app.cursor = lo;
+                app.input_changed();
+            } else if app.cursor < app.input.chars().count() {
+                let byte = app.cursor_byte_offset(app.cursor);
+                let byte_end = app.cursor_byte_offset(app.cursor + 1);
+                app.input.replace_range(byte..byte_end, "");
+                app.input_changed();
+            }
+        }
+        // Arrow keys: plain moves one char, Shift extends a selection, and word motion is
+        // the configurable `word_left`/`word_right` action. The three combine.
         KeyCode::Left => {
             let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-            let target = if key.modifiers.contains(KeyModifiers::CONTROL) {
-                prev_word_start(&app.input, app.cursor)
-            } else {
-                app.cursor.saturating_sub(1)
-            };
-            app.move_cursor(target, extend);
+            app.move_cursor(app.cursor.saturating_sub(1), extend);
         }
         KeyCode::Right => {
             let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-            let target = if key.modifiers.contains(KeyModifiers::CONTROL) {
-                word_right(&app.input, app.cursor)
-            } else {
-                app.cursor + 1
-            };
-            app.move_cursor(target, extend);
+            app.move_cursor(app.cursor + 1, extend);
         }
         KeyCode::Home => {
             let (line, _) = app.cursor_line_col();
@@ -1913,95 +1941,27 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
             let extend = key.modifiers.contains(KeyModifiers::SHIFT);
             app.move_cursor(app.offset_at(line, usize::MAX), extend);
         }
-        // single-line input: Up/Down jump to the ends (popup navigation keeps
-        // priority when the popup is visible). Up on an empty input pulls the most
-        // recently queued prompt back for editing; otherwise Up steps through the
-        // sent-prompt history shell-style, newest first. Queued recall wins when
-        // both apply because its text never ran; browsing sent prompts is the
-        // fallback. Shift+Up/Down stay ordinary caret motion: a selection anchor
-        // cannot survive swapping the whole input for a different prompt.
-        KeyCode::Up
-            if app.completion_count() == 0 && app.input.is_empty() && !app.queued.is_empty() =>
-        {
-            // The request loop can consume the queue concurrently: the driver returns
-            // only text it actually removed, preventing duplicate sends after Up.
-            let _ = cmd_tx.send(UiCommand::TakeLastQueued).await;
-        }
-        // Shift is excluded so it falls through to the line-motion arms below:
-        // swapping the whole input out from under a selection anchor is never what
-        // "select the line above" means.
-        KeyCode::Up
-            if app.completion_count() == 0
-                && !key.modifiers.contains(KeyModifiers::SHIFT)
-                && app.can_recall_previous() =>
-        {
-            app.recall_previous();
-        }
-        KeyCode::Up if app.completion_count() == 0 && app.input.contains('\n') => {
-            let (line, col) = app.cursor_line_col();
-            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-            app.move_cursor(app.offset_at(line.saturating_sub(1), col), extend);
-        }
-        KeyCode::Down
-            if app.completion_count() == 0
-                && !key.modifiers.contains(KeyModifiers::SHIFT)
-                && app.can_recall_next() =>
-        {
-            app.recall_next();
-        }
-        KeyCode::Down if app.completion_count() == 0 && app.input.contains('\n') => {
-            let (line, col) = app.cursor_line_col();
-            let last = app.input_lines().len().saturating_sub(1);
-            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-            app.move_cursor(app.offset_at((line + 1).min(last), col), extend);
-        }
-        KeyCode::Up if app.completion_count() == 0 => {
-            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-            app.move_cursor(0, extend)
-        }
-        KeyCode::Down if app.completion_count() == 0 => {
-            let end = app.input.chars().count();
-            let extend = key.modifiers.contains(KeyModifiers::SHIFT);
-            app.move_cursor(end, extend)
-        }
-        KeyCode::PageUp => {
-            app.scroll_from_bottom = Some(app.scroll_from_bottom.unwrap_or(0).saturating_add(10));
-        }
-        KeyCode::PageDown => match app.scroll_from_bottom {
-            Some(0) | None => app.scroll_from_bottom = None,
-            Some(n) => app.scroll_from_bottom = Some(n.saturating_sub(10)),
-        },
-        KeyCode::Up if app.completion_count() > 0 => {
-            if app.completion_selected == 0 {
-                app.completion_selected = app.completion_count() - 1; // wrap
+        // Shift+arrows extend a selection for line motion too.
+        KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if app.input.contains('\n') {
+                let (line, col) = app.cursor_line_col();
+                app.move_cursor(app.offset_at(line.saturating_sub(1), col), true);
             } else {
-                app.completion_selected -= 1;
+                app.move_cursor(0, true);
             }
         }
-        KeyCode::Down if app.completion_count() > 0 => {
-            app.completion_selected = (app.completion_selected + 1) % app.completion_count();
+        KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+            if app.input.contains('\n') {
+                let (line, col) = app.cursor_line_col();
+                let last = app.input_lines().len().saturating_sub(1);
+                app.move_cursor(app.offset_at((line + 1).min(last), col), true);
+            } else {
+                let end = app.input.chars().count();
+                app.move_cursor(end, true);
+            }
         }
         KeyCode::Tab if app.completion_count() > 0 => {
             app.accept_completion();
-        }
-        KeyCode::BackTab => {
-            let _ = cmd_tx.send(UiCommand::CycleMode).await;
-        }
-        KeyCode::Esc if app.completion_count() > 0 && !app.status.busy => {
-            app.popup_dismissed = true;
-            app.cancel_armed = false;
-        }
-        // Esc is a two-step hard stop: the first press only arms it, the second
-        // aborts the running turn immediately. Idle, it does nothing.
-        KeyCode::Esc if app.status.busy => {
-            if app.cancel_armed {
-                app.cancel_armed = false;
-                let _ = cmd_tx.send(UiCommand::Cancel).await;
-            } else {
-                app.cancel_armed = true;
-                app.popup_dismissed = true;
-                app.activity = "Esc again to stop".into();
-            }
         }
         KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             // Typing over a selection replaces it, as in any text field.
@@ -2018,6 +1978,89 @@ async fn handle_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiComman
         }
         _ => {}
     }
+}
+
+/// Keys while the command palette is open.
+async fn palette_key(app: &mut App, key: KeyEvent, cmd_tx: &mpsc::Sender<UiCommand>) {
+    let Some(mut palette) = app.command_palette.take() else {
+        return;
+    };
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    let mut keep = true;
+    match key.code {
+        KeyCode::Esc => {
+            // A second Escape after a query clears the query, as in most palettes.
+            if palette.query.is_empty() {
+                keep = false;
+            } else {
+                palette.clear();
+            }
+        }
+        KeyCode::Enter => {
+            keep = false;
+            if let Some(entry) = palette.selected_entry() {
+                app.record_sent(&format!("/palette {}", palette.query));
+                match entry.accept {
+                    palette::Accept::Input(input) => {
+                        let input = input.trim_end().to_string();
+                        if !input.is_empty() {
+                            app.palette_open = false;
+                            submit(app, cmd_tx, input, false).await;
+                            return;
+                        }
+                    }
+                    palette::Accept::Action(action) => {
+                        app.palette_open = false;
+                        if let Err(message) = keys::execute(app, action, cmd_tx).await {
+                            app.push_block(Block::System(message));
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        KeyCode::Up => palette.move_by(-1),
+        KeyCode::Down => palette.move_by(1),
+        KeyCode::PageUp => palette.move_by(-(palette.max_rows as isize)),
+        KeyCode::PageDown => palette.move_by(palette.max_rows as isize),
+        KeyCode::Backspace => palette.backspace(),
+        KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // Ctrl+P again closes, so the toggle is symmetric with how it opened.
+            keep = false;
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => palette.clear(),
+        KeyCode::Char(c) if plain => palette.push(c),
+        _ => {}
+    }
+    if keep {
+        app.command_palette = Some(palette);
+        app.palette_open = true;
+    } else {
+        app.command_palette = None;
+        app.palette_open = false;
+    }
+}
+
+/// Submit whatever is in the prompt now. `send_now` interrupts the running turn and takes
+/// over the queue; otherwise a running turn keeps the prompt queued behind it. Returns without
+/// doing anything for an empty prompt (except draining a paused queue, which Enter resumes).
+pub(crate) async fn submit_input(app: &mut App, cmd_tx: &mpsc::Sender<UiCommand>, send_now: bool) {
+    let text = app.input.trim().to_string();
+    app.input.clear();
+    app.cursor = 0;
+    app.input_anchor = None;
+    if text.is_empty() {
+        if app.queue_paused && !app.queued.is_empty() {
+            app.queue_paused = false;
+            app.begin_turn();
+            app.status.busy = true;
+            let _ = cmd_tx.send(UiCommand::SendNow(String::new())).await;
+        }
+        return;
+    }
+    submit(app, cmd_tx, text, send_now).await;
 }
 
 /// Shared Enter path. `send_now` cancels a running turn (in the driver) and starts
@@ -2254,7 +2297,7 @@ fn selected_text(app: &App, sel: SelRange) -> String {
 ///
 /// Skips spaces backwards, then the word itself. A newline is a hard stop: deleting
 /// must never merge two lines silently.
-fn word_left(text: &str, cursor: usize) -> usize {
+pub(crate) fn word_left(text: &str, cursor: usize) -> usize {
     let chars: Vec<char> = text.chars().collect();
     let mut start = cursor.min(chars.len());
     while start > 0 && chars[start - 1].is_whitespace() && chars[start - 1] != '\n' {
@@ -2270,7 +2313,7 @@ fn word_left(text: &str, cursor: usize) -> usize {
 /// [`word_left`], but a line break is crossed instead of stopping, because moving the
 /// caret destroys nothing. Standing at the start of a line, Ctrl+Left therefore lands
 /// on the start of the previous line's last word rather than doing nothing.
-fn prev_word_start(text: &str, cursor: usize) -> usize {
+pub(crate) fn prev_word_start(text: &str, cursor: usize) -> usize {
     let chars: Vec<char> = text.chars().collect();
     let start = word_left(text, cursor);
     if start < cursor.min(chars.len()) || start == 0 {
@@ -2286,7 +2329,7 @@ fn prev_word_start(text: &str, cursor: usize) -> usize {
 
 /// End of the word after `cursor`, for Ctrl+Right: skip the word being finished, then
 /// the whitespace after it, landing at the start of the next word.
-fn word_right(text: &str, cursor: usize) -> usize {
+pub(crate) fn word_right(text: &str, cursor: usize) -> usize {
     let chars: Vec<char> = text.chars().collect();
     let mut end = cursor.min(chars.len());
     while end < chars.len() && !chars[end].is_whitespace() {

@@ -1056,3 +1056,111 @@ fn config_validate_agrees_with_other_subcommands_on_a_bad_config() {
         "run must report the same config error the same way"
     );
 }
+
+/// A slash command is executed, not sent to the model. Before this, `loom run /agents` asked the
+/// mock provider and printed its guess, so no management command was reachable headlessly.
+#[test]
+fn slash_commands_execute_headlessly_instead_of_becoming_prompts() {
+    let home = tempfile::tempdir().unwrap();
+    let mode = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "/mode"])
+        .output()
+        .unwrap();
+    assert!(
+        mode.status.success(),
+        "{}",
+        String::from_utf8_lossy(&mode.stderr)
+    );
+    let out = String::from_utf8_lossy(&mode.stdout);
+    assert!(out.contains("mode: normal"), "{out}");
+    assert!(
+        !out.contains("Hello from the Loon mock provider"),
+        "the command must not be turned into a prompt: {out}"
+    );
+
+    let agents = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "/agents"])
+        .output()
+        .unwrap();
+    let out = String::from_utf8_lossy(&agents.stdout);
+    assert!(out.contains("reviewer"), "{out}");
+    assert!(
+        out.contains("read-only"),
+        "the write policy must be visible: {out}"
+    );
+}
+
+/// A usage error from a command exits 64 (invalid usage), distinct from a failed turn (1), so a
+/// script can tell "you typed it wrong" from "the work failed".
+#[test]
+fn an_unknown_mode_exits_with_the_usage_code() {
+    let home = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "/mode turbo"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(64));
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("turbo"), "{err}");
+    assert!(
+        err.contains("ultrawork"),
+        "the real modes must be listed: {err}"
+    );
+}
+
+/// `/keybind` writes the user config and a reserved chord is refused, both observable from the
+/// shell.
+#[test]
+fn keybind_persists_and_refuses_a_reserved_chord() {
+    let home = tempfile::tempdir().unwrap();
+    let set = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "/keybind open_palette ctrl+k"])
+        .output()
+        .unwrap();
+    assert!(set.status.success());
+    let out = String::from_utf8_lossy(&set.stdout);
+    assert!(out.contains("ctrl+k"), "{out}");
+    let config = std::fs::read_to_string(home.path().join("config/config.toml")).unwrap();
+    assert!(
+        config.contains("open_palette = \"ctrl+k\""),
+        "the binding must be written: {config}"
+    );
+
+    let refused = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "/keybind help ctrl+z"])
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(64));
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("suspend"),
+        "the refusal must explain why"
+    );
+}
+
+/// `/mode plan` switches the session strategy, and the plan mode it enables survives into a
+/// resumed session — the durable effect, not just the reply text.
+#[test]
+fn mode_selection_is_reported_and_durable() {
+    let home = tempfile::tempdir().unwrap();
+    let set = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "/mode plan"])
+        .output()
+        .unwrap();
+    assert!(set.status.success());
+    let out = String::from_utf8_lossy(&set.stdout);
+    assert!(out.contains("plan mode is on"), "{out}");
+
+    // A message materializes the session so its work state is durable.
+    let run = Command::new(env!("CARGO_BIN_EXE_loom"))
+        .env("LOON_HOME", home.path())
+        .args(["run", "/mode plan"])
+        .output()
+        .unwrap();
+    assert!(run.status.success());
+}

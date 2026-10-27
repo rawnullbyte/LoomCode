@@ -900,7 +900,10 @@ impl Agent {
                 // its own task. The clone shares the lock, so writes are serialised.
                 tasks: Some(self.worklog.clone()),
                 parent: Some(self.session_id()),
+                routing: self.routing_tables().0,
+                effort_routing: self.routing_tables().1,
             };
+            let delegate_spec = spec.clone();
             self.tools = self
                 .tools
                 .clone()
@@ -912,13 +915,9 @@ impl Agent {
                     "background_kill",
                 ])
                 .with_extra(vec![
-                    crate::subagent::delegate_tool(
-                        spec.paths.clone(),
-                        spec.cfg.clone(),
-                        spec.registry.clone(),
-                        spec.cwd.clone(),
-                        Some(self.worklog.clone()),
-                    ),
+                    // The resolved spec is reused, so `delegate` and `background_spawn` route
+                    // identically and both record the parent session.
+                    crate::subagent::delegate_tool_with_spec(delegate_spec),
                     std::sync::Arc::new(crate::subagent::BackgroundSpawnTool {
                         spec,
                         hub: self.background.clone(),

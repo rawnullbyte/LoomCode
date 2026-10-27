@@ -31,6 +31,9 @@ pub struct Profile {
     pub disallowed_tools: Vec<String>,
     pub isolation: bool,
     pub body: String,
+    /// Task category from frontmatter (`category: ultrabrain`), used for model routing. `None`
+    /// inherits the matching built-in role's category, or `deep`.
+    pub category: Option<String>,
 }
 pub fn profiles(data: &std::path::Path, cwd: &std::path::Path) -> Vec<Profile> {
     let mut profiles = std::collections::BTreeMap::new();
@@ -84,6 +87,7 @@ pub fn profiles(data: &std::path::Path, cwd: &std::path::Path) -> Vec<Profile> {
                     disallowed_tools: list("disallowedTools"),
                     isolation: fields.get("isolation").is_some_and(|s| s == "worktree"),
                     body: body.to_string(),
+                    category: fields.get("category").cloned(),
                 },
             );
         }
@@ -142,6 +146,40 @@ pub struct ChildSpec {
     /// The parent session id, recorded in the child's journal so resume can filter child
     /// sessions out — a child is not a resumable conversation.
     pub parent: Option<loon_events::EvId>,
+    /// `category` → model routing table from configuration.
+    pub routing: crate::roles::RoutingTable,
+    /// `category` → effort routing table from configuration.
+    pub effort_routing: std::collections::BTreeMap<crate::roles::Category, String>,
+}
+
+/// Read the category routing tables from effective configuration. Invalid category keys and
+/// invalid effort levels are dropped: a typo in one entry must not break delegation.
+pub fn routing_from_config(
+    paths: &LoonPaths,
+    cwd: &std::path::Path,
+) -> (
+    crate::roles::RoutingTable,
+    std::collections::BTreeMap<crate::roles::Category, String>,
+) {
+    let cfg = loon_config::Config::load_effective(paths, cwd)
+        .map(|(c, _)| c)
+        .unwrap_or_else(|_| loon_config::Config::builtin());
+    let mut models = std::collections::BTreeMap::new();
+    for (key, model) in &cfg.routing.models {
+        if let Some(category) = crate::roles::Category::parse(key) {
+            models.insert(category, model.clone());
+        }
+    }
+    let mut effort = std::collections::BTreeMap::new();
+    for (key, level) in &cfg.routing.effort {
+        if let (Some(category), true) = (
+            crate::roles::Category::parse(key),
+            loon_config::Effort::parse(level).is_some(),
+        ) {
+            effort.insert(category, level.clone());
+        }
+    }
+    (models, effort)
 }
 
 /// A child session built and ready for exactly one turn.
@@ -149,6 +187,9 @@ pub struct Child {
     pub agent: Agent,
     pub label: String,
     pub workspace: PathBuf,
+    /// Which model the child will run on and why. Reported with the result so the parent (and the
+    /// user reading the transcript) can answer "why did this run on that model".
+    pub routing: String,
 }
 
 /// Resolve the arguments of a delegation call into a ready-to-run child session.
@@ -178,20 +219,29 @@ async fn build_child(
             "subagent cwd is outside the parent's allowed roots".into(),
         ));
     }
+    // `agent` accepts either a project profile (`.loon/agents/*.md`) or a built-in role id. A
+    // built-in role has no profile file, so it contributes instructions and routing but no
+    // max-turn/tool restrictions — those come from the role's write policy below.
     let profile = if let Some(name) = args["agent"].as_str() {
-        Some(
-            profiles(&spec.paths.data_dir, &spec.cwd)
-                .into_iter()
-                .find(|p| p.name == name)
-                .ok_or_else(|| {
-                    loon_tools::ToolError::InvalidArgs(format!(
-                        "unknown agent profile {name}; use /agents"
-                    ))
-                })?,
-        )
+        let known = profiles(&spec.paths.data_dir, &spec.cwd);
+        match known.into_iter().find(|p| p.name == name) {
+            Some(profile) => Some(profile),
+            None => {
+                let roles = crate::roles::builtin_roles();
+                if !roles.iter().any(|r| r.id == name) {
+                    let available: Vec<String> = roles.iter().map(|r| r.id.clone()).collect();
+                    return Err(loon_tools::ToolError::InvalidArgs(format!(
+                        "unknown agent role or profile `{name}`; built-in roles: {}; project profiles live in .loon/agents",
+                        available.join(", ")
+                    )));
+                }
+                None
+            }
+        }
     } else {
         None
     };
+
     if profile.as_ref().is_some_and(|p| p.isolation) {
         let directory = spec
             .paths
@@ -218,13 +268,72 @@ async fn build_child(
         }
         cwd = directory;
     }
-    let model = profile
+    // Role- and category-aware model routing. An explicit `model` argument on the call wins over
+    // everything, because it is the most specific instruction the caller can give; then the
+    // role/profile, then the category table, then the session model. Each step is validated, so
+    // a stale routing entry is skipped with a visible note instead of failing the delegation.
+    let profiles_now = profiles(&spec.paths.data_dir, &spec.cwd);
+    let catalog = crate::roles::catalog(&spec.paths.data_dir, &spec.cwd, &profiles_now);
+    // Look the role up by the name the caller gave, whether it names a project profile or a
+    // built-in role. Keying this off `profile` alone meant a built-in role id resolved to no role
+    // at all: it kept its default category and lost its instructions.
+    let role = args["agent"]
+        .as_str()
+        .and_then(|name| catalog.iter().find(|r| r.id == name).cloned());
+    let category = args
+        .get("category")
+        .and_then(Value::as_str)
+        .and_then(crate::roles::Category::parse)
+        .or_else(|| role.as_ref().map(|r| r.category))
+        .unwrap_or_default();
+    // Whether this delegation is read-only, from the role's declared write policy. A project
+    // profile that disallows mutating tools is read-only too, via `catalog`.
+    let read_only_role = role
         .as_ref()
-        .and_then(|p| p.model.clone())
-        .unwrap_or_else(|| spec.cfg.model_ref.clone());
+        .is_some_and(|r| !r.writes || !r.allowed(loon_tools::Effects::Mutating));
+    let explicit = args.get("model").and_then(Value::as_str);
+    let (routing, notes) = match explicit {
+        Some(model) => {
+            spec.registry
+                .resolve(model)
+                .map_err(loon_tools::ToolError::InvalidArgs)?;
+            (
+                crate::roles::Routing {
+                    model: model.to_string(),
+                    why: crate::roles::Why::Role,
+                },
+                Vec::new(),
+            )
+        }
+        None => crate::roles::resolve(
+            role.as_ref(),
+            category,
+            &spec.routing,
+            &spec.cfg.model_ref,
+            |model| {
+                spec.registry
+                    .resolve(model)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            },
+        ),
+    };
+    let model = routing.model;
     spec.registry
         .resolve(&model)
         .map_err(loon_tools::ToolError::Other)?;
+    // The chosen model and the reason travel in the delegation result, not in the child's task:
+    // the parent (and the user reading the transcript) needs to know which model actually ran,
+    // while the child only needs its instructions.
+    let routing_note = format!(
+        "model {model} ({}){}",
+        routing.why.describe(),
+        if notes.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", notes.join("; "))
+        }
+    );
     let child_cfg = AgentConfig {
         model_ref: model,
         tool_output_bytes: spec.cfg.tool_output_bytes,
@@ -263,6 +372,19 @@ async fn build_child(
     )
     .map_err(|e| loon_tools::ToolError::Other(format!("subagent session failed: {e}")))?;
     child.adopt_cancel_channel(cancel);
+    if read_only_role {
+        // A read-only role keeps only non-mutating tools. This is a policy on the child's
+        // registry, so even an invented mutating call finds no tool to run.
+        let tools = child
+            .tools
+            .specs()
+            .into_iter()
+            .filter(|s| s.effects != loon_tools::Effects::Mutating)
+            .filter_map(|s| child.tools.get(&s.name))
+            .collect();
+        child.tools = loon_tools::ToolRegistry::new(tools);
+        child.refresh_tool_search();
+    }
     if let Some(profile) = &profile {
         let tools = child
             .tools
@@ -285,6 +407,14 @@ async fn build_child(
             }
             child.effort = Some(effort.clone());
         }
+        // Category effort applies only where the role did not state one.
+        if child.effort.is_none() {
+            if let Some(effort) = spec.effort_routing.get(&category) {
+                if loon_config::Effort::parse(effort).is_some() {
+                    child.effort = Some(effort.clone());
+                }
+            }
+        }
     }
     // The label names the child in every surface that shows it (the live panel, the
     // transcript, background_list). A bare "subagent" for every child made three parallel
@@ -293,25 +423,38 @@ async fn build_child(
         Some(p) => p.name.clone(),
         None => task_label(&task),
     };
-    let task = if let Some(profile) = &profile {
-        format!(
+    let task = match (&profile, &role) {
+        // A built-in role contributes its instructions; a project profile body wins over them by
+        // replacing the role definition in the catalog, so this is one source either way.
+        (Some(profile), _) => format!(
             "Agent profile {}:\n{}\n\nTask:\n{task}",
             profile.name, profile.body
-        )
-    } else {
-        task
+        ),
+        (None, Some(role)) => role.task_prompt(&task),
+        (None, None) => task,
     };
+    let _ = &routing_note;
     Ok((
         Child {
             agent: child,
             label,
             workspace,
+            routing: routing_note,
         },
         task,
     ))
 }
 
-/// Build the `delegate` tool.
+/// Build the `delegate` tool from an explicit [`ChildSpec`].
+///
+/// Prefer this over [`delegate_tool`] whenever the caller has already resolved routing or a
+/// parent session id: rebuilding a spec here would silently discard them, which is how category
+/// routing once reached `background_spawn` but not `delegate`.
+pub fn delegate_tool_with_spec(spec: ChildSpec) -> Arc<dyn loon_tools::Tool> {
+    Arc::new(DelegateTool { spec })
+}
+
+/// Build the `delegate` tool with default (unrouted) delegation settings.
 pub fn delegate_tool(
     paths: LoonPaths,
     cfg: AgentConfig,
@@ -319,6 +462,7 @@ pub fn delegate_tool(
     cwd: PathBuf,
     tasks: Option<crate::worklog::WorkLog>,
 ) -> Arc<dyn loon_tools::Tool> {
+    let (routing, effort_routing) = routing_from_config(&paths, &cwd);
     Arc::new(DelegateTool {
         spec: ChildSpec {
             paths,
@@ -327,6 +471,8 @@ pub fn delegate_tool(
             cwd,
             tasks,
             parent: None,
+            routing,
+            effort_routing,
         },
     })
 }
@@ -346,7 +492,9 @@ impl loon_tools::Tool for DelegateTool {
                 "properties": {
                     "task": {"type": "string", "minLength": 1, "description": "Complete, self-contained task description."},
                     "cwd": {"type": "string", "description": "Optional workspace directory inside the parent's allowed roots."},
-                    "agent": {"type":"string","description":"Optional configured profile name; /agents lists definitions."}
+                    "agent": {"type":"string","description":"Optional role or profile id (orchestrator, planner, explorer, librarian, architect, implementer, frontend, backend, debugger, tester, reviewer, security, documentation, release), or a project profile from .loon/agents. /agents lists both."},
+                    "category": {"type":"string","description":"Optional task category for model routing: quick, deep, ultrabrain, visual-engineering, artistry, writing, testing, security, documentation. Defaults to the role's category."},
+                    "model": {"type":"string","description":"Optional explicit model reference overriding role and category routing."}
                 },
                 "required": ["task"],
                 "additionalProperties": false
@@ -366,8 +514,9 @@ impl loon_tools::Tool for DelegateTool {
         let ok = matches!(result.status, crate::TurnStatus::Completed);
         let status = status_text(&result.status);
         let text = format!(
-            "[subagent {status}; session {}; workspace {}]\n{}",
+            "[subagent {status}; session {}; {}; workspace {}]\n{}",
             child.agent.session_id(),
+            child.routing,
             child.workspace.display(),
             result.assistant_text
         );
@@ -998,7 +1147,9 @@ impl loon_tools::Tool for BackgroundSpawnTool {
                 "properties": {
                     "task": {"type": "string", "minLength": 1, "description": "Complete, self-contained task description."},
                     "cwd": {"type": "string", "description": "Optional workspace directory inside the parent's allowed roots."},
-                    "agent": {"type": "string", "description": "Optional configured profile name; /agents lists definitions."}
+                    "agent": {"type": "string", "description": "Optional role or profile id (orchestrator, planner, explorer, librarian, architect, implementer, frontend, backend, debugger, tester, reviewer, security, documentation, release), or a project profile from .loon/agents."},
+                    "category": {"type": "string", "description": "Optional task category for model routing: quick, deep, ultrabrain, visual-engineering, artistry, writing, testing, security, documentation."},
+                    "model": {"type": "string", "description": "Optional explicit model reference overriding role and category routing."}
                 },
                 "required": ["task"],
                 "additionalProperties": false
@@ -1435,6 +1586,10 @@ pub fn default_tools_with_hub(
     if let Some(loops) = loops {
         extra.push(Arc::new(LoopCancelTool { registry: loops }));
     }
+    // Category routing comes from the effective configuration here, so any host that builds the
+    // standard toolset gets role-aware model choice without a separate wiring step. A
+    // configuration error degrades to "no routing" rather than losing delegation entirely.
+    let (routing, effort_routing) = routing_from_config(paths, cwd);
     let spec = ChildSpec {
         paths: paths.clone(),
         cfg: cfg.clone(),
@@ -1442,6 +1597,8 @@ pub fn default_tools_with_hub(
         cwd: cwd.to_path_buf(),
         tasks: tasks.clone(),
         parent,
+        routing,
+        effort_routing,
     };
     extra.push(Arc::new(BackgroundSpawnTool {
         spec: spec.clone(),
@@ -1459,13 +1616,7 @@ pub fn default_tools_with_hub(
     }
     loon_tools::ToolRegistry::standard()
         .with_extra(extra)
-        .with_extra(vec![delegate_tool(
-            paths.clone(),
-            cfg.clone(),
-            spec.registry,
-            cwd.to_path_buf(),
-            tasks,
-        )])
+        .with_extra(vec![delegate_tool_with_spec(spec.clone())])
 }
 
 #[cfg(test)]

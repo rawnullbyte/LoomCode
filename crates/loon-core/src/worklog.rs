@@ -49,6 +49,10 @@ pub struct WorkState {
     pub next_task_id: u64,
     #[serde(default)]
     pub plan_mode: bool,
+    /// Execution mode chosen with `/mode` or a task keyword. Durable, so `/resume` restores the
+    /// strategy as well as the conversation.
+    #[serde(default)]
+    pub mode: crate::mode::Mode,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanStep {

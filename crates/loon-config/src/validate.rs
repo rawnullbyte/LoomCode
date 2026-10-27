@@ -382,6 +382,18 @@ impl<'a> Validator<'a> {
         if !(1..=120).contains(&self.cfg.context7.timeout_secs) {
             f.push(err("context7.timeout_secs", "must be 1–120".into()));
         }
+        // Keybindings: an unknown action id, an unparsable chord, a chord the terminal owns,
+        // or two actions claiming the same chord in overlapping scopes. Reported here so a
+        // typo fails `loom config validate` instead of silently doing nothing at runtime.
+        for finding in crate::keymap::validate(&self.cfg.keys) {
+            let path = finding
+                .split(':')
+                .next()
+                .unwrap_or("keys")
+                .trim()
+                .to_string();
+            f.push(err(&path, finding));
+        }
         f.sort_by(|a, b| a.path.cmp(&b.path));
         f
     }

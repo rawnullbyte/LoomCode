@@ -5,6 +5,31 @@ the project intends to follow [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## [Unreleased]
 
+### Added — configurable keybindings, command palette, execution modes, role routing
+
+- **Configurable keybindings** (`[keys]`, `/keybindings`, `/keybind`). Every command key resolves
+  through one map (`crates/loon-config/src/keymap.rs`) with context scopes, so `esc` stops a turn in
+  the prompt and dismisses a dialog in a list without ambiguity. Rebinding, unbinding, per-action
+  and whole-profile reset, `default`/`emacs`/`vim` profiles, export, conflict detection and refusal
+  of chords the terminal owns (`ctrl+z`, `ctrl+\`, `ctrl+s`). Changes apply immediately with no
+  restart, and `[keys]` is validated by `loom config validate`. Taking a chord from another action
+  names the displaced action rather than shadowing it silently.
+- **Command palette (Ctrl+P).** Subsequence search over every slash command, configured model,
+  saved session, theme, setting, execution mode and bound shortcut. Accepting an entry submits the
+  real command, so the palette is a dispatcher over the existing registry rather than a second one.
+- **Execution modes** (`/mode`, plus `ultrawork`/`ulw`/`ultracode`/`deepresearch` keywords). A mode
+  derives the switches it implies: `plan`/`review`/`security` enforce read-only through the existing
+  mutation gate, `ultrawork` enables the completion supervisor, `ultracode` raises effort. Durable
+  across `/resume`; shown in the status bar. Implicit keyword routing is restricted to unambiguous
+  keywords so `review the parser` stays a task.
+- **Agent roles and category-aware model routing.** Fourteen built-in roles (orchestrator, planner,
+  explorer, librarian, architect, implementer, frontend, backend, debugger, tester, reviewer,
+  security, documentation, release), overridable by `.loon/agents/*.md`. `delegate`,
+  `background_spawn` and `task_fanout` accept a role, a category and an explicit model; resolution
+  is role → category (`[routing.models]`) → session, each candidate validated, with the chosen model
+  and reason reported in the result. Read-only roles have mutating tools removed from the child.
+- **`[routing.effort]`** per-category effort for delegated work.
+
 81 commits since `v0.1.0`. Grouped below by user-visible effect. The `### Fixed` audit
 entries below date from the first 60 commits; entries added since:
 
@@ -27,6 +52,18 @@ entries below date from the first 60 commits; entries added since:
 
 Correctness defects found and repaired during a full audit pass. Each carries a
 regression test that fails without the fix.
+
+- **Slash commands were unreachable from the shell.** `loom run "/agents"` sent the text to the
+  model and printed its guess, because the headless path called `run_turn` directly. Commands now
+  execute through the same parser the TUI uses (exit 64 on a usage error), so `/mode`, `/agents`,
+  `/keybind` and every other command work headlessly and in `--output json`.
+- **`delegate` silently discarded model routing.** `refresh_delegate` resolved the routing tables
+  and handed them to `background_spawn`, but rebuilt `delegate`'s spec from scratch, so category
+  routing reached one tool and not the other. Both now share the resolved spec
+  (`delegate_tool_with_spec`).
+- **A built-in role id resolved to no role.** The role lookup was keyed off the *profile* it found,
+  so naming `reviewer` with no profile file kept the default category and dropped the role's
+  instructions. Lookup is now by the name the caller gave.
 
 - **Credential redaction could leak or panic on non-ASCII input.** `redact()` indexed the
   lowercased copy of a string with byte offsets from the original. Lowercasing can change

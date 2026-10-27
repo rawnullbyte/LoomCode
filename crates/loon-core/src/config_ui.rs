@@ -86,7 +86,10 @@ fn choices(path: &str) -> Vec<String> {
         ["appearance", "color"] => &["auto", "true", "c256", "c16", "mono"],
         ["permissions", "mode"] => &["bypass", "auto", "ask", "allowlist"],
         ["session", "effort"] => &["", "low", "medium", "high", "xhigh", "ultra"],
+        // Category effort routing accepts the same levels as the session setting.
+        ["routing", "effort", _] => &["low", "medium", "high", "xhigh", "ultra"],
         ["providers", _, "api"] => &["chat", "responses"],
+        ["keys", "profile"] => &["default", "emacs", "vim"],
         ["combos", _, "mode"] => &["fallback", "round_robin"],
         ["models", _, "capabilities", _] => &["", "unknown", "supported", "unsupported"],
         _ => &[],
