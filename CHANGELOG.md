@@ -5,6 +5,13 @@ the project intends to follow [Semantic Versioning](https://semver.org/spec/v2.0
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.2.0] — 2026-10-27
+
+Additive: four new subsystems, all opt-in and backward compatible. Every existing shortcut,
+configuration file and session remains valid.
+
 ### Added — configurable keybindings, command palette, execution modes, role routing
 
 - **Configurable keybindings** (`[keys]`, `/keybindings`, `/keybind`). Every command key resolves
@@ -29,9 +36,34 @@ the project intends to follow [Semantic Versioning](https://semver.org/spec/v2.0
   is role → category (`[routing.models]`) → session, each candidate validated, with the chosen model
   and reason reported in the result. Read-only roles have mutating tools removed from the child.
 - **`[routing.effort]`** per-category effort for delegated work.
+- **Slash commands now work headlessly.** `loom run "/mode plan"` executes the command through the
+  same parser the TUI uses (exit 64 on a usage error) instead of sending the text to the model, so
+  every management command is reachable from the shell and in `--output json`/`jsonl`.
+- **Three new real-widget previews** on the docs site: the command palette, the execution-mode
+  picker and the keybinding editor.
 
-81 commits since `v0.1.0`. Grouped below by user-visible effect. The `### Fixed` audit
-entries below date from the first 60 commits; entries added since:
+### Fixed
+
+- **Slash commands were unreachable from the shell.** `loom run "/agents"` sent the text to the
+  model and printed its guess, because the headless path called `run_turn` directly.
+- **`delegate` silently discarded model routing.** `refresh_delegate` resolved the routing tables
+  and handed them to `background_spawn`, then rebuilt `delegate`'s spec from scratch, so category
+  routing reached one tool and not the other. Both now share the resolved spec.
+- **A built-in role id resolved to no role**, because the lookup was keyed off the profile it
+  found: naming `reviewer` without a profile file kept the default category and dropped the
+  role's instructions.
+- **`/keybind` stealing a chord reported only "(saved)".** It now names the displaced action and
+  how to restore it.
+- **Ctrl+Q and Shift+Tab were dropped** by the keybinding refactor (`BackTab` never reached the
+  map). Both restored, with the modal quit path pinned by a test.
+- **CHANGELOG sections had drifted** from the tags: the `0.1.1` release shipped without a section
+  of its own, and entries accumulated under `Unreleased` across two tags. The history below is now
+  attributed to the version that actually shipped it.
+
+## [0.1.1] — 2026-10-25
+
+Fixes and additions accumulated between the first two tags. Grouped below by user-visible effect;
+the `### Fixed` audit entries date from the first 60 commits of the project, entries added since:
 
 - **TUI lag on long sessions.** Frame cost grew with session length (24 ms/frame at
   2 000 transcript blocks, over 200 ms at 20 000, against a 50 ms animation tick). Rows
@@ -166,5 +198,7 @@ Initial tagged release: TUI, headless `run`/`resume`, sessions with lazy creatio
 provider/registry with combos, the tool set, the permission gate, journal and rewind,
 Ultra Loop, hooks, MCP, memory, compaction, the docs site and the Linux release workflow.
 
-[Unreleased]: https://github.com/rawnullbyte/LoomCode/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rawnullbyte/LoomCode/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rawnullbyte/LoomCode/compare/v0.1.1...v0.2.0
+[0.1.1]: https://github.com/rawnullbyte/LoomCode/releases/tag/v0.1.1
 [0.1.0]: https://github.com/rawnullbyte/LoomCode/releases/tag/v0.1.0
