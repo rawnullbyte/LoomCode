@@ -1257,19 +1257,23 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "loon-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
  "clap",
+ "hex",
  "loon-config",
  "loon-core",
  "loon-events",
  "loon-providers",
  "loon-tools",
  "loon-tui",
+ "reqwest",
  "serde_json",
+ "sha2",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1277,7 +1281,7 @@ dependencies = [
 
 [[package]]
 name = "loon-config"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1290,7 +1294,7 @@ dependencies = [
 
 [[package]]
 name = "loon-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -1313,7 +1317,7 @@ dependencies = [
 
 [[package]]
 name = "loon-events"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "hex",
@@ -1329,7 +1333,7 @@ dependencies = [
 
 [[package]]
 name = "loon-providers"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures",
@@ -1348,7 +1352,7 @@ dependencies = [
 
 [[package]]
 name = "loon-tools"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "glob",
@@ -1373,7 +1377,7 @@ dependencies = [
 
 [[package]]
 name = "loon-tui"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "crossterm",
@@ -1393,7 +1397,7 @@ dependencies = [
 
 [[package]]
 name = "loon-workspace"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hex",
  "serde",

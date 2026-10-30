@@ -11,6 +11,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+mod update;
+
 #[derive(Parser)]
 #[command(
     name = "loom",
@@ -83,6 +85,18 @@ enum Command {
         #[arg(long)]
         connect: bool,
     },
+    /// Check for, and install, a newer release from GitHub Releases.
+    Update {
+        /// Report the newest release without installing it.
+        #[arg(long)]
+        check: bool,
+        /// Install a prerelease build as well as published releases.
+        #[arg(long)]
+        prerelease: bool,
+        /// Install without restarting Loom afterwards.
+        #[arg(long)]
+        no_restart: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -137,8 +151,96 @@ async fn main() {
         Some(Command::Sessions { cmd }) => sessions_cmd(cmd),
         Some(Command::Config { cmd }) => config_cmd(cmd),
         Some(Command::Doctor { connect }) => doctor(*connect),
+        Some(Command::Update {
+            check,
+            prerelease,
+            no_restart,
+        }) => update_cmd(*check, *prerelease, *no_restart).await,
     };
     std::process::exit(code);
+}
+
+/// Where the launch check records when it last asked. Under `state`, not `cache`: it is a
+/// small record of local activity rather than something safe to delete at any moment.
+fn update_cache_path(paths: &LoonPaths) -> PathBuf {
+    paths.state_dir.join("update-check.json")
+}
+
+/// The interactive startup check.
+///
+/// Everything here is best-effort by design: an update must never be the reason a user
+/// cannot start Loom. Offline, rate-limited, malformed-API and unwritable-install-path
+/// failures are reported as one line on stderr and the session starts anyway.
+async fn launch_check(paths: &LoonPaths, cfg: &Config) {
+    let settings = update::Settings::from_config(&cfg.update, Some(update_cache_path(paths)));
+    match update::run(&settings, false).await {
+        Ok(outcome) => {
+            if let Some(notice) = outcome.notice() {
+                eprintln!("loom: {notice}");
+            }
+            // Only a check that actually installed something relaunches; otherwise the
+            // running process is already the newest build.
+            if matches!(outcome, update::Outcome::Installed { .. }) {
+                update::relaunch(&std::env::args().collect::<Vec<_>>());
+            }
+        }
+        Err(e) => eprintln!("loom: {e}"),
+    }
+}
+
+/// `loom update`: an explicit request, so it ignores `[update] enabled` and always asks the
+/// API. `--check` reports the answer without installing.
+async fn update_cmd(check: bool, prerelease: bool, no_restart: bool) -> i32 {
+    let (paths, cfg) = match load_env() {
+        Ok(x) => x,
+        Err(e) => {
+            eprintln!("loon: {e}");
+            return 64;
+        }
+    };
+    let mut settings = update::Settings::from_config(&cfg.update, Some(update_cache_path(&paths)));
+    settings.install = !check;
+    settings.include_prereleases |= prerelease;
+    let current = update::Version::current();
+    match update::run(&settings, true).await {
+        Ok(outcome) => {
+            match &outcome {
+                update::Outcome::Installed { path, release, .. } => {
+                    println!(
+                        "updated loom {current} → {} at {}",
+                        release.version,
+                        path.display()
+                    );
+                    if !no_restart {
+                        update::relaunch(&std::env::args().collect::<Vec<_>>());
+                    }
+                }
+                update::Outcome::Available { release, .. } => {
+                    println!(
+                        "loom {} is available (running {current}) for {}",
+                        release.version, settings.target
+                    );
+                }
+                update::Outcome::UpToDate { latest, .. } => {
+                    println!("loom {current} is up to date (newest release {latest})");
+                }
+                // `force` skips the cache, so this is unreachable in practice; printing it
+                // is still better than panicking if that ever changes.
+                update::Outcome::Cached { latest, .. } => {
+                    println!("loom {current}; newest known release {latest}");
+                }
+                update::Outcome::Unreachable { reason } => {
+                    eprintln!("loon: {reason}");
+                    return 1;
+                }
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("loon: {e}");
+            1
+        }
+    }
 }
 
 fn load_env() -> anyhow::Result<(LoonPaths, Config)> {
@@ -163,6 +265,12 @@ async fn tui_main() -> i32 {
             return 64;
         }
     };
+    // Self-update runs before the session starts, while the terminal is still plain: the
+    // update can replace the binary and re-exec, and the TUI must not have to unwind
+    // raw mode / the alternate screen to allow that. A failed check never blocks startup.
+    if cfg.update.with_env_overrides().enabled {
+        launch_check(&paths, &cfg).await;
+    }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let registry = match ProviderRegistry::from_config(&cfg) {
         Ok(r) => Arc::new(r),

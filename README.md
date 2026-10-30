@@ -338,6 +338,66 @@ For other documentation servers, use `/mcp` or `/settings` → **All configurati
 **mcp**. HTTP servers can be configured by port/URL; stdio servers expose command,
 arguments, environment and timeout. Saving server changes reconnects the live catalog.
 
+### Updating Loom
+
+Loom updates itself from GitHub Releases. On launch it asks the release feed for the newest
+version; if that is newer than the running build it downloads the binary for its own target
+triple, verifies the published SHA-256, replaces the installed file and restarts into the new
+version.
+
+```sh
+loom update              # check, install, and restart in one step
+loom update --check      # report the newest release without installing
+loom update --prerelease # include a prerelease build
+loom update --no-restart # install but keep this process (scripts, CI)
+```
+
+The replacement uses the permissions the process already has. Loom never runs `sudo`, never
+installs a privileged helper, and never writes a second copy somewhere `PATH` would not find
+it. If the install directory is not writable — a root-owned `/usr/local/bin`, for example —
+the update reports the path and the exact `install` command to run instead, and the working
+binary is left untouched:
+
+```sh
+loom: cannot replace /usr/local/bin/loom: the directory is not writable by this user
+      (/usr/local/bin: Permission denied). Loon does not run privileged commands; install
+      the new binary yourself with `sudo install -m 0755 <downloaded-loom> /usr/local/bin/loom`
+```
+
+The download is verified before anything is written, and an unverifiable release is refused:
+
+- a release that publishes no `.sha256` for its binary is **not** installed;
+- a digest that does not match the downloaded bytes aborts the update and names both digests;
+- a staged file is written next to the target, `fsync`ed, then `rename`d, so an interrupted
+  or failed update leaves the previous binary in place;
+- only the raw binary for this platform's target triple is accepted — archives are ignored.
+
+Configuration lives in the `[update]` table (see the commented example from
+`loom config init`):
+
+```toml
+[update]
+enabled = true
+auto_install = true          # false: report a newer release, install only via `loom update`
+check_interval_hours = 24    # 0 checks on every launch
+# repository = "rawnullbyte/LoomCode"
+# api_base = "https://api.github.com"   # GitHub Enterprise or a mirror
+# include_prereleases = false
+# timeout_secs = 15
+```
+
+`LOON_UPDATE` selects the launch behavior without editing the file: `off` disables the
+check, `check` reports a newer release without installing it, and `auto` installs it. That
+last distinction matters on a machine where replacing an install needs a step you want to
+take yourself. `LOON_UPDATE_API_BASE`, `LOON_UPDATE_REPOSITORY` and
+`LOON_UPDATE_INTERVAL_HOURS` redirect the feed and the check interval. `loom update` is an
+explicit request, so it works even when the launch check is off.
+
+A check that cannot reach the feed is not an error at launch: being offline does not stop
+Loom from starting, and `loom update` reports the reason and exits non-zero. When an update
+does install, the process re-executes itself with the same arguments, and a relaunch guard
+prevents a second install in the same run.
+
 ## Sessions and working state
 
 | Command | Behavior |
@@ -582,9 +642,10 @@ actually use, with why.
 
 ## Copying and controls
 
-- **Enter** sends, **Shift+Enter** starts a new line, **Ctrl+Enter** cancels the running request and sends immediately. **Ctrl+Backspace** deletes the previous word. These need the terminal's progressive keyboard protocol; Loom enables it automatically when supported.
+- **Enter** sends, **Shift+Enter** starts a new line, **Ctrl+Enter** cancels the running request and sends immediately. **Ctrl+Backspace** deletes the previous word, and at the start of a line it deletes the line break itself, joining that line with the one above — it never takes the previous line's word along with the break. With a selection active it deletes the selection. These need the terminal's progressive keyboard protocol; Loom enables it automatically when supported.
 - In the prompt, **Ctrl+Left/Right** moves by a word (the same boundaries Ctrl+Backspace deletes), **Shift+arrows** select text, and **Ctrl+Shift+arrows** select a word at a time. Typing or Backspace replaces the selection, and **Ctrl+C** copies it. Clicking anywhere in a multi-line prompt puts the caret on that line and column.
 - **Esc** twice stops immediately and preserves completed edits, tool results and conversation. Pending messages pause; **Enter** on an empty input resumes them. A held Escape key does not count as two presses.
+- **Esc** before the model has answered anything is a different gesture: the unanswered message is rewound out of the transcript and the conversation, and its text goes back into the prompt bar to edit and resend. Once the model has produced anything — text, a tool call, an edit — **Esc** stops the turn and keeps the work, as above.
 - Messages submitted during a turn enter the **next inference request**, in order. **Up** on an empty input retrieves the newest pending message only if it has not already been sent. **Ctrl+Enter** interrupts and submits pending messages plus the new text immediately.
 - **Up/Down** on the prompt recall prompts you have already sent, newest first; **Down** past the newest restores the draft you were typing. Typing a prefix makes **Up** walk only the entries that start with it (`cargo` steps through your cargo commands), falling back to the whole history when the prefix matches nothing. This history is saved under the state directory, so it survives a restart and is shared across sessions.
 - **Ctrl+R** searches that history: typing narrows the match (case-insensitive), a second **Ctrl+R** steps to older matches, **Enter** accepts, and **Esc** puts back the draft you had. The prompt row shows `reverse-i-search › <query>` while it is open.

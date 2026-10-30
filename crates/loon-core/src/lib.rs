@@ -845,6 +845,42 @@ impl Agent {
         *self.cancel_rx.borrow()
     }
 
+    /// Whether the newest turn recorded nothing worth keeping: no provider event and no
+    /// tool call since its prompt. That is the window in which a cancel means "I never
+    /// meant to send that" rather than "stop what you are doing".
+    ///
+    /// The journal is the only honest witness here. `AgentEvent::RequestStarted` reaches
+    /// the UI *before* the request is made, and the journaled `RequestStarted` is written
+    /// when the provider's first event arrives — so a turn cancelled in between has a
+    /// prompt and a turn id but no evidence of an answer. Anything at all from the
+    /// provider (including a failure, which is journaled the same way) counts as an
+    /// answer and keeps the turn.
+    pub fn cancelled_turn_answered_nothing(&self) -> bool {
+        let Ok(events) = self.journal.events() else {
+            // Without a readable journal, keep the turn: losing user work is worse than
+            // leaving an unanswered message in the transcript.
+            return false;
+        };
+        let active = crate::replay::active_events(&events, None);
+        let Some(start) = active.iter().rposition(
+            |e| matches!(&e.kind, EventKind::UserMessage { text } if crate::rewind::visible_user_prompt(text)),
+        ) else {
+            return false;
+        };
+        !active[start..].iter().any(|e| {
+            matches!(
+                &e.kind,
+                EventKind::RequestStarted { .. }
+                    | EventKind::RequestFinished { .. }
+                    | EventKind::TextDelta { .. }
+                    | EventKind::ReasoningDelta { .. }
+                    | EventKind::ToolCallObserved { .. }
+                    | EventKind::ToolExecutionStarted { .. }
+                    | EventKind::FileMutated { .. }
+            )
+        })
+    }
+
     /// Forget the turn that is being cancelled: drop the user message (and anything the
     /// aborted turn journaled after it) from live history, and journal a conversation
     /// rewind so a resume replays the same thing. The prompt is the user's again — it

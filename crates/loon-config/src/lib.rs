@@ -56,6 +56,9 @@ pub struct Config {
     /// Category-aware model/effort routing for delegated work.
     #[serde(default)]
     pub routing: schema::Routing,
+    /// Self-update from GitHub Releases.
+    #[serde(default)]
+    pub update: schema::UpdateCfg,
 }
 
 impl Config {
@@ -102,6 +105,7 @@ impl Config {
             hooks: Default::default(),
             keys: Default::default(),
             routing: Default::default(),
+            update: Default::default(),
         }
     }
 
@@ -323,6 +327,22 @@ footer = true
 # members = [
 #   { provider = "ollama", model = "llama3.1:8b" },
 # ]
+
+# ── Self-update from GitHub Releases ────────────────────────────────────────────
+# On launch Loon checks the release feed and replaces the installed binary when a newer
+# version exists, then restarts into it. The write uses the permissions the process already
+# has: no sudo, no privileged helper. A binary in a directory you cannot write is reported
+# and left alone. Downloads are verified against the release's published SHA-256 and are
+# refused if the checksum is missing or does not match.
+# `loom update` does the same on demand; `loom update --check` only reports.
+[update]
+enabled = true
+auto_install = true        # false: report a newer release, install only via `loom update`
+check_interval_hours = 24  # 0 checks on every launch
+# repository = "rawnullbyte/LoomCode"
+# api_base = "https://api.github.com"   # GitHub Enterprise or a mirror
+# include_prereleases = false
+# timeout_secs = 15
 "#
 }
 
@@ -409,5 +429,150 @@ mod example_config_tests {
         }
         let cfg: Config = toml::from_str(text).unwrap();
         assert!(crate::keymap::validate(&cfg.keys).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod update_config_tests {
+    use super::*;
+
+    /// The `[update]` table must be reachable from the starter config: a setting nobody can
+    /// discover is a setting nobody can turn off.
+    #[test]
+    fn the_example_documents_the_update_table() {
+        let text = example_toml();
+        for key in [
+            "[update]",
+            "auto_install",
+            "check_interval_hours",
+            "include_prereleases",
+        ] {
+            assert!(text.contains(key), "`{key}` must be in the example config");
+        }
+        let cfg: Config = toml::from_str(text).unwrap();
+        assert!(cfg.update.enabled);
+        assert!(cfg.update.auto_install);
+    }
+
+    /// Defaults work with no `[update]` table at all, so upgrading Loon does not break an
+    /// existing config file.
+    #[test]
+    fn an_absent_update_table_takes_the_defaults() {
+        let cfg: Config = toml::from_str("schema_version = 1\n").unwrap();
+        assert!(cfg.update.enabled);
+        assert!(cfg.update.auto_install);
+        assert_eq!(cfg.update.repository, "rawnullbyte/LoomCode");
+        assert_eq!(cfg.update.api_base, "https://api.github.com");
+        assert_eq!(cfg.update.check_interval_hours, 24);
+        assert!(!cfg.update.include_prereleases);
+    }
+
+    /// Every value the table accepts must round-trip, and an unknown key must not silently
+    /// disable the feature.
+    #[test]
+    fn the_update_table_round_trips() {
+        let cfg: Config = toml::from_str(
+            "schema_version = 1\n\
+             [update]\n\
+             enabled = false\n\
+             auto_install = false\n\
+             repository = 'me/mirror'\n\
+             api_base = 'https://git.example.com/api'\n\
+             check_interval_hours = 0\n\
+             timeout_secs = 30\n\
+             include_prereleases = true\n",
+        )
+        .unwrap();
+        assert!(!cfg.update.enabled);
+        assert!(!cfg.update.auto_install);
+        assert_eq!(cfg.update.repository, "me/mirror");
+        assert_eq!(cfg.update.api_base, "https://git.example.com/api");
+        assert_eq!(cfg.update.check_interval_hours, 0);
+        assert_eq!(cfg.update.timeout_secs, 30);
+        assert!(cfg.update.include_prereleases);
+        // This TOML is parsed without the built-in provider tables, so unrelated findings
+        // (the default `mock` model alias) appear; only the update table is under test here.
+        let update_errors: Vec<_> = Validator::new(&cfg)
+            .errors()
+            .into_iter()
+            .filter(|f| f.path.starts_with("update."))
+            .collect();
+        assert!(update_errors.is_empty(), "{update_errors:?}");
+    }
+
+    /// The environment mode covers both switches, so a user can silence the launch check or
+    /// keep it to a notification without editing the config file.
+    #[test]
+    fn the_environment_selects_the_update_mode() {
+        // Environment variables are process-wide; this test owns them for its duration.
+        let original = std::env::var("LOON_UPDATE").ok();
+        std::env::set_var("LOON_UPDATE", "off");
+        let cfg = schema::UpdateCfg::default().with_env_overrides();
+        assert!(!cfg.enabled, "`off` disables the launch check");
+
+        std::env::set_var("LOON_UPDATE", "check");
+        let cfg = schema::UpdateCfg::default().with_env_overrides();
+        assert!(cfg.enabled, "`check` still asks the feed");
+        assert!(!cfg.auto_install, "`check` never installs");
+
+        std::env::set_var("LOON_UPDATE", "auto");
+        let cfg = schema::UpdateCfg::default().with_env_overrides();
+        assert!(cfg.enabled && cfg.auto_install);
+
+        match original {
+            Some(value) => std::env::set_var("LOON_UPDATE", value),
+            None => std::env::remove_var("LOON_UPDATE"),
+        }
+    }
+
+    /// A repository that is not `owner/repo` would build a nonsense API URL, and an API base
+    /// without a scheme would fail at request time in a way the user cannot diagnose.
+    #[test]
+    fn an_invalid_update_configuration_is_rejected() {
+        for (body, expect) in [
+            ("[update]\nrepository = 'nope'\n", "update.repository"),
+            ("[update]\nrepository = 'a/b/c'\n", "update.repository"),
+            ("[update]\nrepository = ''\n", "update.repository"),
+            ("[update]\napi_base = 'not a url'\n", "update.api_base"),
+            ("[update]\ntimeout_secs = 0\n", "update.timeout_secs"),
+            ("[update]\ntimeout_secs = 5000\n", "update.timeout_secs"),
+            (
+                "[update]\ncheck_interval_hours = 999999\n",
+                "update.check_interval_hours",
+            ),
+        ] {
+            let cfg: Config = toml::from_str(&format!("schema_version = 1\n{body}")).unwrap();
+            let errors = Validator::new(&cfg).errors();
+            assert!(
+                errors.iter().any(|f| f.path == expect),
+                "`{body}` must report {expect}, got {errors:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod shipped_example_tests {
+    use super::*;
+
+    /// `examples/full-config.toml` is the reference users copy from, and it is outside the
+    /// binary, so nothing else would notice it drifting out of sync with the schema.
+    #[test]
+    fn the_shipped_full_config_parses_and_validates() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../examples/full-config.toml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let cfg: Config = toml::from_str(&text)
+            .unwrap_or_else(|e| panic!("{} does not parse: {e}", path.display()));
+        let errors: Vec<_> = Validator::new(&cfg)
+            .errors()
+            .into_iter()
+            .filter(|f| f.is_error)
+            .collect();
+        assert!(errors.is_empty(), "{}: {errors:?}", path.display());
+        // The update table is documented there, not just accepted.
+        assert!(text.contains("[update]"), "the updater needs an example");
+        assert_eq!(cfg.update.repository, "rawnullbyte/LoomCode");
     }
 }

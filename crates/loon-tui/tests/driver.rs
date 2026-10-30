@@ -135,10 +135,11 @@ fn serde_for_wait() -> serde_json::Value {
     serde_json::json!({"command":"sleep 30","timeout_secs":60})
 }
 
-/// Esc while the first request is still streaming: the prompt must come back to the
-/// input bar (via UiNotice::RestorePrompt) instead of being lost.
+/// Esc after submitting but before the model has said anything: nothing was produced, so
+/// the turn is rewound and the prompt goes back to the input bar. The transcript row it
+/// left behind must go too, or resending would show the prompt twice.
 #[tokio::test]
-async fn cancelling_preserves_the_prompt_and_does_not_restore_or_rewind_it() {
+async fn cancelling_before_the_first_answer_restores_the_prompt_and_rewinds() {
     let temp = tempfile::tempdir().unwrap();
     let p = temp.path();
     let paths = loon_config::LoonPaths {
@@ -152,14 +153,13 @@ async fn cancelling_preserves_the_prompt_and_does_not_restore_or_rewind_it() {
     let mut a = Agent::new_session(
         &paths,
         AgentConfig::from(&Default::default()),
-        // A slow shell call keeps the turn genuinely in flight so Esc has something
-        // real to cancel (the mock would otherwise answer instantly).
+        // The delay holds the turn open in exactly the window where the provider has not
+        // answered yet; the scripted text never arrives.
         Arc::new(ProviderRegistry::with_mock(MockProvider::with_scripts(
-            vec![MockScript::new(vec![MockStep::tool_call(
-                "slow",
-                "bash",
-                serde_json::json!({"command": "sleep 5"}),
-            )])],
+            vec![MockScript::new(vec![
+                MockStep::Delay(std::time::Duration::from_secs(10)),
+                MockStep::Text("too late".into()),
+            ])],
         ))),
         loon_core::standard_tools(&paths, p),
         p.to_path_buf(),
@@ -183,12 +183,101 @@ async fn cancelling_preserves_the_prompt_and_does_not_restore_or_rewind_it() {
 
     let prompt = "refactor the parser and run the tests";
     cmd.send(UiCommand::Submit(prompt.into())).await.unwrap();
-    // Wait until the turn is actually running, then cancel it.
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        loop {
-            match events.recv().await.unwrap() {
-                AgentEvent::TurnStarted | AgentEvent::RequestStarted => break,
-                _ => {}
+        while let Some(event) = events.recv().await {
+            if matches!(event, AgentEvent::TurnStarted) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    cmd.send(UiCommand::Cancel).await.unwrap();
+
+    let restored = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(notice) = notice_rx.recv().await {
+            if let loon_tui::UiNotice::RestorePrompt(text) = notice {
+                return text;
+            }
+        }
+        panic!("the driver stopped without restoring the prompt");
+    })
+    .await
+    .unwrap();
+    assert_eq!(restored, prompt, "the prompt comes back verbatim");
+
+    let guard = a.lock().await;
+    assert!(
+        !guard.history.iter().any(|m| m.text == prompt),
+        "the unanswered prompt is not left in history"
+    );
+    assert!(
+        guard
+            .journal
+            .events()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, loon_events::model::EventKind::Rewound { .. })),
+        "the cancel is journaled as a conversation rewind"
+    );
+    drop(guard);
+
+    drop(cmd);
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), driver).await;
+}
+
+/// The other cancel: once the model has answered and a tool is running, Esc stops the
+/// turn but keeps everything it produced. Rewinding here would discard real work.
+#[tokio::test]
+async fn cancelling_after_the_model_answered_keeps_the_work() {
+    let temp = tempfile::tempdir().unwrap();
+    let p = temp.path();
+    let paths = loon_config::LoonPaths {
+        config_dir: p.join("c"),
+        data_dir: p.join("d"),
+        state_dir: p.join("s"),
+        cache_dir: p.join("cache"),
+        runtime_dir: p.join("r"),
+    };
+    paths.ensure().unwrap();
+    let mut a = Agent::new_session(
+        &paths,
+        AgentConfig::from(&Default::default()),
+        // A slow shell call keeps the turn genuinely in flight, after the model has
+        // already answered with a tool call.
+        Arc::new(ProviderRegistry::with_mock(MockProvider::with_scripts(
+            vec![MockScript::new(vec![MockStep::tool_call(
+                "slow",
+                "bash",
+                serde_json::json!({"command": "sleep 5"}),
+            )])],
+        ))),
+        loon_core::standard_tools(&paths, p),
+        p.to_path_buf(),
+        true,
+    )
+    .unwrap();
+    let (tx, mut events) = mpsc::channel(16);
+    a.set_event_sink(tx.clone());
+    let a = Arc::new(Mutex::new(a));
+    let (cmd, rx) = mpsc::channel(8);
+    let (out, _results) = mpsc::channel(8);
+    let (notices, mut notice_rx) = mpsc::channel(8);
+    let driver = tokio::spawn(loon_tui::driver::run(
+        a.clone(),
+        rx,
+        tx,
+        notices,
+        out,
+        Arc::new(loon_core::loops::LoopRegistry::new()),
+    ));
+
+    let prompt = "refactor the parser and run the tests";
+    cmd.send(UiCommand::Submit(prompt.into())).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(event) = events.recv().await {
+            if matches!(event, AgentEvent::ToolStarted { .. }) {
+                break;
             }
         }
     })
@@ -207,16 +296,25 @@ async fn cancelling_preserves_the_prompt_and_does_not_restore_or_rewind_it() {
     .await
     .unwrap();
     while let Ok(notice) = notice_rx.try_recv() {
-        assert!(!matches!(notice, loon_tui::UiNotice::RestorePrompt(_)));
+        assert!(
+            !matches!(notice, loon_tui::UiNotice::RestorePrompt(_)),
+            "work was produced, so the prompt must not be taken back"
+        );
     }
     let guard = a.lock().await;
-    assert!(guard.history.iter().any(|m| m.text == prompt));
-    assert!(!guard
-        .journal
-        .events()
-        .unwrap()
-        .iter()
-        .any(|e| matches!(e.kind, loon_events::model::EventKind::Rewound { .. })));
+    assert!(
+        guard.history.iter().any(|m| m.text == prompt),
+        "the prompt stays in history"
+    );
+    assert!(
+        !guard
+            .journal
+            .events()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, loon_events::model::EventKind::Rewound { .. })),
+        "nothing is rewound once the model has answered"
+    );
     drop(guard);
 
     drop(cmd);

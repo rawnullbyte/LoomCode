@@ -3,9 +3,41 @@
 All notable changes to LoomCode. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project intends to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.3.0] — 2026-10-30
 
-Nothing yet.
+### Added
+
+- **Self-update.** On launch Loom asks the release feed for the newest version; when it is
+  newer it downloads the binary for its own target triple, verifies the release's published
+  SHA-256, replaces the installed file atomically and restarts into it. `loom update` runs the
+  same check on demand, with `--check` (report only), `--prerelease` and `--no-restart`
+  (scripts and CI). Configuration is the `[update]` table; `LOON_UPDATE` selects `off`,
+  `check` or `auto`, and `LOON_UPDATE_API_BASE` / `LOON_UPDATE_REPOSITORY` /
+  `LOON_UPDATE_INTERVAL_HOURS` redirect the feed. The write uses only the permissions the
+  process already has — no sudo, no privileged helper — and a non-writable install directory
+  is reported with the `install` command to run instead. A release with no published checksum,
+  or one that does not match, is refused and the working binary is left alone. The target
+  triple is emitted by `crates/loon-cli/build.rs`, so a build never selects another
+  platform's asset.
+- **`release.yml` publishes what the updater consumes.** Each matrix target uploads the raw
+  stripped binary and its `.sha256` next to the existing tarball, for
+  `x86_64`/`aarch64` Linux and `x86_64`/`aarch64` macOS. The workflow runs the raw asset and
+  verifies both digests before publishing, so an asset that cannot start never ships.
+
+### Fixed
+
+- **Ctrl+Backspace could not delete a newline.** Word motion stops at a line break — a break is
+  not part of a word — so at the start of a line there was nothing to delete and the key did
+  nothing. Ctrl+Backspace now deletes the break itself, joining the line with the one above,
+  without also swallowing the previous line's word. With a selection active it deletes the
+  selection. Word motion and word delete still agree on every boundary inside a line.
+- **Cancelling before the model answered stranded the prompt.** The message stayed in the
+  transcript and the journal with no answer behind it, so a resume replayed a prompt that was
+  never answered and `/rewind` had no boundary to point at. A cancel before anything comes
+  back from the provider now forgets the turn — dropping it from live history, journaling a
+  conversation rewind — and puts the text back in the prompt bar to edit and resend. A cancel
+  after the model has produced text, a tool call or an edit keeps everything, exactly as
+  before; the two cases are distinguished from the journal rather than from a UI-side signal.
 
 ## [0.2.0] — 2026-10-27
 

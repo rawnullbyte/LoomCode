@@ -382,6 +382,50 @@ impl<'a> Validator<'a> {
         if !(1..=120).contains(&self.cfg.context7.timeout_secs) {
             f.push(err("context7.timeout_secs", "must be 1–120".into()));
         }
+        // Self-update: the repository is interpolated into an API URL and the API base is
+        // where the binary comes from, so both are checked rather than trusted. A typo here
+        // must fail `loom config validate`, not silently leave the user on an old build.
+        if !self.cfg.update.repository.is_empty() {
+            let repo = &self.cfg.update.repository;
+            let parts: Vec<&str> = repo.split('/').collect();
+            if parts.len() != 2 || parts.iter().any(|p| p.trim().is_empty()) {
+                f.push(err(
+                    "update.repository",
+                    "must be owner/repo, e.g. rawnullbyte/LoomCode".into(),
+                ));
+            }
+            if repo.contains(char::is_whitespace) {
+                f.push(err("update.repository", "must not contain spaces".into()));
+            }
+        } else {
+            f.push(err(
+                "update.repository",
+                "must name the releases repository (owner/repo)".into(),
+            ));
+        }
+        match url_check(&self.cfg.update.api_base) {
+            Ok(scheme) => {
+                if scheme != "https" && scheme != "http" {
+                    f.push(err(
+                        "update.api_base",
+                        format!("must be http(s), got scheme `{scheme}`"),
+                    ));
+                }
+            }
+            Err(e) => f.push(err(
+                "update.api_base",
+                format!("`{}` is not a valid URL: {e}", self.cfg.update.api_base),
+            )),
+        }
+        if !(1..=120).contains(&self.cfg.update.timeout_secs) {
+            f.push(err("update.timeout_secs", "must be 1–120".into()));
+        }
+        if self.cfg.update.check_interval_hours > 24 * 30 {
+            f.push(err(
+                "update.check_interval_hours",
+                "must be at most 720 (30 days); 0 checks on every launch".into(),
+            ));
+        }
         // Keybindings: an unknown action id, an unparsable chord, a chord the terminal owns,
         // or two actions claiming the same chord in overlapping scopes. Reported here so a
         // typo fails `loom config validate` instead of silently doing nothing at runtime.

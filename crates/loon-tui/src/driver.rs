@@ -187,8 +187,32 @@ pub async fn run(
                         queue_paused = true;
                         let _ = notices.send(UiNotice::QueuePaused(true)).await;
                         if finished {
-                            agent.lock().await.seal_cancelled_turn();
-                            let _=events.send(AgentEvent::TurnFinished{status:TurnStatus::Cancelled}).await;
+                            // Two different cancels. Before the provider answered
+                            // anything there is nothing to keep, and the user's most
+                            // likely intent is to edit that prompt — so the turn is
+                            // forgotten and the text goes back to the input bar.
+                            // Otherwise the work stays and only the turn is sealed.
+                            let restored = {
+                                let mut a = agent.lock().await;
+                                let prompt = if a.cancelled_turn_answered_nothing() {
+                                    a.forget_cancelled_turn()
+                                } else {
+                                    None
+                                };
+                                // Nothing to hand back (no prompt recorded, or the turn
+                                // did answer): seal it so the session stays consistent.
+                                if prompt.is_none() {
+                                    a.seal_cancelled_turn();
+                                }
+                                prompt
+                            };
+                            if let Some(prompt) = restored {
+                                // No synthetic TurnFinished: the turn never existed, and
+                                // the notice carries the full teardown the UI needs.
+                                let _ = notices.send(UiNotice::RestorePrompt(prompt)).await;
+                            } else {
+                                let _=events.send(AgentEvent::TurnFinished{status:TurnStatus::Cancelled}).await;
+                            }
                         }
                     }
                     // Send now: the old turn is aborted and this prompt runs as the
@@ -200,6 +224,9 @@ pub async fn run(
                         let finished = stop(&mut running, &cancel).await;
                         queue_paused = false;
                         let _ = notices.send(UiNotice::QueuePaused(false)).await;
+                        // No rewind here, unlike Esc: this gesture is "send *this* now",
+                        // so the prompt bar is about to hold the user's new text. Handing
+                        // the abandoned prompt back would overwrite it.
                         if finished {
                             let _=events.send(AgentEvent::TurnFinished{status:TurnStatus::Cancelled}).await;
                         }

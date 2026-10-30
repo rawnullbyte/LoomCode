@@ -344,6 +344,109 @@ pub struct Routing {
     pub effort: BTreeMap<String, String>,
 }
 
+/// Self-update from GitHub Releases (the `[update]` table).
+///
+/// Replacing the installed binary uses the permissions the running process already has:
+/// Loon never invokes sudo or a privileged helper. An install directory the user cannot
+/// write is reported as an error, and the update is not attempted.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct UpdateCfg {
+    /// Look for a newer release when the interactive UI starts.
+    #[serde(default = "yes")]
+    pub enabled: bool,
+    /// Replace the installed binary automatically. When false the launch check only
+    /// reports that a newer release exists; `loom update` still installs it on request.
+    #[serde(default = "yes")]
+    pub auto_install: bool,
+    /// `owner/repo` whose releases are published.
+    #[serde(default = "default_update_repository")]
+    pub repository: String,
+    /// API root. Point it at GitHub Enterprise, a mirror, or a local test server.
+    #[serde(default = "default_update_api_base")]
+    pub api_base: String,
+    /// Minimum hours between launch checks; 0 checks on every launch.
+    #[serde(default = "default_update_interval_hours")]
+    pub check_interval_hours: u64,
+    /// Whole-check network timeout in seconds.
+    #[serde(default = "default_update_timeout")]
+    pub timeout_secs: u64,
+    /// Also accept releases marked as prereleases.
+    #[serde(default)]
+    pub include_prereleases: bool,
+}
+
+fn default_update_repository() -> String {
+    "rawnullbyte/LoomCode".into()
+}
+fn default_update_api_base() -> String {
+    "https://api.github.com".into()
+}
+fn default_update_interval_hours() -> u64 {
+    24
+}
+fn default_update_timeout() -> u64 {
+    15
+}
+
+impl Default for UpdateCfg {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_install: true,
+            repository: default_update_repository(),
+            api_base: default_update_api_base(),
+            check_interval_hours: default_update_interval_hours(),
+            timeout_secs: default_update_timeout(),
+            include_prereleases: false,
+        }
+    }
+}
+
+impl UpdateCfg {
+    /// Apply the documented environment overrides.
+    ///
+    /// `LOON_UPDATE` takes one of three modes — `off` (no launch check), `check` (report a
+    /// newer release but do not install it) or `auto` (check and install) — so a single
+    /// variable covers both switches. The API root, repository and interval can be
+    /// redirected without editing the config file, which is what makes a mirror, an
+    /// enterprise instance, and a test server reachable.
+    ///
+    /// `loom update` is unaffected by `enabled`: an explicit request is always honoured.
+    pub fn with_env_overrides(&self) -> UpdateCfg {
+        let mut cfg = self.clone();
+        if let Ok(value) = std::env::var("LOON_UPDATE") {
+            match value.trim().to_ascii_lowercase().as_str() {
+                "0" | "off" | "false" | "no" | "none" => cfg.enabled = false,
+                "check" | "notify" | "report" => {
+                    cfg.enabled = true;
+                    cfg.auto_install = false;
+                }
+                "1" | "on" | "true" | "yes" | "auto" => {
+                    cfg.enabled = true;
+                    cfg.auto_install = true;
+                }
+                _ => {}
+            }
+        }
+        if let Ok(value) = std::env::var("LOON_UPDATE_API_BASE") {
+            if !value.trim().is_empty() {
+                cfg.api_base = value.trim().trim_end_matches('/').to_string();
+            }
+        }
+        if let Ok(value) = std::env::var("LOON_UPDATE_INTERVAL_HOURS") {
+            if let Ok(hours) = value.trim().parse::<u64>() {
+                cfg.check_interval_hours = hours;
+            }
+        }
+        if let Ok(value) = std::env::var("LOON_UPDATE_REPOSITORY") {
+            if !value.trim().is_empty() {
+                cfg.repository = value.trim().to_string();
+            }
+        }
+        cfg
+    }
+}
+
 /// UI/behavior settings (the `[ui]` table). Defaults mirror Claude-Code's feel.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UiCfg {

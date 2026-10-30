@@ -1,8 +1,14 @@
 name: Release
 
-# Linux-only release build. Produces a stripped `loom` binary plus a tarball
-# with checksums, uploads them as workflow artifacts, and attaches the same
-# files to the GitHub Release when the run was triggered by a `v*` tag.
+# Publishes a `loom` binary per platform. Each job uploads two things the in-binary updater
+# consumes directly:
+#
+#   loom-<version>-<target>          the raw, stripped, executable binary
+#   loom-<version>-<target>.sha256   its digest, in `sha256sum` format
+#
+# The tarball (with LICENSE/README) is published alongside for people who install by hand.
+# The updater never unpacks an archive: it selects the raw binary for its own target triple,
+# verifies the sibling digest, and only then replaces the installed file.
 
 on:
   push:
@@ -16,16 +22,29 @@ on:
 
 env:
   CARGO_TERM_COLOR: never
-  TARGET: x86_64-unknown-linux-gnu
   BINARY: loom
 
 permissions:
   contents: read
 
 jobs:
-  build-linux:
-    name: linux / x86_64
-    runs-on: ubuntu-24.04
+  build:
+    name: ${{ matrix.target }}
+    # Only the tiers that are actually published: a target listed here is a promise that an
+    # asset with that triple exists, because the updater matches on it exactly.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-24.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-14
+          - target: x86_64-apple-darwin
+            os: macos-14
+    runs-on: ${{ matrix.os }}
     permissions:
       contents: write
     steps:
@@ -33,11 +52,11 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ env.TARGET }}
+          targets: ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ env.TARGET }}
+          key: release-${{ matrix.target }}
 
       - name: Resolve version
         id: version
@@ -46,45 +65,64 @@ jobs:
           version=$(cargo metadata --no-deps --format-version 1 \
             | python3 -c 'import json,sys; pkgs=json.load(sys.stdin)["packages"]; print(next(p["version"] for p in pkgs if p["name"]=="loon-cli"))')
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Building ${{ env.BINARY }} $version for ${{ env.TARGET }}"
+          echo "Building ${{ env.BINARY }} $version for ${{ matrix.target }}"
 
       - name: Build release binary
-        run: cargo build --release --locked --target "${{ env.TARGET }}" -p loon-cli
+        run: cargo build --release --locked --target "${{ matrix.target }}" -p loon-cli
 
       - name: Package
         id: package
+        shell: bash
         run: |
           set -euo pipefail
           version='${{ steps.version.outputs.version }}'
-          name="${BINARY}-${version}-${{ env.TARGET }}"
+          target='${{ matrix.target }}'
+          name="${BINARY}-${version}-${target}"
           stage="dist/${name}"
           mkdir -p "$stage"
-          install -m 0755 "target/${{ env.TARGET }}/release/${BINARY}" "$stage/${BINARY}"
-          strip "$stage/${BINARY}"
+
+          # The raw binary is the asset the updater downloads. Its name ends in the target
+          # triple, which is what `build.rs` bakes into the binary to select it.
+          cp "target/${target}/release/${BINARY}" "dist/${name}"
+          cp "target/${target}/release/${BINARY}" "$stage/${BINARY}"
+          strip "dist/${name}" "$stage/${BINARY}"
+          chmod 0755 "dist/${name}" "$stage/${BINARY}"
+
+          # Published next to the binary so an install is verifiable without the tarball.
+          (cd dist && sha256sum "${name}" > "${name}.sha256")
+
+          # A tarball with the licence and readme, for manual installation.
           cp LICENSE README.md "$stage/"
           tar -C dist -czf "dist/${name}.tar.gz" "$name"
           (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
-          echo "name=$name" >> "$GITHUB_OUTPUT"
+
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
           ls -lh dist
 
       - name: Verify packaged binary
+        shell: bash
         run: |
           set -euo pipefail
-          work="$(mktemp -d)"
-          tar -xzf "dist/${{ steps.package.outputs.name }}.tar.gz" -C "$work"
-          bin="$work/${{ steps.package.outputs.name }}/${BINARY}"
+          name='${{ steps.package.outputs.name }}'
           export LOON_HOME="$(mktemp -d)"
-          "$bin" --version
-          "$bin" doctor
-          (cd dist && sha256sum --check --strict *.sha256)
+          chmod +x "dist/${name}"
+          # Run the raw asset itself: if it does not execute, the updater would hand users a
+          # file that cannot start.
+          "dist/${name}" --version
+          "dist/${name}" doctor
+          (cd dist && sha256sum --check --strict "${name}.sha256")
+          work="$(mktemp -d)"
+          tar -xzf "dist/${name}.tar.gz" -C "$work"
+          (cd dist && sha256sum --check --strict "${name}.tar.gz.sha256")
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.name }}
           path: |
-            dist/*.tar.gz
+            dist/${{ steps.package.outputs.name }}
             dist/*.sha256
+            dist/*.tar.gz
           if-no-files-found: error
           retention-days: 30
 
@@ -92,9 +130,16 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v') || inputs.upload_release
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
           gh release view "$tag" >/dev/null 2>&1 || \
             gh release create "$tag" --title "Loom $tag" --generate-notes
-          gh release upload "$tag" dist/*.tar.gz dist/*.sha256 --clobber
+          # Every asset the updater needs, plus the tarball, in one upload.
+          gh release upload "$tag" \
+            "dist/${{ steps.package.outputs.name }}" \
+            "dist/${{ steps.package.outputs.name }}.sha256" \
+            "dist/${{ steps.package.outputs.name }}.tar.gz" \
+            "dist/${{ steps.package.outputs.name }}.tar.gz.sha256" \
+            --clobber

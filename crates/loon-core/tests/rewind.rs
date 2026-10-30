@@ -454,3 +454,152 @@ async fn rewind_entries_flatten_a_multiline_prompt() {
         e.prompt
     );
 }
+
+/// Esc after submitting but before the model says anything: the turn is rewound and the
+/// prompt comes back. `AgentEvent::RequestStarted` is emitted *before* the request is made
+/// and the journaled `RequestStarted` only lands with the provider's first event, so a
+/// cancel in that window leaves a prompt with no answer behind it — the case the UI has to
+/// treat as "I never sent that" instead of "stop what you are doing".
+#[tokio::test]
+async fn an_unanswered_turn_is_recognised_and_can_be_rewound() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_root = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws_root).unwrap();
+
+    // A delay before any scripted output keeps the turn in flight, in exactly the window
+    // where nothing has been answered yet.
+    let registry = ProviderRegistry::with_mock(loon_providers::MockProvider::with_scripts(vec![
+        MockScript::new(vec![
+            MockStep::Delay(std::time::Duration::from_secs(10)),
+            MockStep::Text("too late".into()),
+        ]),
+        MockScript::new(vec![MockStep::Delay(std::time::Duration::from_secs(10))]),
+    ]));
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let mut agent = Agent::new_session(
+        &paths,
+        cfg(),
+        Arc::new(registry),
+        ToolRegistry::standard(),
+        ws_root,
+        true,
+    )
+    .unwrap();
+    let (tx, mut events) = tokio::sync::mpsc::channel(32);
+    agent.set_event_sink(tx);
+    let prompt = "rename the parser\nand rerun the tests";
+
+    // Run the turn on its own task so it can be aborted the way the driver aborts one.
+    let agent = Arc::new(tokio::sync::Mutex::new(agent));
+    let task = {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            agent.lock().await.run_turn(prompt).await;
+        })
+    };
+    // Wait until the turn has actually started and journaled its prompt, then cancel.
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(loon_core::AgentEvent::TurnStarted) = events.recv().await {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    let _ = task.await;
+
+    let mut agent = agent.lock().await;
+    assert!(
+        agent.cancelled_turn_answered_nothing(),
+        "nothing came back from the provider, so the turn answers nothing"
+    );
+    assert_eq!(
+        agent.forget_cancelled_turn().as_deref(),
+        Some(prompt),
+        "the prompt is handed back to the input bar"
+    );
+    let texts: Vec<&str> = agent.history.iter().map(|m| m.text.as_str()).collect();
+    assert!(
+        !texts.iter().any(|t| t.contains("rename the parser")),
+        "the unanswered prompt left live history: {texts:?}"
+    );
+    assert!(
+        agent
+            .journal
+            .events()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::Rewound { .. })),
+        "the cancel is journaled as a conversation rewind"
+    );
+
+    // The journal agrees with history: a resume replays without the cancelled prompt.
+    let resumed = Agent::resume(
+        &paths,
+        agent.session_id(),
+        cfg(),
+        agent.registry.clone(),
+        ToolRegistry::standard(),
+    )
+    .unwrap();
+    let replay: Vec<&str> = resumed.history.iter().map(|m| m.text.as_str()).collect();
+    assert!(
+        !replay.iter().any(|t| t.contains("rename the parser")),
+        "resume must not replay a prompt that was never answered: {replay:?}"
+    );
+}
+
+/// The other side of the same decision: once the provider has answered, Esc keeps the
+/// turn. Rewinding here would throw away a real answer (and any tool work behind it).
+#[tokio::test]
+async fn an_answered_turn_is_not_treated_as_immediately_cancelled() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws_root = tmp.path().join("proj");
+    std::fs::create_dir_all(&ws_root).unwrap();
+    let registry = ProviderRegistry::with_mock(loon_providers::MockProvider::with_scripts(vec![
+        MockScript::new(vec![
+            MockStep::Text("working on it".into()),
+            MockStep::Delay(std::time::Duration::from_secs(10)),
+        ]),
+    ]));
+    let paths = test_paths(tmp.path());
+    paths.ensure().unwrap();
+    let mut agent = Agent::new_session(
+        &paths,
+        cfg(),
+        Arc::new(registry),
+        ToolRegistry::standard(),
+        ws_root,
+        true,
+    )
+    .unwrap();
+    let (tx, mut events) = tokio::sync::mpsc::channel(32);
+    agent.set_event_sink(tx);
+    let agent = Arc::new(tokio::sync::Mutex::new(agent));
+    let task = {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            agent.lock().await.run_turn("hello").await;
+        })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if let Some(loon_core::AgentEvent::TextDelta(_)) = events.recv().await {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    let _ = task.await;
+
+    let agent = agent.lock().await;
+    assert!(
+        !agent.cancelled_turn_answered_nothing(),
+        "the provider already streamed text; the turn must be kept"
+    );
+}

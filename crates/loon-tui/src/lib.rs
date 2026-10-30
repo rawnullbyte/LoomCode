@@ -1066,6 +1066,15 @@ impl App {
                 self.streaming = None;
                 self.selection = None;
                 self.selection_snapshot = None;
+                // No TurnFinished follows a restored prompt (the turn never happened), so
+                // this notice is what ends the busy state. Without it the UI would sit
+                // behind a spinner and refuse to submit the text it just handed back.
+                self.status.busy = false;
+                self.activity = "Ready".into();
+                self.cancel_armed = false;
+                self.turn_started = None;
+                self.request_rate.finish();
+                self.finish_all_pending();
                 // The cancelled prompt comes back as editable text: cursor at the end,
                 // the popup stays closed so the draft is not mistaken for a command.
                 self.history_pos = None;
@@ -2293,10 +2302,11 @@ fn selected_text(app: &App, sel: SelRange) -> String {
     transcript::copy(&app.transcript_rows(width), sel)
 }
 
-/// Start of the word before `cursor`, for Ctrl+Backspace.
+/// Start of the word before `cursor`, for word motion and Ctrl+Backspace.
 ///
-/// Skips spaces backwards, then the word itself. A newline is a hard stop: deleting
-/// must never merge two lines silently.
+/// Skips spaces backwards, then the word itself. A newline is not part of a word, so the
+/// scan stops there: the word delete never swallows a line break *together with* a word.
+/// [`kill_word_left`] handles the caret sitting exactly on a line break.
 pub(crate) fn word_left(text: &str, cursor: usize) -> usize {
     let chars: Vec<char> = text.chars().collect();
     let mut start = cursor.min(chars.len());
@@ -2325,6 +2335,30 @@ pub(crate) fn prev_word_start(text: &str, cursor: usize) -> usize {
         at -= 1;
     }
     word_left(text, at)
+}
+
+/// Span deleted by Ctrl+Backspace: `(from, to)` as char offsets.
+///
+/// The usual case is the word before the caret, exactly what Ctrl+Left skips. The case
+/// this function exists for is the caret sitting on a line break: `word_left` refuses to
+/// move across a newline (a word delete must not eat the previous line's word *and* the
+/// break), so nothing used to be deleted and the key appeared dead at the start of a
+/// line. A word delete at that position now removes the break itself, which joins the
+/// two lines — the same result as pressing Backspace there — while leaving the previous
+/// word alone.
+pub(crate) fn kill_word_left(text: &str, cursor: usize) -> (usize, usize) {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let start = word_left(text, cursor);
+    if start < cursor {
+        return (start, cursor);
+    }
+    // Nothing but a line break before the caret: delete exactly that break, the same
+    // result plain Backspace produces there, so the key is never dead at a line start.
+    match cursor.checked_sub(1) {
+        Some(prev) if chars[prev] == '\n' => (prev, cursor),
+        _ => (cursor, cursor),
+    }
 }
 
 /// End of the word after `cursor`, for Ctrl+Right: skip the word being finished, then
@@ -2415,7 +2449,7 @@ mod tests {
         )
         .await;
         assert_eq!(app.input, "git ");
-        // A newline is a hard stop: the word delete never swallows the line break.
+        // Deleting the last word of a line leaves the line break behind.
         app.input = "first\nsecond".into();
         app.cursor = app.input.chars().count();
         handle_key(
@@ -2425,6 +2459,58 @@ mod tests {
         )
         .await;
         assert_eq!(app.input, "first\n");
+    }
+
+    #[tokio::test]
+    async fn ctrl_backspace_at_line_start_deletes_the_newline() {
+        // Ctrl+Backspace used to do nothing here, because the word scan refuses to cross
+        // a line break and there was no word to delete. The caret is now sitting on a
+        // break, so the break itself is the target: the two lines join.
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = app_for_test();
+        app.input = "first\nsecond".into();
+        app.cursor = 6; // start of "second", right after the newline
+        handle_key(
+            &mut app,
+            key(KeyCode::Backspace, KeyModifiers::CONTROL),
+            &tx,
+        )
+        .await;
+        assert_eq!(app.input, "firstsecond");
+        assert_eq!(app.cursor, 5);
+        // Pressing again deletes the word it joined to, like any other word delete.
+        handle_key(
+            &mut app,
+            key(KeyCode::Backspace, KeyModifiers::CONTROL),
+            &tx,
+        )
+        .await;
+        assert_eq!(app.input, "second");
+        assert_eq!(app.cursor, 0);
+    }
+
+    #[tokio::test]
+    async fn ctrl_backspace_strips_indentation_before_the_newline() {
+        // An indented line: the spaces go first (they are the word before the caret),
+        // then the break. Nothing jumps to the previous line's word in one press.
+        let (tx, _rx) = mpsc::channel(8);
+        let mut app = app_for_test();
+        app.input = "fn main\n    body".into();
+        app.cursor = 12; // start of "body"
+        handle_key(
+            &mut app,
+            key(KeyCode::Backspace, KeyModifiers::CONTROL),
+            &tx,
+        )
+        .await;
+        assert_eq!(app.input, "fn main\nbody");
+        handle_key(
+            &mut app,
+            key(KeyCode::Backspace, KeyModifiers::CONTROL),
+            &tx,
+        )
+        .await;
+        assert_eq!(app.input, "fn mainbody");
     }
 
     #[tokio::test]
@@ -2559,7 +2645,7 @@ mod prompt_editing_tests {
     }
 
     #[tokio::test]
-    async fn ctrl_left_crosses_a_line_break_but_backspace_does_not() {
+    async fn ctrl_left_crosses_a_line_break_and_backspace_joins_the_lines() {
         let mut app = app_with("first\nsecond");
         press(&mut app, KeyCode::Left, KeyModifiers::CONTROL).await;
         assert_eq!(app.cursor, 6, "stops at the start of the second line");
@@ -2568,15 +2654,16 @@ mod prompt_editing_tests {
             app.cursor, 0,
             "Ctrl+Left crosses the break and lands on the previous word"
         );
-        // Ctrl+Backspace at the start of a line must not merge the two lines.
+        // Ctrl+Backspace at the start of a line deletes the break and nothing else, so it
+        // can never reach across and swallow the previous line's word in one press.
         let mut app = app_with("first\nsecond");
         app.cursor = 6;
         press(&mut app, KeyCode::Backspace, KeyModifiers::CONTROL).await;
         assert_eq!(
-            app.input, "first\nsecond",
-            "nothing to delete across a newline"
+            app.input, "firstsecond",
+            "only the newline is deleted; the previous word survives"
         );
-        assert_eq!(app.cursor, 6);
+        assert_eq!(app.cursor, 5);
     }
 
     #[tokio::test]

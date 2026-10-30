@@ -146,12 +146,22 @@ pub async fn execute_with(
             }
         }
         Action::DeleteWord => {
-            if app.cursor > 0 {
-                let start = crate::word_left(&app.input, app.cursor);
-                let from = app.cursor_byte_offset(start);
-                let to = app.cursor_byte_offset(app.cursor);
+            // Word delete respects an active selection first: deleting the selection is
+            // what typing and plain Backspace do, and jumping elsewhere instead would
+            // silently discard the text the user had highlighted.
+            if let Some((lo, hi)) = app.input_selection() {
+                let from = app.cursor_byte_offset(lo);
+                let to = app.cursor_byte_offset(hi);
                 app.input.replace_range(from..to, "");
-                app.cursor = start;
+                app.cursor = lo;
+            } else if app.cursor > 0 {
+                let (start, end) = crate::kill_word_left(&app.input, app.cursor);
+                if end > start {
+                    let from = app.cursor_byte_offset(start);
+                    let to = app.cursor_byte_offset(end);
+                    app.input.replace_range(from..to, "");
+                    app.cursor = start;
+                }
             }
             app.input_changed();
         }
