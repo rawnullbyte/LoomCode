@@ -202,6 +202,12 @@ async fn update_cmd(check: bool, prerelease: bool, no_restart: bool) -> i32 {
     settings.install = !check;
     settings.include_prereleases |= prerelease;
     let current = update::Version::current();
+    // Name the platform in the answer: "did it pick the right build for this machine" is
+    // the question a person actually has, and the target triple is the whole answer.
+    println!(
+        "loom {current} ({}) — checking {}",
+        settings.target, settings.repository
+    );
     match update::run(&settings, true).await {
         Ok(outcome) => {
             match &outcome {
@@ -222,7 +228,10 @@ async fn update_cmd(check: bool, prerelease: bool, no_restart: bool) -> i32 {
                     );
                 }
                 update::Outcome::UpToDate { latest, .. } => {
-                    println!("loom {current} is up to date (newest release {latest})");
+                    println!(
+                        "loom {current} is up to date (newest release {latest} for {})",
+                        settings.target
+                    );
                 }
                 // `force` skips the cache, so this is unreachable in practice; printing it
                 // is still better than panicking if that ever changes.

@@ -3,6 +3,16 @@
 All notable changes to LoomCode. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 the project intends to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-10-30
+
+### Changed
+
+- **`loom update` says which platform it is updating.** The command now opens with the
+  version and the target triple it will select (`loom 0.3.0 (x86_64-unknown-linux-gnu) —
+  checking rawnullbyte/LoomCode`), and the up-to-date line names the triple too. "Is this
+  picking the right build for my machine" is the question a person actually has, and the
+  triple is the answer; it was previously only implied by the outcome.
+
 ## [0.3.0] — 2026-10-30
 
 ### Added
