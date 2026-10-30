@@ -41,9 +41,9 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
-            os: macos-14
+            os: macos-15
           - target: x86_64-apple-darwin
-            os: macos-14
+            os: macos-15
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -78,26 +78,30 @@ jobs:
           version='${{ steps.version.outputs.version }}'
           target='${{ matrix.target }}'
           name="${BINARY}-${version}-${target}"
-          stage="dist/${name}"
+          # The tarball stages a *directory* named after the asset, so the raw binary must be
+          # written separately — otherwise `dist/${name}` is a directory and stripping it
+          # fails. `out` holds the published files; `stage` is what the tarball wraps.
+          out="dist"
+          stage="dist/pkg/${name}"
           mkdir -p "$stage"
 
           # The raw binary is the asset the updater downloads. Its name ends in the target
           # triple, which is what `build.rs` bakes into the binary to select it.
-          cp "target/${target}/release/${BINARY}" "dist/${name}"
+          cp "target/${target}/release/${BINARY}" "${out}/${name}"
           cp "target/${target}/release/${BINARY}" "$stage/${BINARY}"
-          strip "dist/${name}" "$stage/${BINARY}"
-          chmod 0755 "dist/${name}" "$stage/${BINARY}"
+          strip "${out}/${name}" "$stage/${BINARY}"
+          chmod 0755 "${out}/${name}" "$stage/${BINARY}"
 
           # Published next to the binary so an install is verifiable without the tarball.
-          (cd dist && sha256sum "${name}" > "${name}.sha256")
+          (cd "$out" && sha256sum "${name}" > "${name}.sha256")
 
           # A tarball with the licence and readme, for manual installation.
           cp LICENSE README.md "$stage/"
-          tar -C dist -czf "dist/${name}.tar.gz" "$name"
-          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          tar -C "dist/pkg" -czf "${out}/${name}.tar.gz" "$name"
+          (cd "$out" && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
 
           echo "name=${name}" >> "$GITHUB_OUTPUT"
-          ls -lh dist
+          ls -lh "$out"
 
       - name: Verify packaged binary
         shell: bash
